@@ -65,6 +65,63 @@ def capacity_gate_vram_gb(gpu_info: dict) -> int:
     return int(gpu_info.get("vram_gb") or 0)
 
 
+def _resolve_registry_config_any_tier(
+    lookup_id: str,
+    *,
+    quant: str | None,
+    checkpoint: str | None,
+):
+    """Resolve registry config without enforcing local VRAM tier (proxy backends)."""
+    from verallm.registry.models import MODELS_BY_ID, TierMatch
+
+    model = MODELS_BY_ID.get(lookup_id)
+    if model is None:
+        return None
+
+    candidates = list(model.tier_configs)
+    if checkpoint:
+        filtered = [c for c in candidates if c.checkpoint.lower() == checkpoint.lower()]
+        if filtered:
+            candidates = filtered
+    if quant:
+        filtered = [
+            c for c in candidates
+            if any(qo.quant == quant for qo in c.quant_configs)
+        ]
+        if filtered:
+            candidates = filtered
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda c: c.tier.value)
+    return TierMatch(model=model, config=best, native=False)
+
+
+def _advertised_gpu_info(vram_gb: int | None = None) -> dict | None:
+    """Build synthetic GPU info for proxy miners without local CUDA."""
+    import os
+
+    from verallm.registry.gpu import normalize_marketed_vram_gb
+
+    if vram_gb is None:
+        raw = os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "")
+        if not str(raw).strip().isdigit():
+            return None
+        vram_gb = int(raw)
+    vram_gb = normalize_marketed_vram_gb(int(vram_gb))
+    tier = vram_tier_for_gb(int(vram_gb))
+    if tier is None:
+        return None
+    name = str(
+        os.environ.get("VERATHOS_ADVERTISED_GPU_NAME", "") or "proxy-advertised"
+    ).strip()
+    return {
+        "available": True,
+        "name": name,
+        "vram_gb": int(vram_gb),
+        "tier": tier,
+    }
+
+
 def _filter_capacity_recommendations(recs, on_chain_models: Optional[Iterable[str]]):
     if on_chain_models is None:
         return list(recs)
@@ -228,6 +285,8 @@ def resolve_model_config(
     chain_config: Optional[str] = None,
     subtensor_network: Optional[str] = None,
     capacity_audit_required: bool = False,
+    no_local_gpu: bool = False,
+    advertised_vram_gb: int | None = None,
 ) -> ResolvedModel:
     """Resolve a miner's model configuration with cascading fallback.
 
@@ -266,7 +325,15 @@ def resolve_model_config(
 
     # --- GPU detection (always needed for registry lookups) ---
     gpu_info = detect_gpu_info()
-    if not gpu_info["available"]:
+    if not gpu_info["available"] and no_local_gpu:
+        synth = _advertised_gpu_info(advertised_vram_gb)
+        if synth is not None:
+            gpu_info = synth
+            bt.logging.info(
+                f"Proxy mode: using advertised GPU {gpu_info['name']} "
+                f"({gpu_info['vram_gb']} GB, tier={gpu_info['tier'].name})"
+            )
+    if not gpu_info.get("available"):
         if capacity_audit_required:
             bt.logging.error("Capacity audit is enabled but no CUDA GPU was detected")
             sys.exit(1)
@@ -437,13 +504,30 @@ def resolve_model_config(
                 bt.logging.info(f"Resolved HF checkpoint '{model_id}' → registry '{_lookup_id}'")
                 break
 
-    try:
-        match = resolve_model_for_tier(
-            _lookup_id, tier,
+    match = None
+    tier_exc: Exception | None = None
+    if no_local_gpu:
+        match = _resolve_registry_config_any_tier(
+            _lookup_id,
             quant=quant,
             checkpoint=model_id if _user_gave_hf_checkpoint else None,
         )
-    except (KeyError, ValueError) as exc:
+        if match is not None:
+            bt.logging.info(
+                f"Proxy mode: resolved {model_id} from registry tier "
+                f"{match.config.tier.name} (ignoring advertised tier {tier.name})"
+            )
+    if match is None:
+        try:
+            match = resolve_model_for_tier(
+                _lookup_id, tier,
+                quant=quant,
+                checkpoint=model_id if _user_gave_hf_checkpoint else None,
+            )
+        except (KeyError, ValueError) as exc:
+            tier_exc = exc
+    if match is None:
+        exc = tier_exc or ValueError(f"Model {model_id!r} not in registry")
         bt.logging.warning(f"Model {model_id} not in registry for this tier ({exc}), using defaults")
         resolved_quant = quant or "fp16"
         if max_context_len is None:
@@ -458,6 +542,7 @@ def resolve_model_config(
             context_source="cli",
         )
 
+    assert match is not None
     # Registry matched — use the tier config's checkpoint for shortnames,
     # keep the user's HF checkpoint if they specified one explicitly.
     if not _user_gave_hf_checkpoint:

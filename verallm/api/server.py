@@ -98,6 +98,10 @@ except Exception:
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from verallm.api.proxy_auth import proxy_llm_key_from_env, verify_proxy_llm_request
+from verallm.api.proxy_forward import proxy_json_post, proxy_state, merge_upstream_health
 
 from verallm.config import Config, set_config
 from verallm.challenge.beacon import derive_beacon_from_nonce, derive_challenges, derive_sampling_challenge, derive_embedding_challenge
@@ -250,8 +254,26 @@ state = MinerState()
 app = FastAPI(title="VeraLLM Miner", version="0.1.0")
 
 
+class ProxyLLMKeyMiddleware(BaseHTTPMiddleware):
+    """Require proxy shared secret on inference GPUs when VERATHOS_PROXY_LLM_KEY is set."""
+
+    async def dispatch(self, request: Request, call_next):
+        expected = proxy_llm_key_from_env()
+        if expected and request.url.path in {"/chat", "/inference"}:
+            if not verify_proxy_llm_request(request, expected):
+                return JSONResponse(status_code=401, content={"error": "unauthorized proxy request"})
+        return await call_next(request)
+
+
+app.add_middleware(ProxyLLMKeyMiddleware)
+
+
 def _capacity_audit_gate() -> Optional[JSONResponse]:
     """Reject normal inference while this miner is inside a local audit drain."""
+    # Proxy miners serve inference from a remote LLM pool; a local capacity
+    # audit occupies only this host's audit GPU, so never gate forwarded traffic.
+    if proxy_state.enabled:
+        return None
     path = state.capacity_audit_state_file
     if not path:
         return None
@@ -552,8 +574,11 @@ async def health():
             if state.activation_tracker is not None
             else ("splitting_ops" if state.miner and getattr(state.miner, "_use_cuda_graphs", False) else "hooks")
         ),
-        "max_model_len": state.miner.llm.llm_engine.model_config.max_model_len
-        if state.miner and state.miner.llm else None,
+        "max_model_len": (
+            state.miner.llm.llm_engine.model_config.max_model_len
+            if state.miner and state.miner.llm
+            else (proxy_state.max_context_len or None)
+        ),
     }
     if state.gpu_name:
         result["hardware"] = {
@@ -582,6 +607,8 @@ async def health():
             "platform": state.tee_platform,
             "proof_mode": "attestation" if state.tee_skip_proofs else "verallm",
         }
+    if proxy_state.enabled:
+        result = merge_upstream_health(result)
     return result
 
 
@@ -748,11 +775,14 @@ async def run_inference(body: InferenceRequestBody, request: Request = None):
     continuous batching.  A semaphore limits concurrency to prevent OOM.
     Returns 503 when all slots are occupied.
     """
-    if state.miner is None:
-        return JSONResponse(status_code=503, content={"error": "Model not loaded"})
     audit_gate = _capacity_audit_gate()
     if audit_gate is not None:
         return audit_gate
+    if proxy_state.enabled:
+        payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+        return await proxy_json_post("/inference", payload, request)
+    if state.miner is None:
+        return JSONResponse(status_code=503, content={"error": "Model not loaded"})
 
     nonce = bytes.fromhex(body.validator_nonce)
 
@@ -847,11 +877,14 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
     Used by the chain-discovery webapp and any client that wants chat-native
     inference without managing tokenizers.
     """
-    if state.miner is None:
-        return JSONResponse(status_code=503, content={"error": "Model not loaded"})
     audit_gate = _capacity_audit_gate()
     if audit_gate is not None:
         return audit_gate
+    if proxy_state.enabled:
+        payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+        return await proxy_json_post("/chat", payload, request)
+    if state.miner is None:
+        return JSONResponse(status_code=503, content={"error": "Model not loaded"})
 
     # Extract validator hotkey for logging (set by ValidatorAuthMiddleware)
     _vali_hotkey = getattr(getattr(request, "state", None), "validator_hotkey", "") if request else ""
@@ -2644,6 +2677,14 @@ def startup(args):
     and comparison logic are a TODO — currently the miner computes roots
     and serves them directly via GET /model_spec.
     """
+    from verallm.api.proxy_forward import configure_proxy_from_args, proxy_startup_minimal
+
+    configure_proxy_from_args(args)
+    if getattr(args, "proxy_mode", False) or proxy_state.enabled:
+        proxy_startup_minimal(state, args)
+        bt.logging.info("Proxy mode: skipping local vLLM startup")
+        return
+
     _preflight_gpu_check(skip=getattr(args, 'skip_gpu_check', False))
     state.capacity_audit_state_file = str(getattr(args, "capacity_audit_state_file", "") or "")
 
@@ -3606,6 +3647,27 @@ def parse_args():
                              "Default: True when --tee-enabled is set.")
     parser.add_argument("--capacity-audit-state-file", default=None,
                         help=argparse.SUPPRESS)
+    proxy_group = parser.add_argument_group("proxy")
+    proxy_group.add_argument("--proxy-mode", action="store_true",
+                             help="Validator-facing proxy without local vLLM")
+    proxy_group.add_argument("--proxy-balancer", default=None,
+                             help="Inference balancer base URL (Balancer 1)")
+    proxy_group.add_argument("--proxy-balancer-key", default=None,
+                             help="Bearer token for Balancer 1")
+    proxy_group.add_argument("--proxy-llm-key", default=None,
+                             help="Shared secret for upstream inference GPUs")
+    proxy_group.add_argument("--proxy-slot-id", default=None,
+                             help="Optional slot id passed to balancer /pick")
+    proxy_group.add_argument("--advertised-gpu-name", default=None,
+                             help="GPU name for /health on proxy nodes")
+    proxy_group.add_argument("--advertised-vram-gb", type=int, default=None,
+                             help="VRAM GB for /health on proxy nodes")
+    proxy_group.add_argument("--advertised-gpu-count", type=int, default=None,
+                             help="GPU count for /health on proxy nodes")
+    proxy_group.add_argument("--advertised-compute-capability", default=None,
+                             help="Compute capability string for /health on proxy nodes")
+    proxy_group.add_argument("--advertised-gpu-uuids", default=None,
+                             help="Comma-separated GPU UUIDs for /health on proxy nodes")
     parser.add_argument("--log-level", default="info",
                         choices=["debug", "info", "warning"],
                         help="Logging level (default: info)")
