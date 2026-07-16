@@ -608,7 +608,7 @@ async def health():
             "proof_mode": "attestation" if state.tee_skip_proofs else "verallm",
         }
     if proxy_state.enabled:
-        result = merge_upstream_health(result)
+        result = await merge_upstream_health(result)
     return result
 
 

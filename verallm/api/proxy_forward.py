@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlencode
 
@@ -15,6 +17,45 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from verallm.api.proxy_auth import PROXY_LLM_HEADER
 
 logger = logging.getLogger(__name__)
+
+# Seconds to reuse a mirrored upstream /health snapshot. Validators poll the
+# proxy's /health often; without this, every poll cost a balancer /pick plus an
+# upstream /health, which burned the upstream's public rate-limit budget.
+HEALTH_CACHE_TTL_S = float(os.environ.get("PROXY_HEALTH_CACHE_TTL_S", "10") or 10)
+
+# Upstream /health timeout. The proxy and the inference pool can sit in far-apart
+# regions (~300ms RTT observed), so a new connection costs ~2 RTT before any
+# response. The old 1s budget timed out constantly and mirroring never worked.
+# This call is async and cached, so a generous timeout costs nothing.
+HEALTH_FETCH_TIMEOUT_S = float(os.environ.get("PROXY_HEALTH_FETCH_TIMEOUT_S", "5") or 5)
+
+# Pooled async client for the short auxiliary calls (balancer /pick, upstream
+# /health). These used to be synchronous httpx.get() calls issued from inside
+# async request handlers, which blocked the event loop — stalling every in-flight
+# SSE relay and truncating them.
+_aux_client: Optional[httpx.AsyncClient] = None
+
+_health_cache_at: float = 0.0
+_health_cache_data: Optional[dict] = None
+_health_cache_lock: Optional[asyncio.Lock] = None
+
+
+def _aux() -> httpx.AsyncClient:
+    global _aux_client
+    if _aux_client is None or _aux_client.is_closed:
+        _aux_client = httpx.AsyncClient(
+            verify=proxy_state.verify_upstream_ssl,
+            timeout=10.0,
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=32),
+        )
+    return _aux_client
+
+
+def _health_lock() -> asyncio.Lock:
+    global _health_cache_lock
+    if _health_cache_lock is None:
+        _health_cache_lock = asyncio.Lock()
+    return _health_cache_lock
 
 
 class ProxyInferenceState:
@@ -55,19 +96,67 @@ def _mirror_health_fields() -> tuple[str, ...]:
     )
 
 
-def _fetch_upstream_health(url: str) -> Optional[dict]:
+async def _fetch_upstream_health(url: str) -> Optional[dict]:
+    """Fetch upstream /health, authenticated as the proxy.
+
+    /health is a *public* endpoint on the inference server and is rate-limited
+    per client IP (60/min). Behind Docker NAT every proxy shares a single source
+    IP, so unauthenticated mirroring trips that limit and gets 429s. Sending the
+    proxy key takes the trusted-proxy path and skips the public limiter.
+    """
     try:
-        resp = httpx.get(
+        headers: dict[str, str] = {}
+        if proxy_state.proxy_llm_key:
+            headers[PROXY_LLM_HEADER] = proxy_state.proxy_llm_key
+        resp = await _aux().get(
             f"{url.rstrip('/')}/health",
-            timeout=1.0,
-            verify=proxy_state.verify_upstream_ssl,
+            timeout=HEALTH_FETCH_TIMEOUT_S,
+            headers=headers,
         )
         if resp.status_code == 200:
             data = resp.json()
             return data if isinstance(data, dict) else {}
+        if resp.status_code == 429:
+            logger.warning("proxy health mirror rate-limited by upstream %s (429)", url)
     except Exception as exc:
         logger.debug("proxy health mirror failed for %s: %s", url, exc)
     return None
+
+
+async def _upstream_health_cached() -> Optional[dict]:
+    """Return a recent upstream /health snapshot, refreshing at most every TTL.
+
+    Both hits and misses are cached so a failing upstream can't be hammered.
+    """
+    global _health_cache_at, _health_cache_data
+
+    now = time.monotonic()
+    if now - _health_cache_at < HEALTH_CACHE_TTL_S:
+        return _health_cache_data
+
+    async with _health_lock():
+        now = time.monotonic()
+        if now - _health_cache_at < HEALTH_CACHE_TTL_S:
+            return _health_cache_data
+
+        data: Optional[dict] = None
+        # Optional pin for debugging; normal proxy miners use balancer /pick only.
+        explicit = str(proxy_state.mirror_health_url or "").strip()
+        if explicit:
+            data = await _fetch_upstream_health(explicit)
+
+        if data is None and proxy_state.balancer_base:
+            try:
+                pick = await _pick_upstream(log_pick=False)
+                endpoint = str(pick.get("endpoint") or "").rstrip("/")
+                if endpoint:
+                    data = await _fetch_upstream_health(endpoint)
+            except Exception as exc:
+                logger.debug("proxy health mirror via balancer pick failed: %s", exc)
+
+        _health_cache_data = data
+        _health_cache_at = time.monotonic()
+        return data
 
 
 def _parse_advertised_gpu_uuids(args=None) -> list[str]:
@@ -146,23 +235,9 @@ def _configured_proxy_gpu_uuids(result: Optional[dict] = None) -> list[str]:
     return _parse_advertised_gpu_uuids()
 
 
-def merge_upstream_health(result: dict) -> dict:
+async def merge_upstream_health(result: dict) -> dict:
     """Mirror inference load/KV stats from upstream; keep audit GPU in hardware."""
-    upstream: Optional[dict] = None
-
-    # Optional pin for debugging; normal proxy miners use balancer /pick only.
-    explicit = str(proxy_state.mirror_health_url or "").strip()
-    if explicit:
-        upstream = _fetch_upstream_health(explicit)
-
-    if upstream is None and proxy_state.balancer_base:
-        try:
-            pick = _pick_upstream(log_pick=False)
-            endpoint = str(pick.get("endpoint") or "").rstrip("/")
-            if endpoint:
-                upstream = _fetch_upstream_health(endpoint)
-        except Exception as exc:
-            logger.debug("proxy health mirror via balancer pick failed: %s", exc)
+    upstream = await _upstream_health_cached()
 
     if not upstream:
         return result
@@ -265,7 +340,7 @@ def _validator_hotkey(request: Optional[Request]) -> str:
     return str(request.headers.get("X-Validator-Hotkey", "") or "").strip()
 
 
-def _pick_upstream(*, log_pick: bool = True) -> dict[str, Any]:
+async def _pick_upstream(*, log_pick: bool = True) -> dict[str, Any]:
     if not proxy_state.balancer_base:
         raise RuntimeError("proxy balancer URL not configured")
     params = {
@@ -277,7 +352,7 @@ def _pick_upstream(*, log_pick: bool = True) -> dict[str, Any]:
     if proxy_state.slot_id:
         params["slot_id"] = proxy_state.slot_id
     url = f"{proxy_state.balancer_base}/pick?{urlencode(params)}"
-    resp = httpx.get(url, headers=_balancer_headers(), timeout=5.0)
+    resp = await _aux().get(url, headers=_balancer_headers(), timeout=5.0)
     resp.raise_for_status()
     data = resp.json() or {}
     endpoint = str(data.get("endpoint") or "").rstrip("/")
@@ -317,25 +392,50 @@ async def _stream_upstream_response(resp: httpx.Response) -> AsyncIterator[bytes
         yield chunk
 
 
+# Upstream failures we translate into clean HTTP status codes instead of
+# letting them escape into the ASGI layer. httpx.StreamError (e.g. StreamClosed)
+# subclasses RuntimeError — NOT HTTPError — so it must be listed explicitly.
+# RemoteProtocolError ("incomplete chunked read") and ConnectError are HTTPError.
+_UPSTREAM_ERRORS = (httpx.HTTPError, httpx.StreamError)
+
+
 async def proxy_json_post(
     path: str,
     body: dict[str, Any],
     request: Optional[Request] = None,
 ) -> Any:
-    pick = _pick_upstream()
+    try:
+        pick = await _pick_upstream()
+    except Exception as exc:
+        logger.warning("proxy pick failed: path=%s err=%s", path, exc)
+        return JSONResponse(
+            status_code=503,
+            content={"error": "no upstream available", "detail": str(exc)},
+        )
     endpoint = str(pick["endpoint"]).rstrip("/")
     url = f"{endpoint}{path}"
     validator_hotkey = _validator_hotkey(request)
     hotkey_suffix = f" validator={validator_hotkey[:12]}..." if validator_hotkey else ""
     logger.info("proxy forwarding %s -> %s%s", path, url, hotkey_suffix)
     client = httpx.AsyncClient(verify=proxy_state.verify_upstream_ssl, timeout=None)
-    req = client.build_request(
-        "POST",
-        url,
-        headers=_upstream_headers(pick, request),
-        json=body,
-    )
-    resp = await client.send(req, stream=True)
+    try:
+        req = client.build_request(
+            "POST",
+            url,
+            headers=_upstream_headers(pick, request),
+            json=body,
+        )
+        resp = await client.send(req, stream=True)
+    except _UPSTREAM_ERRORS as exc:
+        await client.aclose()
+        logger.warning(
+            "proxy upstream connect failed: path=%s upstream=%s%s err=%s",
+            path, url, hotkey_suffix, exc,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={"error": "upstream connect failed", "detail": str(exc)},
+        )
     logger.info(
         "proxy upstream response: path=%s status=%s upstream=%s%s",
         path,
@@ -351,6 +451,12 @@ async def proxy_json_post(
             except json.JSONDecodeError:
                 content = {"error": raw.decode(errors="replace")}
             return JSONResponse(status_code=resp.status_code, content=content)
+        except _UPSTREAM_ERRORS as exc:
+            logger.warning(
+                "proxy upstream error-body read failed: path=%s upstream=%s%s err=%s",
+                path, endpoint, hotkey_suffix, exc,
+            )
+            return JSONResponse(status_code=502, content={"error": "upstream read failed", "detail": str(exc)})
         finally:
             await resp.aclose()
             await client.aclose()
@@ -361,12 +467,17 @@ async def proxy_json_post(
             try:
                 async for chunk in resp.aiter_bytes():
                     yield chunk
-            except httpx.StreamClosed:
-                logger.debug(
-                    "proxy upstream SSE closed: path=%s upstream=%s%s",
+            except _UPSTREAM_ERRORS as exc:
+                # Upstream inference GPU dropped the stream mid-body (crash/OOM,
+                # timeout, or connection reset). SSE headers are already sent, so
+                # we cannot change the status — stop cleanly; the validator sees a
+                # truncated stream and fails that request, which is correct.
+                logger.warning(
+                    "proxy upstream SSE ended early: path=%s upstream=%s%s err=%s",
                     path,
                     endpoint,
                     hotkey_suffix,
+                    exc,
                 )
             finally:
                 await resp.aclose()
@@ -391,6 +502,12 @@ async def proxy_json_post(
             except json.JSONDecodeError:
                 return JSONResponse(status_code=resp.status_code, content={"raw": raw.decode(errors="replace")})
         return JSONResponse(status_code=resp.status_code, content={})
+    except _UPSTREAM_ERRORS as exc:
+        logger.warning(
+            "proxy upstream read failed: path=%s upstream=%s%s err=%s",
+            path, endpoint, hotkey_suffix, exc,
+        )
+        return JSONResponse(status_code=502, content={"error": "upstream read failed", "detail": str(exc)})
     finally:
         await resp.aclose()
         await client.aclose()
