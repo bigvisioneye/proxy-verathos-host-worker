@@ -1409,6 +1409,12 @@ def parse_args():
                         help="Deferred proof payload timeout after the final timing receipt.")
     parser.add_argument("--capacity-audit-worker-poll-s", type=float, default=None,
                         help="Miner-side capacity-audit chain polling interval in seconds.")
+    parser.add_argument("--capacity-audit-balancer", default=None,
+                        help="Worker balancer (Balancer 2) base URL. When set, the capacity audit "
+                             "runs on a leased remote GPU worker instead of this host's GPU "
+                             "(or CAPACITY_AUDIT_BALANCER_URL). Unset = local audit (default).")
+    parser.add_argument("--capacity-audit-balancer-key", default=None,
+                        help="Bearer token for Balancer 2 (or CAPACITY_AUDIT_BALANCER_API_KEY).")
 
     proxy_group = parser.add_argument_group("proxy (inference forwarding)")
     proxy_group.add_argument("--proxy-mode", action="store_true",
@@ -1717,6 +1723,21 @@ def main():
         config.capacity_audit_payload_deadline_s = args.capacity_audit_payload_deadline_s
     if getattr(args, "capacity_audit_worker_poll_s", None) is not None:
         config.capacity_audit_worker_poll_s = args.capacity_audit_worker_poll_s
+
+    audit_balancer = str(
+        getattr(args, "capacity_audit_balancer", "")
+        or os.environ.get("CAPACITY_AUDIT_BALANCER_URL", "")
+        or ""
+    ).strip()
+    if audit_balancer:
+        config.capacity_audit_balancer = audit_balancer
+    audit_balancer_key = str(
+        getattr(args, "capacity_audit_balancer_key", "")
+        or os.environ.get("CAPACITY_AUDIT_BALANCER_API_KEY", "")
+        or ""
+    ).strip()
+    if audit_balancer_key:
+        config.capacity_audit_balancer_key = audit_balancer_key
 
     proxy_balancer = str(getattr(args, "proxy_balancer", "") or "").strip()
     if getattr(args, "proxy_mode", False) or proxy_balancer:
@@ -2027,6 +2048,8 @@ def main():
                 local_health_url=local_health_url,
                 audit_state_file=capacity_audit_state_file,
                 poll_interval_s=_capacity_audit_worker_poll_interval(config),
+                audit_balancer_url=str(getattr(config, "capacity_audit_balancer", "") or ""),
+                audit_balancer_api_key=str(getattr(config, "capacity_audit_balancer_key", "") or ""),
             )
             neuron._capacity_audit_worker.start()
         except Exception as e:
