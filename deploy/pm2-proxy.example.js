@@ -36,7 +36,7 @@ module.exports = {
         "--hotkey", "miner1",
         "--netuid", "96",
         "--subtensor-network", "finney",
-        "--model-id", "Qwen/Qwen3.5-9B",
+        "--model", "Qwen/Qwen3.5-9B",
         "--quant", "fp16",
         "--endpoint", "https://proxy.example.com:31123",
         "--capacity-audit",
@@ -51,7 +51,7 @@ module.exports = {
         "--proxy-mode",
         "--skip-gpu-check",
       ],
-      cwd: "/workspace/verathos",
+      cwd: "/workspace/proxy-verathos-host-worker",
       env: {
         // MUST match this host's real local GPU (the one that runs the audit).
         VERATHOS_ADVERTISED_GPU_NAME: "NVIDIA A100-SXM4-80GB",

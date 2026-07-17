@@ -14,12 +14,12 @@ module.exports = {
       script: ".venv-vllm/bin/python",
       args: [
         "-u", "-m", "verallm.api.server",
-        "--model-id", "Qwen/Qwen3.5-9B",
+        "--model", "Qwen/Qwen3.5-9B",
         "--quant", "fp16",
-        "--port", "8000",
+        "--port", "8061",
         "--host", "0.0.0.0",
       ].join(" "),
-      cwd: "/workspace/verathos",
+      cwd: "/workspace/proxy-verathos-host-worker",
       env: {
         VERATHOS_PROXY_LLM_KEY: "REPLACE_PROXY_LLM_KEY",
       },
