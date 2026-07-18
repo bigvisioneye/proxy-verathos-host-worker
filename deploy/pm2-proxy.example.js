@@ -58,6 +58,7 @@ module.exports = {
         VERATHOS_ADVERTISED_VRAM_GB: "80",
         // Set to 0 if Balancer 1 returns https:// GPU endpoints with self-signed certs.
         PROXY_UPSTREAM_VERIFY_SSL: "0",
+        VERATHOS_AUDIT_WORKER_KEY: "REPLACE_WORKER_KEY"
       },
       autorestart: true,
       merge_logs: true,

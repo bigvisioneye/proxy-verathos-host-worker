@@ -750,9 +750,16 @@ class CapacityAuditMinerWorker:
 
     def _on_block(self, block_number: int, block_hash: bytes, subtensor=None) -> None:
         due = self._pending.pop(block_number, [])
-        for audit_slot in due:
-            prepared = self._pop_prepared_audit(audit_slot.audit_id)
-            self._run_audit_slot(audit_slot, block_hash, subtensor, prepared=prepared)
+        # In remote-audit mode the dedicated waiter (_await_and_run_audit_slot_remote)
+        # is the sole driver of a slot. Running the local path here too would race it
+        # on _mark_audit_started_once at B_start: if this callback wins, it takes the
+        # local branch (no workspace wheel on a proxy VPS -> "workload skipped") and
+        # marks the slot started, so the remote waiter aborts and the warmed worker is
+        # never told to start -> no artifacts published. Only drive locally.
+        if not self._use_remote_audit():
+            for audit_slot in due:
+                prepared = self._pop_prepared_audit(audit_slot.audit_id)
+                self._run_audit_slot(audit_slot, block_hash, subtensor, prepared=prepared)
 
         epoch_blocks = self._epoch_blocks(subtensor)
         if block_number % epoch_blocks == 0:
