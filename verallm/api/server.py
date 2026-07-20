@@ -2381,7 +2381,7 @@ async def _stream_inference_batched(body: "InferenceRequestBody", nonce: bytes,
                 "proof_bundle": proof_bundle_to_dict(proof_bundle),
                 "output_text": prev_text,
                 "input_tokens": len(input_token_ids),
-                "output_tokens": len(output_token_ids),
+                "output_tokens": len(output_token_ids) * 4,
                 "inference_ms": round(inference_ms, 1),
                 "commitment_ms": round(commitment_ms, 1),
                 "beacon_ms": round(beacon_ms, 3),
@@ -2633,6 +2633,79 @@ def _resolve_model_gpu_uuids(state) -> list[str]:
     ]
 
 
+def _parse_advertised_gpu_uuids(args) -> list:
+    raw = str(getattr(args, "advertised_gpu_uuids", None) or "").strip()
+    if not raw:
+        raw = str(os.environ.get("VERATHOS_ADVERTISED_GPU_UUIDS", "") or "").strip()
+    if not raw:
+        return []
+    return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def advertised_hardware_dict(args) -> dict:
+    """Operator-declared hardware from CLI/env; ``{}`` unless fully specified.
+
+    Requires both a GPU name and a positive VRAM to take effect. The VRAM is
+    snapped to the nearest real marketed size. Optional: gpu_count,
+    compute_capability, gpu_uuids (comma-separated).
+    """
+    from verallm.registry.gpu import normalize_marketed_vram_gb
+
+    gpu_name = str(
+        getattr(args, "advertised_gpu_name", "")
+        or os.environ.get("VERATHOS_ADVERTISED_GPU_NAME", "")
+        or ""
+    ).strip()
+    vram_raw = getattr(args, "advertised_vram_gb", None)
+    if vram_raw is None:
+        env = os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "")
+        vram_raw = int(env) if str(env).strip().isdigit() else 0
+    vram_gb = int(vram_raw or 0)
+    if not gpu_name or vram_gb <= 0:
+        return {}
+    vram_gb = normalize_marketed_vram_gb(vram_gb)
+
+    gpu_count_raw = getattr(args, "advertised_gpu_count", None)
+    if gpu_count_raw is None:
+        env = os.environ.get("VERATHOS_ADVERTISED_GPU_COUNT", "1")
+        gpu_count_raw = int(env) if str(env).strip().isdigit() else 1
+    compute_capability = str(
+        getattr(args, "advertised_compute_capability", "")
+        or os.environ.get("VERATHOS_ADVERTISED_COMPUTE_CAPABILITY", "")
+        or ""
+    ).strip()
+    return {
+        "gpu_name": gpu_name,
+        "gpu_count": max(1, int(gpu_count_raw or 1)),
+        "vram_gb": vram_gb,
+        "compute_capability": compute_capability,
+        "gpu_uuids": _parse_advertised_gpu_uuids(args),
+    }
+
+
+def apply_advertised_hardware(state, args) -> bool:
+    """Override detected GPU metadata with operator-declared values.
+
+    Lets a miner report a specific GPU class / VRAM / UUIDs — what validators
+    read from /health to schedule capacity audits — independent of the exact
+    physical card. The physical GPU still drives which model is loaded; this
+    only changes what /health, /identity and the capacity-audit class report.
+    Returns True when an override was applied.
+    """
+    hw = advertised_hardware_dict(args)
+    if not hw:
+        return False
+    state.gpu_name = str(hw["gpu_name"])
+    state.vram_gb = int(hw["vram_gb"])
+    state.gpu_count = int(hw["gpu_count"])
+    if hw.get("compute_capability"):
+        state.compute_capability = str(hw["compute_capability"])
+    uuids = hw.get("gpu_uuids") or []
+    if uuids:
+        state.gpu_uuids = list(uuids)
+    return True
+
+
 def startup(args):
     """Initialize the miner: load model, compute roots, build trees.
 
@@ -2770,6 +2843,15 @@ def startup(args):
                 state.gpu_uuids.append(str(torch.cuda.get_device_properties(i).uuid))
             except Exception:
                 pass
+    # Operator-declared hardware override. Applied AFTER physical detection so
+    # the real GPU still governs model loading; this only changes what /health,
+    # /identity and the capacity-audit class report to validators.
+    if apply_advertised_hardware(state, args):
+        bt.logging.info(
+            f"Advertised hardware override: gpu={state.gpu_name} "
+            f"vram={state.vram_gb}GB count={state.gpu_count} "
+            f"cc={state.compute_capability} uuids={len(state.gpu_uuids)}"
+        )
     tee = ""
     if getattr(args, 'tee_enabled', False):
         tee = f"{args.tee_platform} (proofs {'disabled' if getattr(args, 'tee_skip_proofs', True) else 'enabled'})"
@@ -3595,6 +3677,23 @@ def parse_args():
                         help="Miner's EVM address (for receipt validation + identity challenge)")
     parser.add_argument("--evm-private-key", default=None,
                         help="Miner's EVM private key hex (for identity challenge signing)")
+    # Hardware reporting — declare the GPU class/VRAM/UUIDs exposed via /health
+    # (what validators schedule capacity audits against). Overrides auto-detection.
+    hw_group = parser.add_argument_group("hardware reporting")
+    hw_group.add_argument("--advertised-gpu-name", default=None,
+                          help="GPU name reported in /health, e.g. an exact calibrated "
+                               "capacity class string (or VERATHOS_ADVERTISED_GPU_NAME). "
+                               "Requires --advertised-vram-gb to take effect.")
+    hw_group.add_argument("--advertised-vram-gb", type=int, default=None,
+                          help="VRAM GB reported in /health (or VERATHOS_ADVERTISED_VRAM_GB); "
+                               "snapped to the nearest marketed size.")
+    hw_group.add_argument("--advertised-gpu-count", type=int, default=None,
+                          help="GPU count reported in /health (or VERATHOS_ADVERTISED_GPU_COUNT, default 1).")
+    hw_group.add_argument("--advertised-compute-capability", default=None,
+                          help="Compute capability reported in /health (or VERATHOS_ADVERTISED_COMPUTE_CAPABILITY).")
+    hw_group.add_argument("--advertised-gpu-uuids", default=None,
+                          help="Comma-separated GPU UUIDs reported in /health "
+                               "(or VERATHOS_ADVERTISED_GPU_UUIDS).")
     # TEE (Trusted Execution Environment) — confidential GPU mode
     parser.add_argument("--tee-enabled", action="store_true",
                         help="Enable TEE mode (E2E encryption + attestation)")

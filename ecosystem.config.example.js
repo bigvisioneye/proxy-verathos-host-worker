@@ -1,40 +1,75 @@
-// PM2 ecosystem config for Verathos.
-// Auto-generate with: verathos setup
+// PM2 ecosystem config for the `advertised-hardware` branch.
 //
-// Copy and fill in your values:
-//   cp ecosystem.config.example.js ecosystem.config.js
+// This is the ORIGINAL GPU miner (local inference + local capacity audit),
+// with one addition: it can DECLARE the hardware it reports via /health —
+// GPU class name, VRAM, GPU count, compute capability, GPU UUIDs — overriding
+// auto-detection. Validators read /health to schedule capacity audits, so the
+// class you advertise is the class you are audited as.
 //
-// Network (pick one):
-//   --subtensor-network finney               # mainnet (netuid 96)
-//   --subtensor-network test                 # testnet (netuid 405)
-//   --subtensor-chain-endpoint wss://...     # local or custom subtensor
-//
-// IMPORTANT: After changing args, delete + recreate the PM2 process:
-//   pm2 delete miner && pm2 start ecosystem.config.js --only miner
-//
-// Usage:
-//   pm2 start ecosystem.config.js          # start all
+//   cp ecosystem.config.advertised-hardware.example.js ecosystem.config.js
 //   pm2 start ecosystem.config.js --only miner
-//   pm2 logs validator --lines 50
-//   pm2 stop all
-//   pm2 monit                              # live dashboard
+//
+// After changing args, delete + recreate the process (plain restart won't
+// reload argv/env):
+//   pm2 delete miner && pm2 start ecosystem.config.js --only miner
+//   # env-only changes:  pm2 restart miner --update-env
+//
+// ── The advertised-hardware flags (all optional) ──────────────────────────
+//   --advertised-gpu-name  "<exact calibrated class string>"   e.g. "NVIDIA A40"
+//   --advertised-vram-gb   <int>        snapped to nearest marketed size (46 -> 48)
+//   --advertised-gpu-count <int>        default 1
+//   --advertised-compute-capability <x.y>   e.g. 8.0
+//   --advertised-gpu-uuids "<uuid1,uuid2>"
+//
+// The override takes effect ONLY when BOTH --advertised-gpu-name AND
+// --advertised-vram-gb are set. It changes what /health, /identity and the
+// capacity-audit class report — the PHYSICAL GPU still governs which model
+// loads. Equivalent env vars work too (see the `env` block below):
+//   VERATHOS_ADVERTISED_GPU_NAME / _VRAM_GB / _GPU_COUNT /
+//   _COMPUTE_CAPABILITY / _GPU_UUIDS
+//
+// ⚠️  IMPORTANT — do not advertise UP. The capacity audit runs LOCALLY on your
+//     real GPU and must finish the advertised class's workload within that
+//     class's deadline. Advertise a class your physical card can actually pass
+//     (same as, or lower than, your real GPU). Advertising a faster class than
+//     you own makes the local audit miss the deadline and fail. There is no
+//     penalty for being faster than the advertised class.
 
 module.exports = {
   apps: [
-    // ── Miner ────────────────────────────────────────────────────
+    // ── Miner (advertised hardware) ───────────────────────────────
     // Required: --wallet, --hotkey, --netuid, --endpoint
-    // Model: --model-id auto (auto-select best for GPU) or --model-id <id> --quant <quant>
-    // Logging: INFO by default. Add --logging.debug for verbose output.
-    // TEE mode: add --tee-enabled --tee-platform tdx|sev-snp
-    // Auto-update: restarts the GPU server on new versions — use with caution
-    //   on expensive GPU instances. Consider manual updates for miners.
+    // Model:    --model-id auto  (or --model-id <id> --quant <quant>)
+    // Capacity: --capacity-audit enables the local capacity-audit worker.
     {
       name: "miner",
       script: ".venv-vllm/bin/python",
-      args: "-u -m neurons.miner --wallet <WALLET> --hotkey <HOTKEY> --netuid 96 --subtensor-network finney --model-id auto --endpoint https://<YOUR_PUBLIC_IP_OR_DOMAIN> --auto-update",
+      args: [
+        "-u -m neurons.miner",
+        "--wallet <WALLET> --hotkey <HOTKEY>",
+        "--netuid 96 --subtensor-network finney",
+        "--endpoint https://<YOUR_PUBLIC_IP_OR_DOMAIN>:<PORT>",
+        "--model-id auto",
+        "--capacity-audit",
+        // ── advertised hardware (edit or delete) ──
+        '--advertised-gpu-name "NVIDIA A40"',
+        "--advertised-vram-gb 48",
+        // "--advertised-gpu-count 1",
+        // "--advertised-compute-capability 8.6",
+        // '--advertised-gpu-uuids "GPU-xxxxxxxx-....,GPU-yyyyyyyy-...."',
+        // ── server args after `--` (port, explicit model/quant, etc.) ──
+        "-- --port 11005",
+      ].join(" "),
       cwd: "<REPO_ROOT>",
+      env: {
+        // Alternative to the CLI flags above — uncomment to use env instead.
+        // VERATHOS_ADVERTISED_GPU_NAME: "NVIDIA A40",
+        // VERATHOS_ADVERTISED_VRAM_GB: "48",
+        // VERATHOS_ADVERTISED_GPU_COUNT: "1",
+        // VERATHOS_ADVERTISED_COMPUTE_CAPABILITY: "8.6",
+        // VERATHOS_ADVERTISED_GPU_UUIDS: "GPU-xxxx...,GPU-yyyy...",
+      },
       // GPU-bound — do NOT auto-restart. Crash loops waste VRAM.
-      // Investigate before restarting manually.
       autorestart: false,
       max_restarts: 0,
       merge_logs: true,
@@ -42,38 +77,20 @@ module.exports = {
       max_size: "50M",
       retain: 3,
     },
-
-    // ── Validator ─────────────────────────────────────────────────
-    // Required: --wallet, --hotkey, --netuid
-    // Optional: --analytics (canary results, epoch scores, network receipts)
-    //           --retain-backups (keep analytics backup files; default: auto-deleted after 7 days)
-    //           --no-evm (skip on-chain registerEvm + reportOffline; use if
-    //              you don't want to fund an EVM mirror)
-    // Logging: INFO by default. Add --logging.debug for verbose output.
-    {
-      name: "validator",
-      script: ".venv-validator/bin/python",
-      // Public RPC default works out of the box.  If you run a local
-      // subtensor docker exposing both Substrate (WS) and EVM (HTTP) on
-      // the same port, append:  --subtensor-chain-endpoint ws://localhost:9944
-      // (EVM auto-translates to http://localhost:9944) — or be explicit
-      // with --evm-rpc-url http://localhost:9944 alongside it.
-      args: "-u -m neurons.validator --wallet <WALLET> --hotkey <HOTKEY> --netuid 96 --subtensor-network finney --auto-update --analytics --retain-backups",
-      cwd: "<REPO_ROOT>",
-      env: {
-        // HuggingFace token — avoids rate limits when downloading tokenizers
-        // for input commitment verification. Get one at https://huggingface.co/settings/tokens
-        HF_TOKEN: "",
-      },
-      // Auto-restart on crash (transient RPC errors, etc.)
-      autorestart: true,
-      max_restarts: 5,
-      min_uptime: "60s",
-      restart_delay: 10000,
-      merge_logs: true,
-      log_date_format: "YYYY-MM-DD HH:mm:ss",
-      max_size: "50M",
-      retain: 3,
-    },
   ],
 };
+
+// ── Example B: advertise an RTX 3090 (24 GB, class "NVIDIA GeForce RTX 3090") ──
+//   '--advertised-gpu-name "NVIDIA GeForce RTX 3090"',
+//   "--advertised-vram-gb 24",
+//
+// Calibrated class strings must match the capacity table exactly, e.g.:
+//   "NVIDIA GeForce RTX 3090"      (24 GB)
+//   "NVIDIA GeForce RTX 3090 Ti"   (24 GB)
+//   "NVIDIA GeForce RTX 4090"      (24 GB)
+//   "NVIDIA GeForce RTX 5090"      (32 GB)
+//   "NVIDIA A40"                   (48 GB, reported as 46 -> snapped to 48)
+//   "NVIDIA L40S"                  (48 GB)
+//   "NVIDIA A100-SXM4-40GB"        (40 GB)
+//   "NVIDIA A100 80GB PCIe"        (80 GB)
+//   "NVIDIA A100-SXM4-80GB"        (80 GB)

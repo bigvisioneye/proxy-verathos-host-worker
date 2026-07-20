@@ -12,6 +12,25 @@ from __future__ import annotations
 from verallm.registry.models import VRAMTier
 
 
+# Marketed VRAM sizes used by normalize_marketed_vram_gb / detect_vram_gb.
+_MARKETED_VRAM_GB = (16, 24, 32, 40, 48, 80, 96, 128, 141, 192, 288)
+
+
+def normalize_marketed_vram_gb(raw_gb: float | int) -> int:
+    """Map a raw or CLI VRAM value to the nearest marketed GPU size.
+
+    torch reports *usable* VRAM (5-12% under spec); a plain round() maps a
+    24 GB card to 24 but a 48 GB card (torch ~44.4) to 44. Round to the
+    smallest marketed spec >= raw*0.95 and within 25% of raw. Also used to
+    sanitize an operator-supplied ``--advertised-vram-gb`` to a real size.
+    """
+    raw_gb = float(raw_gb)
+    for spec in _MARKETED_VRAM_GB:
+        if spec >= raw_gb * 0.95 and spec <= raw_gb * 1.25:
+            return spec
+    return round(raw_gb)
+
+
 def detect_vram_gb(device: int = 0) -> int:
     """Return **marketed** VRAM in GB for the given CUDA device.
 
@@ -35,18 +54,7 @@ def detect_vram_gb(device: int = 0) -> int:
         raise RuntimeError("No CUDA GPU detected")
 
     total_bytes = torch.cuda.get_device_properties(device).total_memory
-    raw_gb = total_bytes / (1024 ** 3)
-
-    # Common marketed VRAM sizes.  Find the smallest spec >= raw_gb * 0.95
-    # (allowing 5% tolerance for driver overhead) that is also within 25%
-    # of the raw value (to avoid mapping a 24 GB card to 32 GB).
-    _SPEC_SIZES = (16, 24, 32, 48, 80, 96, 128, 141, 192, 288)
-    for spec in _SPEC_SIZES:
-        if spec >= raw_gb * 0.95 and spec <= raw_gb * 1.25:
-            return spec
-
-    # Fallback: plain round for unusual sizes
-    return round(raw_gb)
+    return normalize_marketed_vram_gb(total_bytes / (1024 ** 3))
 
 
 def detect_vram_tier(device: int = 0) -> VRAMTier:

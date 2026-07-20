@@ -1271,6 +1271,22 @@ def parse_args():
     auth.add_argument("--private-key", default=None,
                       help="EVM private key (Anvil — skips bittensor wallet)")
 
+    # Hardware reporting — declare the GPU class/VRAM/UUIDs exposed via the
+    # server's /health (what validators schedule capacity audits against).
+    # Forwarded to the server subprocess; overrides its auto-detection.
+    hw_group = parser.add_argument_group("hardware reporting")
+    hw_group.add_argument("--advertised-gpu-name", default=None,
+                          help="GPU name reported via /health (exact calibrated capacity "
+                               "class string). Requires --advertised-vram-gb.")
+    hw_group.add_argument("--advertised-vram-gb", type=int, default=None,
+                          help="VRAM GB reported via /health (snapped to nearest marketed size).")
+    hw_group.add_argument("--advertised-gpu-count", type=int, default=None,
+                          help="GPU count reported via /health (default 1).")
+    hw_group.add_argument("--advertised-compute-capability", default=None,
+                          help="Compute capability reported via /health, e.g. 8.0.")
+    hw_group.add_argument("--advertised-gpu-uuids", default=None,
+                          help="Comma-separated GPU UUIDs reported via /health.")
+
     # Model selection (auto or explicit, with cascading fallback)
     add_model_args(parser)
 
@@ -1598,6 +1614,18 @@ def main():
         server_args.extend(["--evm-address", neuron.evm_addr])
     if neuron.evm_pk:
         server_args.extend(["--evm-private-key", neuron.evm_pk])
+
+    # Forward operator-declared hardware to the server subprocess (/health reporting)
+    if getattr(args, "advertised_gpu_name", None):
+        server_args = _set_server_arg(server_args, "--advertised-gpu-name", str(args.advertised_gpu_name))
+    if getattr(args, "advertised_vram_gb", None) is not None:
+        server_args = _set_server_arg(server_args, "--advertised-vram-gb", str(args.advertised_vram_gb))
+    if getattr(args, "advertised_gpu_count", None) is not None:
+        server_args = _set_server_arg(server_args, "--advertised-gpu-count", str(args.advertised_gpu_count))
+    if getattr(args, "advertised_compute_capability", None):
+        server_args = _set_server_arg(server_args, "--advertised-compute-capability", str(args.advertised_compute_capability))
+    if getattr(args, "advertised_gpu_uuids", None):
+        server_args = _set_server_arg(server_args, "--advertised-gpu-uuids", str(args.advertised_gpu_uuids))
 
     # Forward log level to server subprocess
     if getattr(args, "logging.trace", False):
