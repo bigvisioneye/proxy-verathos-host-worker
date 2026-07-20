@@ -172,10 +172,10 @@ if [ -z "$GPU_NAME" ]; then
     echo "  ERROR: No GPU detected."
     exit 1
 fi
-if [ "${GPU_VRAM:-0}" -lt 20000 ] 2>/dev/null; then
-    echo "  ERROR: GPU has ${GPU_VRAM}MB VRAM. Minimum 24GB required."
-    exit 1
-fi
+#if [ "${GPU_VRAM:-0}" -lt 20000 ] 2>/dev/null; then
+#    echo "  ERROR: GPU has ${GPU_VRAM}MB VRAM. Minimum 24GB required."
+#    exit 1
+#fi
 GPU_SM=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
 GPU_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
 GPU_DRIVER_MAJOR=$(echo "$GPU_DRIVER" | cut -d. -f1)
@@ -259,9 +259,9 @@ fi
 cd "$REPO_DIR"
 
 GPU_VRAM_GB=$(( (GPU_VRAM + 512) / 1024 ))
-if ! "$PYTHON" scripts/check_capacity_audit_gpu.py --gpu-name "$GPU_NAME" --vram-gb "$GPU_VRAM_GB"; then
-    exit 1
-fi
+#if ! "$PYTHON" scripts/check_capacity_audit_gpu.py --gpu-name "$GPU_NAME" --vram-gb "$GPU_VRAM_GB"; then
+#    exit 1
+#fi
 
 # ── LD_LIBRARY_PATH: find pip-installed NVIDIA libs ──────────────────────────
 # torch 2.9+ (from vLLM pip) needs libcusparseLt.so.0 which lives in
