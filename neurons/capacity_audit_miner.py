@@ -54,6 +54,14 @@ from neurons.subnet_runtime_config import (
     capacity_audit_config_from_neuron_config,
 )
 
+# Artifact publish timeout. Proof payloads are large and miner→validator routes
+# can be slow (multi-second RTT observed from hosted GPU boxes); a 5s budget
+# caused receipt/proof upload timeouts and 409 "final receipt required" retry
+# storms against validators that never received the receipt.
+AUDIT_PUBLISH_TIMEOUT_S = float(
+    os.environ.get("VERATHOS_CAPACITY_AUDIT_PUBLISH_TIMEOUT_S", "20") or 20
+)
+
 
 @dataclass(frozen=True)
 class MinerAuditSlot:
@@ -1830,7 +1838,7 @@ class CapacityAuditMinerWorker:
                     resp = httpx.post(
                         f"{base}{path}",
                         json=artifact,
-                        timeout=5.0,
+                        timeout=AUDIT_PUBLISH_TIMEOUT_S,
                     )
                     return base, resp, None
                 except Exception as exc:
