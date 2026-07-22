@@ -481,7 +481,7 @@ class MinerNeuron:
 
         for attempt in range(1, max_attempts + 1):
             try:
-                sub = bt.Subtensor(network=self.config.subtensor_network)
+                sub = self._make_subtensor(prefer_fallback=(attempt > 1))
                 mg = sub.metagraph(self.config.netuid)
                 for uid_val in range(len(mg.hotkeys)):
                     if mg.hotkeys[uid_val] == hk_ss58:
@@ -1167,9 +1167,33 @@ class MinerNeuron:
 
     _subtensor_cache = None
 
+    def _subtensor_fallback_net(self) -> str:
+        """Public finney fallback network when the primary is a CUSTOM endpoint
+        (e.g. a dead/expired Dwellir key); empty if the primary is already public."""
+        primary = self.config.subtensor_network or ""
+        is_public = (primary in ("finney", "") or
+                     any(h in primary for h in ("opentensor.ai", "chain.opentensor")))
+        return "" if is_public else os.environ.get("VERATHOS_SUBTENSOR_FALLBACK", "finney")
+
+    def _make_subtensor(self, prefer_fallback: bool = False):
+        """Create a Subtensor, optionally preferring the public fallback network."""
+        net = self.config.subtensor_network
+        if prefer_fallback:
+            fb = self._subtensor_fallback_net()
+            if fb:
+                net = fb
+        return bt.Subtensor(network=net)
+
     def _get_subtensor(self):
         if self._subtensor_cache is None:
-            self._subtensor_cache = bt.Subtensor(network=self.config.subtensor_network)
+            try:
+                self._subtensor_cache = bt.Subtensor(network=self.config.subtensor_network)
+            except Exception as e:
+                fb = self._subtensor_fallback_net()
+                if not fb:
+                    raise
+                bt.logging.warning(f"Subtensor primary failed ({e}); using public fallback {fb}")
+                self._subtensor_cache = bt.Subtensor(network=fb)
         return self._subtensor_cache
 
     def _refresh_metagraph_stats(self) -> None:

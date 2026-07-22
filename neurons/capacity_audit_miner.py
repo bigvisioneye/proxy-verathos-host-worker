@@ -350,7 +350,37 @@ class CapacityAuditMinerWorker:
 
     def _subtensor(self):
         SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
-        return SubtensorCls(network=self.config.subtensor_network)
+        net = self.config.subtensor_network
+        if getattr(self, "_sub_use_fallback", False) and getattr(self, "_sub_fallback_net", ""):
+            net = self._sub_fallback_net
+        return SubtensorCls(network=net)
+
+    def _note_sub_failure(self) -> None:
+        """Count consecutive substrate failures; after a few, fall back to the
+        public finney endpoint — but ONLY when the primary is a CUSTOM RPC
+        (e.g. a dead/expired Dwellir key). Keeps capacity audits alive on a bad
+        key instead of hammering a 403 endpoint forever. Restart re-engages the
+        primary."""
+        if not hasattr(self, "_sub_fail_streak"):
+            self._sub_fail_streak = 0
+            self._sub_use_fallback = False
+            primary = self.config.subtensor_network or ""
+            is_public = (primary in ("finney", "") or
+                         any(h in primary for h in ("opentensor.ai", "chain.opentensor")))
+            self._sub_fallback_net = "" if is_public else os.getenv(
+                "VERATHOS_SUBTENSOR_FALLBACK", "finney")
+        self._sub_fail_streak += 1
+        if (self._sub_fallback_net and not self._sub_use_fallback
+                and self._sub_fail_streak >= 3):
+            bt.logging.warning(
+                "Capacity audit block stream: primary RPC failed "
+                f"{self._sub_fail_streak}x; falling back to public "
+                f"{self._sub_fallback_net} (restart to re-engage primary)"
+            )
+            self._sub_use_fallback = True
+
+    def _note_sub_success(self) -> None:
+        self._sub_fail_streak = 0
 
     def _get_block_hash(self, subtensor, block_number: int) -> Optional[bytes]:
         raw = None
@@ -695,8 +725,12 @@ class CapacityAuditMinerWorker:
                         last_block = int(state.last_block)
                         started_at = float(state.started_at)
                     last_block = catch_up_if_due(now, last_block, active)
+                    if last_header_at and last_header_at != getattr(self, "_prev_header_at", 0.0):
+                        self._prev_header_at = last_header_at
+                        self._note_sub_success()
                     if error is not None:
                         bt.logging.warning(f"Capacity audit block stream ended: {error}")
+                        self._note_sub_failure()
                         break
                     reference_at = last_header_at or started_at
                     if not active and now - reference_at > watchdog_s:
@@ -714,6 +748,7 @@ class CapacityAuditMinerWorker:
                     last_block = self._poll_catch_up(last_block)
             except Exception as exc:
                 bt.logging.warning(f"Capacity audit miner worker error: {exc}")
+                self._note_sub_failure()
                 last_block = self._poll_catch_up(last_block)
                 time.sleep(min(60.0, self.poll_interval_s * 2))
             finally:

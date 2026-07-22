@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -64,34 +65,23 @@ class Web3Provider:
     """
 
     def __init__(self, config: ChainConfig):
-        from web3 import Web3
-        from web3.middleware import ExtraDataToPOAMiddleware
-
         self.config = config
 
-        if config.rpc_url.startswith("wss://") or config.rpc_url.startswith("ws://"):
-            self.w3 = Web3(Web3.WebsocketProvider(config.rpc_url))
-        else:
-            # Limit connection pool to prevent CLOSE-WAIT socket accumulation
-            # during RPC rate limiting (429s leave dangling connections).
-            from requests.adapters import HTTPAdapter
-            from urllib3.util.retry import Retry as _Retry
-            provider = Web3.HTTPProvider(
-                config.rpc_url,
-                request_kwargs={"timeout": 15},
-            )
-            adapter = HTTPAdapter(
-                pool_connections=2,
-                pool_maxsize=5,
-                max_retries=_Retry(total=0),  # we handle retries ourselves
-            )
-            provider._session = __import__("requests").Session()
-            provider._session.mount("https://", adapter)
-            provider._session.mount("http://", adapter)
-            self.w3 = Web3(provider)
+        # RPC fallback: when the configured primary is a CUSTOM endpoint (e.g. a
+        # Dwellir key) and it fails hard (dead/expired key -> 403, or repeated
+        # errors), transparently fall back to the public finney EVM RPC so
+        # renewals/registrations can't be silently killed by a bad key.
+        self._w3_swap_lock = threading.Lock()
+        self._primary_rpc = config.rpc_url
+        self._using_fallback = False
+        _pub = ("opentensor.ai", "chain.opentensor", "finney")
+        _primary_is_public = any(h in config.rpc_url for h in _pub)
+        self._fallback_rpc = (
+            "" if _primary_is_public
+            else os.getenv("VERATHOS_EVM_RPC_FALLBACK", "https://lite.chain.opentensor.ai")
+        )
 
-        # Bittensor EVM is a PoA chain — inject middleware for extraData
-        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        self.w3 = self._build_w3(config.rpc_url)
 
         # Nonce tracking to avoid race conditions on rapid transactions
         self._nonce_lock = threading.Lock()
@@ -114,6 +104,54 @@ class Web3Provider:
             config.max_retries = 5
             config.retry_delay = 3.0
 
+    def _build_w3(self, rpc_url: str):
+        """Construct a Web3 client for the given RPC URL (WSS or HTTP)."""
+        from web3 import Web3
+        from web3.middleware import ExtraDataToPOAMiddleware
+
+        if rpc_url.startswith("wss://") or rpc_url.startswith("ws://"):
+            w3 = Web3(Web3.WebsocketProvider(rpc_url))
+        else:
+            # Limit connection pool to prevent CLOSE-WAIT socket accumulation
+            # during RPC rate limiting (429s leave dangling connections).
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry as _Retry
+            provider = Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15})
+            adapter = HTTPAdapter(
+                pool_connections=2,
+                pool_maxsize=5,
+                max_retries=_Retry(total=0),  # we handle retries ourselves
+            )
+            provider._session = __import__("requests").Session()
+            provider._session.mount("https://", adapter)
+            provider._session.mount("http://", adapter)
+            w3 = Web3(provider)
+
+        # Bittensor EVM is a PoA chain — inject middleware for extraData
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        return w3
+
+    def _switch_to_fallback(self) -> bool:
+        """Swap self.w3 to the public fallback RPC. Returns True if switched
+        (or already on fallback); False if no fallback is configured."""
+        if not self._fallback_rpc:
+            return False
+        with self._w3_swap_lock:
+            if self._using_fallback:
+                return True
+            logger.warning(
+                "EVM RPC primary %s is failing; falling back to public %s. "
+                "Restart the miner to re-engage the primary once it is healthy.",
+                self._primary_rpc, self._fallback_rpc,
+            )
+            self.config.rpc_url = self._fallback_rpc
+            self.w3 = self._build_w3(self._fallback_rpc)
+            # public RPCs need the inter-call pacing + patient retries
+            self._is_public_rpc = True
+            self._rpc_min_interval = 1.1
+            self._using_fallback = True
+            return True
+
     def get_contract(self, address: str, abi_name: str):
         """Load a contract instance by address and ABI name."""
         from web3 import Web3
@@ -124,6 +162,17 @@ class Web3Provider:
         )
 
     def call_with_retry(self, fn: Callable[[], T]) -> T:
+        """Retry with backoff; if a CUSTOM primary RPC fails completely, fall
+        back to the public finney RPC and retry there (so a dead/expired key
+        can't silently kill the miner). No-op fallback for public primaries."""
+        try:
+            return self._attempt_with_retry(fn)
+        except Exception:
+            if not self._using_fallback and self._switch_to_fallback():
+                return self._attempt_with_retry(fn)
+            raise
+
+    def _attempt_with_retry(self, fn: Callable[[], T]) -> T:
         """Call a view function with retry and exponential backoff.
 
         Automatically detects HTTP 429 (rate limit) and uses longer backoff
