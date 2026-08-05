@@ -39,6 +39,7 @@ class ActiveMiner:
     vram_gb: int = 0
     compute_capability: str = ""
     gpu_uuids: List[str] = field(default_factory=list)
+    proof_protocol_versions: List[int] = field(default_factory=list)
 
 
 def discover_active_miners(

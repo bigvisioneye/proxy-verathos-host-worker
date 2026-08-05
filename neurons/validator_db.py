@@ -291,6 +291,38 @@ class ValidatorStateDB:
             CREATE INDEX IF NOT EXISTS idx_network_receipts_validator
                 ON network_receipts(validator_hotkey, epoch_number);
 
+            -- Validator-owned signed receipts are authoritative for its own
+            -- canary obligations.  They must survive restart and must not
+            -- depend on the miner returning the receipt at epoch close.
+            CREATE TABLE IF NOT EXISTS local_service_receipts (
+                epoch_number        INTEGER NOT NULL,
+                validator_signature TEXT NOT NULL,
+                miner_address       TEXT NOT NULL,
+                model_index         INTEGER NOT NULL,
+                receipt_json        TEXT NOT NULL,
+                created_at          REAL NOT NULL,
+                PRIMARY KEY (epoch_number, validator_signature)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_local_service_receipts_epoch
+                ON local_service_receipts(epoch_number);
+            CREATE INDEX IF NOT EXISTS idx_local_service_receipts_miner
+                ON local_service_receipts(
+                    epoch_number, miner_address, model_index
+                );
+
+            CREATE TABLE IF NOT EXISTS proof_v3_hard_failures (
+                outcome_digest      TEXT PRIMARY KEY,
+                source_epoch        INTEGER NOT NULL,
+                miner_address       TEXT NOT NULL,
+                model_index         INTEGER NOT NULL,
+                outcome_json        TEXT NOT NULL,
+                created_at          REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_proof_v3_hard_failures_epoch
+                ON proof_v3_hard_failures(source_epoch);
+
             CREATE INDEX IF NOT EXISTS idx_canary_epoch
                 ON canary_results(epoch_number);
             CREATE INDEX IF NOT EXISTS idx_canary_miner
@@ -365,13 +397,16 @@ class ValidatorStateDB:
                 slot_id              TEXT NOT NULL,
                 lease_id             TEXT NOT NULL,
                 claimed_gpu_class    TEXT NOT NULL DEFAULT '',
+                gpu_index            INTEGER NOT NULL DEFAULT 0,
                 pass_count           INTEGER NOT NULL DEFAULT 0,
+                workload_spec        TEXT NOT NULL DEFAULT '{}',
                 deadline_s           REAL NOT NULL DEFAULT 0.0,
                 transport_grace_s    REAL NOT NULL DEFAULT 0.0,
                 payload_deadline_s   REAL NOT NULL DEFAULT 0.0,
                 drain_until_ts       REAL NOT NULL DEFAULT 0.0,
                 pass0_received_at    REAL,
                 final_received_at    REAL,
+                final_observed_block INTEGER,
                 proof_received_at    REAL,
                 pass0_root           TEXT NOT NULL DEFAULT '',
                 final_root           TEXT NOT NULL DEFAULT '',
@@ -381,6 +416,8 @@ class ValidatorStateDB:
                 proof_verify_ms      REAL,
                 verdict              TEXT NOT NULL DEFAULT 'pending',
                 failure_reason       TEXT,
+                probation_required   INTEGER NOT NULL DEFAULT 0,
+                probation_applied_at REAL,
                 pass0_artifact       TEXT,
                 final_artifact       TEXT,
                 proof_artifact_path  TEXT,
@@ -415,6 +452,7 @@ class ValidatorStateDB:
                 slot_id              TEXT NOT NULL DEFAULT '',
                 lease_id             TEXT NOT NULL DEFAULT '',
                 claimed_gpu_class    TEXT NOT NULL DEFAULT '',
+                gpu_index            INTEGER NOT NULL DEFAULT 0,
                 pass_count           INTEGER NOT NULL DEFAULT 0,
                 epoch_number         INTEGER NOT NULL DEFAULT 0,
                 selection_block      INTEGER NOT NULL DEFAULT 0,
@@ -425,6 +463,8 @@ class ValidatorStateDB:
                 proof_status         TEXT NOT NULL DEFAULT '',
                 failure_reason       TEXT,
                 proof_verify_ms      REAL,
+                probation_required   INTEGER NOT NULL DEFAULT 0,
+                probation_applied_at REAL,
                 pass0_received_at    REAL,
                 final_received_at    REAL,
                 proof_received_at    REAL,
@@ -488,6 +528,46 @@ class ValidatorStateDB:
         self._ensure_column(
             "capacity_audit_slots",
             "proof_verify_ms",
+            "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_slots",
+            "final_observed_block",
+            "INTEGER",
+        )
+        self._ensure_column(
+            "capacity_audit_slots",
+            "workload_spec",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._ensure_column(
+            "capacity_audit_slots",
+            "gpu_index",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "capacity_audit_history",
+            "gpu_index",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "capacity_audit_slots",
+            "probation_required",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "capacity_audit_slots",
+            "probation_applied_at",
+            "REAL",
+        )
+        self._ensure_column(
+            "capacity_audit_history",
+            "probation_required",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "capacity_audit_history",
+            "probation_applied_at",
             "REAL",
         )
         self._ensure_column(
@@ -1488,9 +1568,15 @@ class ValidatorStateDB:
                         miner_hotkey_ss58, endpoint,
                         model_id, quant, max_context_len, gpu_name, gpu_count,
                         vram_gb, group_key, slot_id, lease_id, claimed_gpu_class,
-                        pass_count, deadline_s, transport_grace_s,
+                        gpu_index, pass_count, workload_spec, deadline_s, transport_grace_s,
                         payload_deadline_s, drain_until_ts, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?
+                    )""",
                     (
                         audit_id,
                         str(slot["miner_address"]).lower(),
@@ -1508,7 +1594,13 @@ class ValidatorStateDB:
                         str(slot["slot_id"]),
                         str(slot["lease_id"]),
                         str(slot.get("claimed_gpu_class", "")),
+                        int(slot.get("gpu_index", 0) or 0),
                         int(slot.get("pass_count", 0) or 0),
+                        json.dumps(
+                            slot.get("workload_spec") or {},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
                         float(slot.get("deadline_s", 0.0) or 0.0),
                         float(slot.get("transport_grace_s", 0.0) or 0.0),
                         float(slot.get("payload_deadline_s", 0.0) or 0.0),
@@ -1717,15 +1809,14 @@ class ValidatorStateDB:
                 self._conn.execute(
                     """UPDATE capacity_audit_slots
                        SET verdict = CASE
-                             WHEN verdict IN ('pending', 'pass0_seen', 'timing_pass', 'timing_miss', 'no_show', 'hard_proof_miss')
-                             THEN 'chain_reorged'
+                             WHEN verdict != 'chain_reorged' THEN 'chain_reorged'
                              ELSE verdict
                            END,
                            failure_reason = CASE
-                             WHEN verdict IN ('pending', 'pass0_seen', 'timing_pass', 'timing_miss', 'no_show', 'hard_proof_miss')
-                             THEN 'audit_block_reorged'
+                             WHEN verdict != 'chain_reorged' THEN 'audit_block_reorged'
                              ELSE failure_reason
                            END,
+                           probation_required = 0,
                            drain_until_ts = CASE
                              WHEN drain_until_ts > ? THEN ? ELSE drain_until_ts
                            END,
@@ -1787,6 +1878,7 @@ class ValidatorStateDB:
         now: Optional[float] = None,
         *,
         require_proof_payload: bool = False,
+        probation_required: bool = False,
         return_slots: bool = False,
     ) -> int | List[dict]:
         """Mark audit misses after validator deadlines.
@@ -1832,6 +1924,9 @@ class ValidatorStateDB:
             )
             updated = cur.rowcount or 0
             if require_proof_payload:
+                # Security invariant: the proof deadline starts when B_proof is
+                # first observed.  Finalization lag must never grant the miner
+                # extra workspace-retention or proof-construction time.
                 if return_slots:
                     rows = self._conn.execute(
                         """SELECT s.audit_id, s.miner_address, s.model_index,
@@ -1865,6 +1960,9 @@ class ValidatorStateDB:
                        SET proof_status = 'missing_payload',
                            verdict = 'hard_proof_miss',
                            failure_reason = COALESCE(failure_reason, 'missing_proof_payload'),
+                           probation_required = CASE
+                               WHEN ? != 0 THEN 1 ELSE probation_required
+                           END,
                            updated_at = ?
                        WHERE verdict = 'timing_pass'
                          AND proof_status = 'pending'
@@ -1887,7 +1985,7 @@ class ValidatorStateDB:
                            FROM capacity_audit_windows w
                            WHERE w.audit_id = capacity_audit_slots.audit_id
                          ) + payload_deadline_s""",
-                    (ts, ts),
+                    (1 if probation_required else 0, ts, ts),
                 )
                 updated += cur.rowcount or 0
             self._conn.commit()
@@ -1920,17 +2018,22 @@ class ValidatorStateDB:
         pass0_root: str,
         artifact: dict,
         received_at: Optional[float] = None,
-    ) -> None:
+    ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 """UPDATE capacity_audit_slots
                    SET pass0_received_at = COALESCE(pass0_received_at, ?),
                        pass0_root = ?,
                        pass0_artifact = ?,
                        verdict = CASE WHEN verdict = 'pending' THEN 'pass0_seen' ELSE verdict END,
                        updated_at = ?
-                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND EXISTS (
+                       SELECT 1 FROM capacity_audit_windows w
+                       WHERE w.audit_id = capacity_audit_slots.audit_id
+                         AND w.chain_status != 'reorged'
+                     )""",
                 (
                     ts,
                     pass0_root,
@@ -1942,6 +2045,7 @@ class ValidatorStateDB:
                 ),
             )
             self._conn.commit()
+        return (cur.rowcount or 0) == 1
 
     def record_capacity_audit_final(
         self,
@@ -1955,27 +2059,72 @@ class ValidatorStateDB:
         timing_status: str,
         verdict: str,
         failure_reason: str = "",
+        probation_required: bool = False,
+        final_observed_block: Optional[int] = None,
         received_at: Optional[float] = None,
-    ) -> None:
+    ) -> Tuple[Optional[dict], bool]:
+        """Persist the first final receipt without letting retries retime it.
+
+        Miner delivery is at-least-once: a committed request can be retried when
+        its HTTP response is lost. Timing, transcript, and validator-observed
+        chronology belong to the first accepted delivery. A later hard failure
+        may update the verdict without replacing those commitments.
+        """
         ts = time.time() if received_at is None else float(received_at)
         pass0_root = str(artifact.get("pass0_root") or "")
+        observed_block = (
+            None
+            if final_observed_block is None
+            else max(0, int(final_observed_block))
+        )
+        hard_override = verdict == "hard_proof_miss"
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 """UPDATE capacity_audit_slots
-                   SET final_received_at = COALESCE(final_received_at, ?),
-                       pass0_root = CASE
-                           WHEN pass0_root = '' THEN ? ELSE pass0_root
+                   SET final_received_at = CASE
+                           WHEN final_received_at IS NULL THEN ?
+                           ELSE final_received_at
                        END,
-                       final_root = ?,
-                       transcript_root = ?,
-                       final_artifact = ?,
+                       final_observed_block = CASE
+                           WHEN final_received_at IS NULL THEN ?
+                           ELSE final_observed_block
+                       END,
+                       pass0_root = CASE
+                           WHEN final_received_at IS NULL AND pass0_root = '' THEN ?
+                           ELSE pass0_root
+                       END,
+                       final_root = CASE
+                           WHEN final_received_at IS NULL THEN ?
+                           ELSE final_root
+                       END,
+                       transcript_root = CASE
+                           WHEN final_received_at IS NULL THEN ?
+                           ELSE transcript_root
+                       END,
+                       final_artifact = CASE
+                           WHEN final_received_at IS NULL THEN ?
+                           ELSE final_artifact
+                       END,
                        timing_status = ?,
                        verdict = ?,
                        failure_reason = COALESCE(NULLIF(?, ''), failure_reason),
+                       probation_required = CASE
+                           WHEN ? != 0 THEN 1 ELSE probation_required
+                       END,
                        updated_at = ?
-                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND EXISTS (
+                       SELECT 1 FROM capacity_audit_windows w
+                       WHERE w.audit_id = capacity_audit_slots.audit_id
+                         AND w.chain_status != 'reorged'
+                     )
+                     AND (
+                       final_received_at IS NULL
+                       OR (? = 1 AND verdict != 'hard_proof_miss')
+                     )""",
                 (
                     ts,
+                    observed_block,
                     pass0_root,
                     final_root,
                     transcript_root,
@@ -1983,13 +2132,83 @@ class ValidatorStateDB:
                     timing_status,
                     verdict,
                     failure_reason,
+                    1 if probation_required else 0,
                     ts,
                     audit_id,
                     address.lower(),
                     int(model_index),
+                    int(hard_override),
                 ),
             )
+            row = self._conn.execute(
+                """SELECT *
+                   FROM capacity_audit_slots
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                (audit_id, address.lower(), int(model_index)),
+            ).fetchone()
             self._conn.commit()
+        return (dict(row) if row is not None else None, bool(cur.rowcount))
+
+    def reconcile_capacity_audit_duplicate_timing_misses(
+        self,
+        *,
+        reconciled_at: Optional[float] = None,
+    ) -> dict[str, int]:
+        """Repair timing misses created by late retries of on-time final receipts."""
+        ts = time.time() if reconciled_at is None else float(reconciled_at)
+        on_time_final = """
+            s.final_received_at IS NOT NULL
+            AND w.audit_start_observed_at IS NOT NULL
+            AND s.deadline_s > 0
+            AND s.final_received_at <= (
+                w.audit_start_observed_at
+                + s.deadline_s
+                + MAX(0.0, s.transport_grace_s)
+            )
+        """
+        with self._lock:
+            history_cur = self._conn.execute(
+                f"""UPDATE capacity_audit_history AS h
+                    SET verdict = 'timing_pass',
+                        timing_status = 'pass',
+                        failure_reason = NULL,
+                        slot_updated_at = ?
+                    WHERE h.verdict = 'timing_miss'
+                      AND h.failure_reason = 'deadline_exceeded'
+                      AND EXISTS (
+                        SELECT 1
+                        FROM capacity_audit_slots s
+                        JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                        WHERE s.audit_id = h.audit_id
+                          AND s.miner_address = h.miner_address
+                          AND s.model_index = h.model_index
+                          AND s.verdict = 'timing_miss'
+                          AND s.failure_reason = 'deadline_exceeded'
+                          AND {on_time_final}
+                      )""",
+                (ts,),
+            )
+            slot_cur = self._conn.execute(
+                f"""UPDATE capacity_audit_slots AS s
+                    SET verdict = 'timing_pass',
+                        timing_status = 'pass',
+                        failure_reason = NULL,
+                        updated_at = ?
+                    WHERE s.verdict = 'timing_miss'
+                      AND s.failure_reason = 'deadline_exceeded'
+                      AND EXISTS (
+                        SELECT 1
+                        FROM capacity_audit_windows w
+                        WHERE w.audit_id = s.audit_id
+                          AND {on_time_final}
+                      )""",
+                (ts,),
+            )
+            self._conn.commit()
+        return {
+            "slot_rows": int(slot_cur.rowcount or 0),
+            "history_rows": int(history_cur.rowcount or 0),
+        }
 
     def record_capacity_audit_proof_verdict(
         self,
@@ -2002,12 +2221,13 @@ class ValidatorStateDB:
         failure_reason: str = "",
         proof_artifact_path: str = "",
         proof_verify_ms: Optional[float] = None,
+        probation_required: bool = False,
         received_at: Optional[float] = None,
-    ) -> None:
+    ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
         verify_ms = None if proof_verify_ms is None else max(0.0, float(proof_verify_ms))
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 """UPDATE capacity_audit_slots
                    SET proof_received_at = COALESCE(proof_received_at, ?),
                        proof_status = ?,
@@ -2015,8 +2235,16 @@ class ValidatorStateDB:
                        verdict = ?,
                        failure_reason = COALESCE(NULLIF(?, ''), failure_reason),
                        proof_artifact_path = COALESCE(NULLIF(?, ''), proof_artifact_path),
+                       probation_required = CASE
+                           WHEN ? != 0 THEN 1 ELSE probation_required
+                       END,
                        updated_at = ?
-                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND EXISTS (
+                       SELECT 1 FROM capacity_audit_windows w
+                       WHERE w.audit_id = capacity_audit_slots.audit_id
+                         AND w.chain_status != 'reorged'
+                     )""",
                 (
                     ts,
                     proof_status,
@@ -2024,6 +2252,7 @@ class ValidatorStateDB:
                     verdict,
                     failure_reason,
                     proof_artifact_path,
+                    1 if probation_required else 0,
                     ts,
                     audit_id,
                     address.lower(),
@@ -2031,6 +2260,111 @@ class ValidatorStateDB:
                 ),
             )
             self._conn.commit()
+        return (cur.rowcount or 0) == 1
+
+    def apply_finalized_capacity_audit_probation_once(
+        self,
+        *,
+        audit_id: str,
+        address: str,
+        model_index: int,
+        epoch: int,
+        applied_at: Optional[float] = None,
+    ) -> Optional[dict]:
+        """Atomically apply one finalized capacity-audit probation event.
+
+        The slot must already belong to a chain-confirmed window and have
+        ``probation_required`` set when the failure was observed. The slot
+        marker, persisted probation state, and EMA decay commit together so a
+        restarted validator cannot apply the same audit penalty twice.
+        """
+
+        ts = time.time() if applied_at is None else float(applied_at)
+        address = address.lower()
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT
+                       s.endpoint,
+                       s.failure_reason,
+                       s.probation_required,
+                       s.probation_applied_at,
+                       w.chain_status,
+                       m.probation_entered_epoch,
+                       m.ema_score
+                   FROM capacity_audit_slots s
+                   JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                   LEFT JOIN miner_entries m
+                     ON m.address = s.miner_address
+                    AND m.model_index = s.model_index
+                   WHERE s.audit_id = ?
+                     AND s.miner_address = ?
+                     AND s.model_index = ?
+                     AND s.verdict = 'hard_proof_miss'""",
+                (audit_id, address, int(model_index)),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["chain_status"] or "") != "confirmed"
+                or not bool(row["probation_required"])
+                or row["probation_applied_at"] is not None
+            ):
+                return None
+
+            miner_exists = row["ema_score"] is not None
+            was_on_probation = row["probation_entered_epoch"] is not None
+            if miner_exists:
+                self._conn.execute(
+                    """UPDATE miner_entries
+                       SET probation_entered_epoch = COALESCE(
+                               probation_entered_epoch, ?
+                           ),
+                           probation_consecutive_passes = 0,
+                           ema_score = ema_score * 0.5,
+                           updated_at = ?
+                       WHERE address = ? AND model_index = ?""",
+                    (int(epoch), ts, address, int(model_index)),
+                )
+            cur = self._conn.execute(
+                """UPDATE capacity_audit_slots
+                   SET probation_applied_at = ?,
+                       updated_at = ?
+                   WHERE audit_id = ?
+                     AND miner_address = ?
+                     AND model_index = ?
+                     AND probation_applied_at IS NULL
+                     AND probation_required != 0""",
+                (ts, ts, audit_id, address, int(model_index)),
+            )
+            if (cur.rowcount or 0) != 1:
+                self._conn.rollback()
+                return None
+            self._conn.commit()
+            return {
+                "audit_id": audit_id,
+                "address": address,
+                "model_index": int(model_index),
+                "endpoint": str(row["endpoint"] or ""),
+                "failure_reason": str(row["failure_reason"] or ""),
+                "miner_exists": miner_exists,
+                "was_on_probation": was_on_probation,
+            }
+
+    def get_finalized_capacity_audit_probation_candidates(self) -> List[dict]:
+        """Return unapplied hard-proof failures whose chain anchors are final."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT s.audit_id, s.miner_address, s.model_index,
+                          s.endpoint, s.failure_reason
+                   FROM capacity_audit_slots s
+                   JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
+                   WHERE s.verdict = 'hard_proof_miss'
+                     AND s.probation_required != 0
+                     AND s.probation_applied_at IS NULL
+                     AND w.chain_status = 'confirmed'
+                   ORDER BY s.updated_at ASC, s.audit_id ASC""",
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_capacity_audit_proof_received(
         self,
@@ -2039,10 +2373,10 @@ class ValidatorStateDB:
         address: str,
         model_index: int,
         received_at: Optional[float] = None,
-    ) -> None:
+    ) -> bool:
         ts = time.time() if received_at is None else float(received_at)
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 """UPDATE capacity_audit_slots
                    SET proof_received_at = COALESCE(proof_received_at, ?),
                        proof_status = CASE
@@ -2050,7 +2384,12 @@ class ValidatorStateDB:
                            ELSE proof_status
                        END,
                        updated_at = ?
-                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?""",
+                   WHERE audit_id = ? AND miner_address = ? AND model_index = ?
+                     AND EXISTS (
+                       SELECT 1 FROM capacity_audit_windows w
+                       WHERE w.audit_id = capacity_audit_slots.audit_id
+                         AND w.chain_status != 'reorged'
+                     )""",
                 (
                     ts,
                     ts,
@@ -2060,6 +2399,7 @@ class ValidatorStateDB:
                 ),
             )
             self._conn.commit()
+        return (cur.rowcount or 0) == 1
 
     def release_capacity_audit_drain(
         self,
@@ -2111,7 +2451,12 @@ class ValidatorStateDB:
                      AND verdict = 'timing_pass'
                      AND (
                        ? = 0
-                       OR proof_status IN ('proof_verified', 'combined_proof_verified')
+                       OR proof_status IN (
+                         'proof_verified',
+                         'combined_proof_verified',
+                         'legacy_combined_proof_compatibility_accepted',
+                         'legacy_combined_proof_grace_accepted'
+                       )
                      )""",
                 (
                     ts,
@@ -2499,6 +2844,8 @@ class ValidatorStateDB:
             }
         final_proof_statuses = (
             "combined_proof_verified",
+            "legacy_combined_proof_compatibility_accepted",
+            "legacy_combined_proof_grace_accepted",
             "proof_verified",
             "invalid_payload",
             "verify_error",
@@ -2559,9 +2906,10 @@ class ValidatorStateDB:
                         miner_hotkey_ss58, endpoint,
                         model_id, quant, max_context_len, gpu_name, gpu_count,
                         vram_gb, group_key, slot_id, lease_id, claimed_gpu_class,
-                        pass_count, epoch_number, selection_block, audit_block,
+                        gpu_index, pass_count, epoch_number, selection_block, audit_block,
                         proof_challenge_block, verdict, timing_status, proof_status,
-                        failure_reason, proof_verify_ms, pass0_received_at,
+                        failure_reason, proof_verify_ms, probation_required,
+                        probation_applied_at, pass0_received_at,
                         final_received_at, proof_received_at, slot_created_at,
                         slot_updated_at, archived_at
                     )
@@ -2570,10 +2918,11 @@ class ValidatorStateDB:
                         s.miner_hotkey_ss58, s.endpoint, s.model_id, s.quant,
                         s.max_context_len, s.gpu_name,
                         s.gpu_count, s.vram_gb, s.group_key, s.slot_id, s.lease_id,
-                        s.claimed_gpu_class, s.pass_count, w.epoch_number,
+                        s.claimed_gpu_class, s.gpu_index, s.pass_count, w.epoch_number,
                         w.selection_block, w.audit_block, w.proof_challenge_block,
                         s.verdict, s.timing_status, s.proof_status, s.failure_reason,
-                        s.proof_verify_ms, s.pass0_received_at, s.final_received_at,
+                        s.proof_verify_ms, s.probation_required,
+                        s.probation_applied_at, s.pass0_received_at, s.final_received_at,
                         s.proof_received_at, s.created_at, s.updated_at, ?
                     FROM capacity_audit_slots s
                     JOIN capacity_audit_windows w ON w.audit_id = s.audit_id
@@ -2618,7 +2967,12 @@ class ValidatorStateDB:
                        WHERE epoch_number <= ?
                    )
                      AND verdict IN ('timing_pass', 'timing_excused')
-                     AND proof_status IN ('combined_proof_verified', 'proof_verified')""",
+                     AND proof_status IN (
+                       'combined_proof_verified',
+                       'legacy_combined_proof_compatibility_accepted',
+                       'legacy_combined_proof_grace_accepted',
+                       'proof_verified'
+                     )""",
                 (int(current_epoch),),
             )
             failure_cur = self._conn.execute(
@@ -3957,6 +4311,147 @@ class ValidatorStateDB:
             )
             self._conn.commit()
         return len(rows)
+
+    def store_local_service_receipt(self, receipt: dict) -> None:
+        """Persist one validator-owned signed receipt before peer transport."""
+
+        if not isinstance(receipt, dict):
+            raise TypeError("local service receipt must be a mapping")
+        epoch_number = int(receipt["epoch_number"])
+        model_index = int(receipt["model_index"])
+        miner_address = str(receipt["miner_address"]).lower()
+        signature = str(receipt["validator_signature"]).lower()
+        if epoch_number < 0 or model_index < 0 or not miner_address:
+            raise ValueError("local service receipt identity is invalid")
+        if len(signature) != 128:
+            raise ValueError("local service receipt signature is invalid")
+        try:
+            bytes.fromhex(signature)
+        except ValueError as exc:
+            raise ValueError(
+                "local service receipt signature is invalid"
+            ) from exc
+        encoded = json.dumps(
+            receipt,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO local_service_receipts (
+                    epoch_number, validator_signature, miner_address,
+                    model_index, receipt_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    epoch_number,
+                    signature,
+                    miner_address,
+                    model_index,
+                    encoded,
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+
+    def get_local_service_receipts(self, epoch_number: int) -> List[dict]:
+        """Return canonical validator-owned receipts for one epoch."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT receipt_json
+                   FROM local_service_receipts
+                   WHERE epoch_number = ?
+                   ORDER BY created_at ASC, validator_signature ASC""",
+                (int(epoch_number),),
+            ).fetchall()
+        receipts: List[dict] = []
+        for row in rows:
+            value = json.loads(row["receipt_json"])
+            if not isinstance(value, dict):
+                raise ValueError("local service receipt row is malformed")
+            receipts.append(value)
+        return receipts
+
+    def gc_local_service_receipts(self, minimum_epoch: int) -> int:
+        """Delete locally-owned receipts older than the retained epoch floor."""
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM local_service_receipts WHERE epoch_number < ?",
+                (max(0, int(minimum_epoch)),),
+            )
+            self._conn.commit()
+            return max(0, int(cursor.rowcount or 0))
+
+    def store_proof_v3_hard_failure(
+        self,
+        outcome: dict,
+        outcome_digest: bytes,
+    ) -> None:
+        """Persist one canonical owner-signed hard-audit failure."""
+
+        if not isinstance(outcome, dict) or len(outcome_digest) != 32:
+            raise ValueError("proof-v3 hard failure is malformed")
+        source_epoch = int(outcome["source_epoch"])
+        miner_address = str(outcome["miner_address"]).lower()
+        model_index = int(outcome["model_index"])
+        encoded = json.dumps(
+            outcome,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO proof_v3_hard_failures (
+                    outcome_digest, source_epoch, miner_address,
+                    model_index, outcome_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    outcome_digest.hex(),
+                    source_epoch,
+                    miner_address,
+                    model_index,
+                    encoded,
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+
+    def get_proof_v3_hard_failures(
+        self,
+        minimum_epoch: int,
+        maximum_epoch: int,
+    ) -> List[dict]:
+        """Return signed hard-audit failures in canonical database order."""
+
+        lower = max(0, int(minimum_epoch))
+        upper = max(lower, int(maximum_epoch))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT outcome_json
+                   FROM proof_v3_hard_failures
+                   WHERE source_epoch BETWEEN ? AND ?
+                   ORDER BY source_epoch ASC, outcome_digest ASC""",
+                (lower, upper),
+            ).fetchall()
+        values: List[dict] = []
+        for row in rows:
+            value = json.loads(row["outcome_json"])
+            if not isinstance(value, dict):
+                raise ValueError("proof-v3 hard failure row is malformed")
+            values.append(value)
+        return values
+
+    def gc_proof_v3_hard_failures(self, minimum_epoch: int) -> int:
+        """Delete signed hard failures older than the public retention floor."""
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM proof_v3_hard_failures WHERE source_epoch < ?",
+                (max(0, int(minimum_epoch)),),
+            )
+            self._conn.commit()
+            return max(0, int(cursor.rowcount or 0))
 
     def backup_and_cleanup_canary_results(self, retain_days: int = 7, backup_dir: str = "") -> int:
         """Export old canary_results to .jsonl.gz, then delete from live DB."""

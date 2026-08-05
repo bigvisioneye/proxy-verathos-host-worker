@@ -28,6 +28,7 @@ Each neuron adds ``--auto-update`` to its argparser.  When enabled::
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import logging
 import bittensor as bt
 import os
@@ -36,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -123,6 +125,177 @@ def install_local_zkllm_wheel() -> bool:
 def install_local_hot_capacity_workspace_wheel(*, required: bool = True) -> bool:
     """Force-install the bundled hot-capacity workspace wheel for this Python minor."""
     return install_local_wheel("hot_capacity_workspace_cuda", required=required)
+
+
+def _proof_v3_cuda_runtime_tag() -> Optional[str]:
+    """Return the bundled proof-runtime tag for the installed torch CUDA ABI."""
+    try:
+        import torch
+    except Exception:
+        return None
+    cuda = str(torch.version.cuda or "")
+    if cuda.startswith("12.8"):
+        return "cu128"
+    if cuda.startswith("13.0"):
+        return "cu130"
+    return None
+
+
+def install_local_proof_v3_cuda_wheel() -> bool:
+    """Force-install the proof-v3 CUDA wheel matching torch and Python."""
+    runtime_tag = _proof_v3_cuda_runtime_tag()
+    if runtime_tag is None:
+        bt.logging.error(
+            "No bundled proof-v3 CUDA runtime matches the installed torch CUDA ABI"
+        )
+        return False
+    py_tag = _current_python_tag()
+    wheels = sorted(
+        (_REPO_ROOT / "dist").glob(
+            f"verathos_proof_v3_cuda-*+{runtime_tag}-{py_tag}-{py_tag}-*.whl"
+        )
+    )
+    if len(wheels) != 1:
+        bt.logging.error(
+            "Expected exactly one bundled proof-v3 CUDA wheel for "
+            f"runtime={runtime_tag} python={py_tag}; found {len(wheels)}"
+        )
+        return False
+
+    wheel = wheels[0]
+    bt.logging.info(f"Installing proof-v3 CUDA wheel: {wheel.name}")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--force-reinstall",
+                "--no-deps",
+                str(wheel),
+            ],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            bt.logging.error(f"proof-v3 CUDA wheel install failed: {result.stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        bt.logging.error("proof-v3 CUDA wheel install timed out")
+        return False
+    bt.logging.info("proof-v3 CUDA wheel installed successfully")
+    return True
+
+
+def _selected_proof_v3_cuda_wheel() -> Optional[Path]:
+    runtime_tag = _proof_v3_cuda_runtime_tag()
+    if runtime_tag is None:
+        return None
+    py_tag = _current_python_tag()
+    wheels = sorted(
+        (_REPO_ROOT / "dist").glob(
+            f"verathos_proof_v3_cuda-*+{runtime_tag}-{py_tag}-{py_tag}-*.whl"
+        )
+    )
+    return wheels[0] if len(wheels) == 1 else None
+
+
+def _installed_proof_v3_cuda_package_dir() -> Optional[Path]:
+    spec = importlib.util.find_spec("verathos_proof_v3_cuda")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    return Path(next(iter(spec.submodule_search_locations))).resolve()
+
+
+def proof_v3_cuda_wheel_is_current(wheel: Path) -> bool:
+    """Compare installed proof-runtime payload bytes with the release wheel."""
+    package_dir = _installed_proof_v3_cuda_package_dir()
+    if package_dir is None:
+        return False
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            members = [
+                name
+                for name in archive.namelist()
+                if name.startswith("verathos_proof_v3_cuda/")
+                and not name.endswith("/")
+            ]
+            if not members:
+                return False
+            for name in members:
+                installed = package_dir / Path(name).name
+                if not installed.is_file():
+                    return False
+                if hashlib.sha256(installed.read_bytes()).digest() != hashlib.sha256(
+                    archive.read(name)
+                ).digest():
+                    return False
+    except (OSError, zipfile.BadZipFile, KeyError):
+        return False
+    return True
+
+
+def proof_v3_cuda_runtime_smoke() -> bool:
+    """Load and execute both bundled kernel families in a fresh process."""
+    program = """
+import torch
+from verathos_proof_v3_cuda import load_fused_kernels, load_tree_kernels
+fold = load_fused_kernels()
+tree = load_tree_kernels()
+for name in ('round_partials', 'lerp_fold', 'product_round_partials', 'fs_round_v2'):
+    assert hasattr(fold, name), name
+for name in ('leaf_hash_w1', 'leaf_hash_wn_base', 'node_hash', 'node_hash_base'):
+    assert hasattr(tree, name), name
+folded = fold.lerp_fold(torch.tensor([1, 2], dtype=torch.int64, device='cuda'), 0)
+assert folded.cpu().tolist() == [1]
+leaf = tree.leaf_hash_wn_base(
+    torch.zeros(90, dtype=torch.uint8, device='cuda'),
+    torch.tensor([1], dtype=torch.int64, device='cuda'),
+    0,
+    1,
+)
+assert tuple(leaf.shape) == (32,)
+torch.cuda.synchronize()
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", program],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        bt.logging.error("proof-v3 CUDA runtime smoke timed out")
+        return False
+    if result.returncode != 0:
+        bt.logging.error(
+            "proof-v3 CUDA runtime smoke failed: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+        return False
+    return True
+
+
+def ensure_local_proof_v3_cuda_wheel() -> bool:
+    """Ensure first-start after an old updater has the release proof runtime."""
+    wheel = _selected_proof_v3_cuda_wheel()
+    if wheel is None:
+        bt.logging.error(
+            "No unique bundled proof-v3 CUDA wheel matches Python and torch CUDA"
+        )
+        return False
+    if not proof_v3_cuda_wheel_is_current(wheel):
+        if not install_local_proof_v3_cuda_wheel():
+            return False
+        importlib.invalidate_caches()
+        if not proof_v3_cuda_wheel_is_current(wheel):
+            return False
+    return proof_v3_cuda_runtime_smoke()
 
 
 def get_local_head() -> Optional[str]:
@@ -290,7 +463,11 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
     return None
 
 
-def pull_and_install(*, install_extras: str = "neurons") -> bool:
+def pull_and_install(
+    *,
+    install_extras: str = "neurons",
+    install_proof_cuda: bool = False,
+) -> bool:
     """Pull latest code and reinstall the package.
 
     Returns True on success, False on failure.
@@ -340,6 +517,8 @@ def pull_and_install(*, install_extras: str = "neurons") -> bool:
     if not install_local_zkllm_wheel():
         return False
     install_local_hot_capacity_workspace_wheel(required=False)
+    if install_proof_cuda and not install_local_proof_v3_cuda_wheel():
+        return False
     return True
 
 
@@ -462,6 +641,7 @@ class AutoUpdater:
     ):
         requested_role = str(role or "validator")
         self.role = requested_role if requested_role != "proxy" else "validator"  # proxy uses validator_version
+        self.install_proof_cuda = requested_role == "miner"
         self.install_extras = (
             str(install_extras).strip()
             if install_extras is not None
@@ -540,7 +720,10 @@ class AutoUpdater:
             return
         bt.logging.info("Deferred update ready — applying now")
         self._update_pending = False
-        if not pull_and_install(install_extras=self.install_extras):
+        if not pull_and_install(
+            install_extras=self.install_extras,
+            install_proof_cuda=self.install_proof_cuda,
+        ):
             bt.logging.error("Deferred update failed — will retry next cycle")
             return
         bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
@@ -583,7 +766,10 @@ class AutoUpdater:
             return
 
         self._update_pending = False
-        if not pull_and_install(install_extras=self.install_extras):
+        if not pull_and_install(
+            install_extras=self.install_extras,
+            install_proof_cuda=self.install_proof_cuda,
+        ):
             bt.logging.error("Update failed — will retry next cycle")
             return
 

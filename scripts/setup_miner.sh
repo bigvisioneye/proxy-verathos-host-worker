@@ -166,8 +166,11 @@ if ! command -v nvidia-smi &>/dev/null; then
     echo "  ERROR: nvidia-smi not found. NVIDIA GPU required."
     exit 1
 fi
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-GPU_VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+# Query the first visible device directly.  With pipefail enabled, piping a
+# multi-GPU nvidia-smi result through head can terminate nvidia-smi with
+# SIGPIPE and abort an otherwise healthy one-command install.
+GPU_NAME=$(nvidia-smi -i 0 --query-gpu=name --format=csv,noheader 2>/dev/null)
+GPU_VRAM=$(nvidia-smi -i 0 --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null)
 if [ -z "$GPU_NAME" ]; then
     echo "  ERROR: No GPU detected."
     exit 1
@@ -176,8 +179,8 @@ fi
 #    echo "  ERROR: GPU has ${GPU_VRAM}MB VRAM. Minimum 24GB required."
 #    exit 1
 #fi
-GPU_SM=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
-GPU_DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+GPU_SM=$(nvidia-smi -i 0 --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '.')
+GPU_DRIVER=$(nvidia-smi -i 0 --query-gpu=driver_version --format=csv,noheader 2>/dev/null)
 GPU_DRIVER_MAJOR=$(echo "$GPU_DRIVER" | cut -d. -f1)
 echo "  GPU: $GPU_NAME (${GPU_VRAM}MB, sm_${GPU_SM}, driver ${GPU_DRIVER})"
 # Early check: RTX 5090 requires NVIDIA driver >= 575.
@@ -399,7 +402,13 @@ if cuobjdump is not None:
 else:
     # No cuobjdump available — fall back to known wheel arch list.
     known = {80, 86, 89, 90}
-    if sm not in known:
+    cuda = str(getattr(torch.version, 'cuda', '') or '')
+    # CUDA 13 wheels are the supported forward path for Blackwell. Do not
+    # reject one solely because this host image lacks cuobjdump; the runtime
+    # Marlin smoke below is the authoritative compatibility check.
+    if sm >= 120 and cuda.startswith('13.'):
+        pass
+    elif sm not in known:
         print(f'{sm_str} not in known wheel archs {known}')
         sys.exit(1)
 
@@ -602,6 +611,49 @@ if [ "${WORKSPACE_IS_FUSE:-0}" = "1" ]; then
 fi
 
 # ── System dependencies ────────────────────────────────────────────────────
+# vLLM/Triton may compile small runtime launchers even when all Verathos native
+# artifacts come from wheels.  A minimal cloud image therefore still needs a C
+# compiler on the ordinary serving path.
+if ! command -v cc &>/dev/null; then
+    SYSTEM_PY_VER=$($PYTHON -c \
+        "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    if can_run_privileged; then
+        if command -v apt-get &>/dev/null; then
+            run_privileged apt-get update -qq
+            run_privileged apt-get install -y -qq \
+                build-essential "python${SYSTEM_PY_VER}-dev" >/dev/null
+        elif command -v dnf &>/dev/null; then
+            run_privileged dnf install -y gcc gcc-c++ python3-devel >/dev/null
+        fi
+    fi
+    if ! command -v cc &>/dev/null; then
+        echo "  ERROR: a C compiler is required by the vLLM/Triton runtime."
+        echo "  Install build-essential (Debian/Ubuntu) or gcc (RHEL/Fedora), then rerun setup."
+        exit 1
+    fi
+fi
+
+PYTHON_INCLUDE=$($PYTHON -c \
+    "import sysconfig; print(sysconfig.get_path('include') or '')")
+if [ -z "$PYTHON_INCLUDE" ] || [ ! -f "$PYTHON_INCLUDE/Python.h" ]; then
+    SYSTEM_PY_VER=$($PYTHON -c \
+        "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    if can_run_privileged && command -v apt-get &>/dev/null; then
+        run_privileged apt-get update -qq
+        run_privileged apt-get install -y -qq \
+            "python${SYSTEM_PY_VER}-dev" >/dev/null
+    elif can_run_privileged && command -v dnf &>/dev/null; then
+        run_privileged dnf install -y python3-devel >/dev/null
+    fi
+    PYTHON_INCLUDE=$($PYTHON -c \
+        "import sysconfig; print(sysconfig.get_path('include') or '')")
+    if [ -z "$PYTHON_INCLUDE" ] || [ ! -f "$PYTHON_INCLUDE/Python.h" ]; then
+        echo "  ERROR: Python development headers are required by the vLLM/Triton runtime."
+        echo "  Install python${SYSTEM_PY_VER}-dev (Debian/Ubuntu) or python3-devel (RHEL/Fedora), then rerun setup."
+        exit 1
+    fi
+fi
+
 # ninja-build: required by FlashInfer JIT compilation on Hopper/Blackwell (sm_90+)
 if ! command -v ninja &>/dev/null; then
     if can_run_privileged; then
@@ -614,7 +666,77 @@ if ! command -v ninja &>/dev/null; then
     # If system install failed, pip fallback happens after venv activation below
 fi
 
+ensure_node_runtime() {
+    local node_major=0
+    if command -v node &>/dev/null; then
+        node_major=$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)
+    fi
+    if [ "$node_major" -ge 18 ] 2>/dev/null && command -v npm &>/dev/null; then
+        return 0
+    fi
+
+    local SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+        if sudo -n true 2>/dev/null; then
+            SUDO="sudo"
+        else
+            echo "  ERROR: Node.js >= 18 is required and sudo is unavailable."
+            echo "  Install Node.js >= 18, then rerun this setup."
+            exit 1
+        fi
+    fi
+
+    echo "  Installing Node.js 20 runtime..."
+    if command -v apt-get &>/dev/null; then
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y -qq ca-certificates curl gnupg 2>&1 | tail -3
+        # Ubuntu 22.04 may have Node 12 plus libnode-dev preinstalled.
+        # NodeSource's Node 20 package owns the same headers, so remove the
+        # obsolete distro packages first instead of leaving dpkg to fail on
+        # an overwrite conflict.
+        if [ "$node_major" -gt 0 ] 2>/dev/null; then
+            $SUDO apt-get remove -y -qq nodejs npm libnode-dev 2>&1 | tail -5
+        fi
+        local key_tmp
+        key_tmp=$(mktemp)
+        if ! curl -fsSL \
+            https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+            -o "$key_tmp"; then
+            rm -f "$key_tmp"
+            echo "  ERROR: could not download the NodeSource signing key."
+            exit 1
+        fi
+        $SUDO mkdir -p /etc/apt/keyrings
+        $SUDO gpg --batch --yes --dearmor \
+            -o /etc/apt/keyrings/nodesource.gpg "$key_tmp"
+        rm -f "$key_tmp"
+        printf '%s\n' \
+            'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main' \
+            | $SUDO tee /etc/apt/sources.list.d/nodesource.list >/dev/null
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y -qq nodejs 2>&1 | tail -5
+    elif command -v dnf &>/dev/null; then
+        $SUDO dnf module enable -y nodejs:20 2>&1 | tail -3 || true
+        $SUDO dnf install -y nodejs npm 2>&1 | tail -5
+    else
+        echo "  ERROR: no supported package manager can install Node.js >= 18."
+        exit 1
+    fi
+
+    hash -r
+    node_major=0
+    if command -v node &>/dev/null; then
+        node_major=$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)
+    fi
+    if [ "$node_major" -lt 18 ] 2>/dev/null || ! command -v npm &>/dev/null; then
+        echo "  ERROR: setup did not produce a working Node.js >= 18 runtime."
+        exit 1
+    fi
+    echo "  Node.js ready: $(node --version)"
+}
+
 install_pm2_if_missing() {
+    ensure_node_runtime
     if command -v pm2 &>/dev/null; then
         return 0
     fi
@@ -622,33 +744,7 @@ install_pm2_if_missing() {
     echo "  Installing PM2 process manager..."
     local SUDO=""
     if [ "$(id -u)" -ne 0 ]; then
-        if sudo -n true 2>/dev/null; then
-            SUDO="sudo"
-        else
-            echo "  ERROR: pm2 is not installed and sudo is unavailable."
-            echo "  Install Node.js/npm and PM2, then rerun this setup:"
-            echo "    npm install -g pm2"
-            exit 1
-        fi
-    fi
-
-    if ! command -v npm &>/dev/null; then
-        if command -v apt-get &>/dev/null; then
-            $SUDO apt-get update -qq
-            $SUDO apt-get install -y -qq nodejs npm 2>&1 | tail -3
-        elif command -v dnf &>/dev/null; then
-            $SUDO dnf install -y nodejs npm 2>&1 | tail -3
-        else
-            echo "  ERROR: npm not found and no supported system package manager detected."
-            echo "  Install Node.js/npm and PM2, then rerun this setup:"
-            echo "    npm install -g pm2"
-            exit 1
-        fi
-    fi
-
-    if ! command -v npm &>/dev/null; then
-        echo "  ERROR: npm install failed or npm is still not on PATH."
-        exit 1
+        SUDO="sudo"
     fi
     $SUDO npm install -g pm2 >/dev/null
     if ! command -v pm2 &>/dev/null; then
@@ -906,6 +1002,26 @@ if [ "$SKIP_INSTALL" = false ]; then
         echo "  vLLM CUDA kernels: compatible"
     fi
 
+    if ! $PYTHON - <<'PY'
+from zkllm.crypto.pcs_v2 import (
+    ABI_VERSION,
+    fold_u31_linear_coefficients,
+    native_library_path,
+    prove_i64_linear_combination_linear,
+)
+
+assert ABI_VERSION == 10, f"expected proof PCS ABI 10, got {ABI_VERSION}"
+assert callable(fold_u31_linear_coefficients)
+assert callable(prove_i64_linear_combination_linear)
+native_library_path()
+PY
+    then
+        echo "  ERROR: zkllm wheel is stale or lacks the proof PCS ABI required by this release."
+        echo "  Rebuild the release wheels with scripts/build_zkllm_wheel.sh."
+        exit 1
+    fi
+    echo "  Proof PCS ABI 10: OK"
+
     echo ""
     echo "Step 3/6: GPTQ quantization support..."
     if [ "$INSTALL_GPTQMODEL" = "1" ]; then
@@ -982,7 +1098,7 @@ except Exception as e:
     }
 
     echo ""
-    echo "Step 5/6: Verifying zkllm CUDA extension..."
+    echo "Step 5/6: Verifying proof CUDA extensions..."
     fix_ld_library_path
     # zkllm is installed as a wheel — no build needed.
     # The wheel auto-detects the correct torch version at import time.
@@ -1005,13 +1121,85 @@ except Exception as e:
             -name "zkllm_native.cpython-*.so.torch*" \
         \) -delete 2>/dev/null || true
     fi
+    TORCH_CUDA_RUNTIME=$($PYTHON -c '
+import torch
+cuda = str(torch.version.cuda or "")
+if cuda.startswith("12.8"):
+    print("cu128")
+elif cuda.startswith("13.0"):
+    print("cu130")
+else:
+    raise SystemExit(f"unsupported torch CUDA runtime: {cuda or None}")
+') || {
+        echo "  ERROR: unsupported torch CUDA runtime for proof-v3."
+        exit 1
+    }
+    PYTHON_ABI=$($PYTHON -c \
+        'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+    PROOF_V3_CUDA_WHEELS=(
+        "$REPO_DIR"/dist/verathos_proof_v3_cuda-*+"$TORCH_CUDA_RUNTIME"-"$PYTHON_ABI"-"$PYTHON_ABI"-*.whl
+    )
+    if [ "${#PROOF_V3_CUDA_WHEELS[@]}" -ne 1 ] ||
+        [ ! -f "${PROOF_V3_CUDA_WHEELS[0]}" ]; then
+        echo "  ERROR: expected exactly one proof-v3 CUDA runtime wheel for"
+        echo "    runtime=$TORCH_CUDA_RUNTIME python=$PYTHON_ABI"
+        echo "  Available artifacts:"
+        find "$REPO_DIR/dist" -maxdepth 1 -type f \
+            -name 'verathos_proof_v3_cuda-*.whl' -printf '    %f\n' \
+            2>/dev/null | sort
+        exit 1
+    fi
+    echo "  Installing proof-v3 CUDA runtime: $(basename "${PROOF_V3_CUDA_WHEELS[0]}")"
+    $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
+        "${PROOF_V3_CUDA_WHEELS[0]}" 2>&1 | tail -5
+    if ! $PYTHON -c "
+import torch
+from verathos_proof_v3_cuda import load_fused_kernels, load_tree_kernels
+fold = load_fused_kernels()
+tree = load_tree_kernels()
+for name in ('round_partials', 'lerp_fold', 'product_round_partials', 'fs_round_v2'):
+    assert hasattr(fold, name), f'Missing proof-v3 fold kernel: {name}'
+for name in ('leaf_hash_w1', 'leaf_hash_wn_base', 'node_hash', 'node_hash_base'):
+    assert hasattr(tree, name), f'Missing proof-v3 tree kernel: {name}'
+folded = fold.lerp_fold(
+    torch.tensor([1, 2], dtype=torch.int64, device='cuda'), 0
+)
+assert folded.cpu().tolist() == [1]
+leaf = tree.leaf_hash_wn_base(
+    torch.zeros(90, dtype=torch.uint8, device='cuda'),
+    torch.tensor([1], dtype=torch.int64, device='cuda'),
+    0,
+    1,
+)
+assert tuple(leaf.shape) == (32,)
+torch.cuda.synchronize()
+print('  Proof-v3 CUDA runtime: OK')
+" 2>/dev/null; then
+        echo "ERROR: precompiled proof-v3 CUDA runtime is unavailable or incompatible."
+        echo "  Reinstall the matching wheel from dist/verathos_proof_v3_cuda-*.whl."
+        exit 1
+    fi
     if $PYTHON -c "
 from zkllm.cuda import zkllm_native, HAS_CUDA
+from zkllm.crypto import pcs_v2
 assert zkllm_native is not None, 'zkllm_native not loaded — is the zkllm wheel installed?'
 assert HAS_CUDA, 'Extension loaded but HAS_CUDA=False — CUDA not available in zkllm'
 assert hasattr(zkllm_native, 'cuda_blake3_merkle_leaves'), 'Missing cuda_blake3_merkle_leaves kernel'
+assert hasattr(zkllm_native, 'cuda_blake3_activation_row_roots'), 'Missing proof-v3 activation row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_row_roots_retain_into'), 'Missing proof-v3 retained-runtime activation reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_staged_row_roots_into'), 'Missing proof-v3 staged row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_activation_update_peaks'), 'Missing proof-v3 activation frontier reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_activation_update_peaks_heterogeneous'), 'Missing proof-v3 heterogeneous frontier reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_runtime_row_roots_into'), 'Missing proof-v3 graph row reducer'
+assert hasattr(zkllm_native, 'cuda_blake3_prehashed_update_peaks'), 'Missing proof-v3 prehashed frontier reducer'
+for name in (
+    'combine_registered_catalog_u31_batch',
+    'prove_linear',
+    'verify_linear',
+):
+    assert hasattr(pcs_v2, name), f'Missing proof-v3 PCS API: {name}'
 print(f'  HAS_CUDA: {HAS_CUDA}')
-print(f'  Kernels: blake3_merkle, sumcheck, field_ops')
+print(f'  Kernels: blake3_merkle, proof_v3_anchor, sumcheck, field_ops, linear_pcs')
 " 2>/dev/null; then
         echo "  CUDA extension: OK"
     else
@@ -1155,7 +1343,7 @@ fi
 ENVEOF
 
 BASHRC="${HOME}/.bashrc"
-if ! grep -qF "verathos/.env.sh" "$BASHRC" 2>/dev/null; then
+if ! grep -qF "${ENV_FILE}" "$BASHRC" 2>/dev/null; then
     echo "" >> "$BASHRC"
     echo "# Verathos environment (auto-added by setup_miner.sh)" >> "$BASHRC"
     echo "[ -f \"${ENV_FILE}\" ] && source \"${ENV_FILE}\"" >> "$BASHRC"
@@ -1165,6 +1353,19 @@ else
 fi
 
 # ── Show model recommendations + next steps ──────────────────────────────────
+
+if [ "$SKIP_INSTALL" = true ]; then
+    echo "  Verifying existing miner runtime (--skip-install)..."
+    "$PYTHON" - <<'PY'
+import torch
+import vllm
+import zstandard
+import zkllm
+
+assert torch.cuda.is_available(), "CUDA is unavailable"
+print(f"  Existing miner runtime: torch={torch.__version__}, vllm={vllm.__version__}")
+PY
+fi
 
 echo ""
 echo "============================================================"

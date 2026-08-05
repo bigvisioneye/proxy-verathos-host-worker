@@ -50,7 +50,9 @@ The pattern maps directly onto Verathos: miners running coevolutionary merging w
 
 **Status: Implemented, testing on testnet**
 
-The same proof system that verifies inference extends to training. The training prover verifies the forward pass, backward pass (gradient GEMM), and optimizer step. Supported methods include full fine-tuning and LoRA, with AdamW, SGD, and Muon optimizers.
+The training research track extends execution auditing to the forward pass,
+backward pass, and optimizer step. Supported prototypes include full
+fine-tuning and LoRA with AdamW, SGD, and Muon optimizers.
 
 Once live, verified training enables miners to fine-tune LoRA adapters on domain-specific data (code, math, legal, medical, etc.) with cryptographic proofs that the correct base model was used with the claimed data and optimizer. Combined with intelligent routing, this creates domain-specialized miners that the router can dispatch to based on query content. Verified training is the infrastructure that makes the incentivized expert training described above trustless: the network can verify that a miner actually trained the adapter it claims to have trained.
 
@@ -82,7 +84,7 @@ NTP is the infrastructure layer that enables the capabilities below. Without it,
 
 The long-term vision is a network where intelligence lives in the topology and composition of experts, not in any single model's weights. Several research threads contribute to this:
 
-**Persistent memory.** Dedicated memory experts maintain per-user and per-session state (long-term preferences, episodic memory, working context). The orchestrator queries memory on every request and stores new knowledge after each interaction. Memory is verified like any other inference call.
+**Persistent memory.** Dedicated memory experts maintain per-user and per-session state (long-term preferences, episodic memory, working context). The orchestrator queries memory on every request and stores new knowledge after each interaction. Memory inference can be audited under the applicable qualified execution profile.
 
 **Multimodal grounding.** Vision, audio, and sensor experts ground the network's language understanding in non-textual reality. NTP enables these experts to pass representations directly: a vision expert sends embeddings, not text descriptions of what it sees.
 

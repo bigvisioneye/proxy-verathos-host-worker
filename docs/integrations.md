@@ -50,7 +50,7 @@ response = litellm.completion(
 
 ### LangChain
 
-Proof verification metadata on every response.
+Gleipnir verification-tier metadata is available on responses.
 
 ```python
 pip install langchain-verathos
@@ -61,7 +61,7 @@ from langchain_verathos import ChatVerathos
 
 llm = ChatVerathos(api_key="your-key")
 msg = llm.invoke("Explain ZK proofs.")
-print(msg.response_metadata["proof_verified"])  # True
+print(msg.response_metadata.get("verification_tier"))  # "light" or "hard"
 ```
 
 ### elizaOS

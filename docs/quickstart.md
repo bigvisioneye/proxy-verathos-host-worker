@@ -27,7 +27,10 @@ curl https://api.verathos.ai/v1/chat/completions \
   }'
 ```
 
-Use `"auto"` to let Verathos pick the best available model, or specify one explicitly (e.g. `"qwen3.5-9b"`). The response is OpenAI-compatible (same format, same fields). Every response includes a cryptographic proof that the model weights weren't tampered with.
+Use `"auto"` to let Verathos pick the best available model, or specify one
+explicitly. The response is OpenAI-compatible. Ordinary v3 traffic is bound to
+a nonce-free light proof; unpredictable canaries carry the hard execution
+proofs that enforce registered-model serving across the network.
 
 ## 3. Use with any OpenAI SDK
 

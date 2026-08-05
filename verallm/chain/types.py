@@ -147,11 +147,16 @@ def on_chain_to_model_spec(oc: OnChainModelSpec) -> ModelSpec:
 
 def model_spec_to_on_chain(spec: ModelSpec) -> OnChainModelSpec:
     """Convert a Python ModelSpec to the on-chain representation for registration."""
-    # Infer num_experts from expert_weight_merkle_roots if present
-    num_experts = 0
+    # Preserve the explicit chain-derived value.  Registration helpers for older
+    # callers may only populate the per-layer expert roots, so retain that as a
+    # compatibility fallback.
+    num_experts = int(getattr(spec, "num_experts", 0) or 0)
     if spec.expert_weight_merkle_roots:
         first_layer_roots = next(iter(spec.expert_weight_merkle_roots.values()), [])
-        num_experts = len(first_layer_roots)
+        inferred_num_experts = len(first_layer_roots)
+        if num_experts and inferred_num_experts != num_experts:
+            raise ValueError("num_experts does not match expert weight roots")
+        num_experts = inferred_num_experts
 
     return OnChainModelSpec(
         model_id=spec.model_id,

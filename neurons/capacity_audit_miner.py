@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +45,11 @@ from neurons.capacity_audit import (
     slot_id,
     transcript_root,
 )
-from neurons.capacity_audit_combined import COMBINED_PROOF_FORMAT
+from neurons.capacity_audit_combined import (
+    CURRENT_COMBINED_PROOF_PROTOCOL_VERSION,
+    combined_commitment_from_final_timing,
+    combined_proof_protocol_version,
+)
 from neurons.capacity_audit_discovery import CapacityAuditEndpointResolver
 from neurons.discovery import ActiveMiner
 from neurons.subnet_runtime_config import (
@@ -85,6 +89,14 @@ class PreparedAuditProcess:
     challenge_file: Path
     start_file: Path
     ready_file: Path
+
+
+@dataclass(frozen=True)
+class _ValidatorDelivery:
+    path: str
+    artifact: dict
+    attempts: int
+    retry_delay_s: float
 
 
 def _coerce_block_hash(raw: object) -> Optional[bytes]:
@@ -174,10 +186,18 @@ class CapacityAuditMinerWorker:
         self._audit_start_lock = threading.Lock()
         self._prepared_audit_lock = threading.Lock()
         self._prepared_audits: dict[str, PreparedAuditProcess] = {}
+        self._block_hash_condition = threading.Condition()
+        self._recent_block_hashes: dict[int, bytes] = {}
         self._workspace_ext_lock = threading.Lock()
         self._workspace_ext_ready = False
         self._resolved_epoch_blocks: Optional[int] = None
         self._audit_endpoint_rejections: dict[str, set[str]] = {}
+        self._audit_endpoint_rejections_lock = threading.Lock()
+        self._publisher_lock = threading.Lock()
+        self._publisher_result_lock = threading.Lock()
+        self._publisher_stop = threading.Event()
+        self._publisher_queues: dict[str, queue.Queue[_ValidatorDelivery]] = {}
+        self._publisher_threads: dict[str, threading.Thread] = {}
 
     def _refresh_subnet_runtime_config(
         self,
@@ -347,6 +367,7 @@ class CapacityAuditMinerWorker:
 
     def stop(self) -> None:
         self._running = False
+        self._publisher_stop.set()
 
     def _subtensor(self):
         SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
@@ -566,6 +587,48 @@ class CapacityAuditMinerWorker:
             if subtensor is not None:
                 self._close_subtensor(subtensor)
 
+    def _remember_block_hash(self, block_number: int, block_hash: bytes) -> None:
+        condition = getattr(self, "_block_hash_condition", None)
+        if condition is None:
+            condition = threading.Condition()
+            self._block_hash_condition = condition
+        with condition:
+            hashes = getattr(self, "_recent_block_hashes", None)
+            if hashes is None:
+                hashes = {}
+                self._recent_block_hashes = hashes
+            hashes[int(block_number)] = bytes(block_hash)
+            floor = int(block_number) - 255
+            for stale_block in tuple(hashes):
+                if stale_block < floor:
+                    hashes.pop(stale_block, None)
+            condition.notify_all()
+
+    def _cached_block_hash(self, block_number: int) -> Optional[bytes]:
+        condition = getattr(self, "_block_hash_condition", None)
+        if condition is None:
+            return None
+        with condition:
+            value = getattr(self, "_recent_block_hashes", {}).get(int(block_number))
+            return bytes(value) if value is not None else None
+
+    def _wait_for_cached_block_hash(self, block_number: int, timeout_s: float) -> Optional[bytes]:
+        condition = getattr(self, "_block_hash_condition", None)
+        if condition is None:
+            condition = threading.Condition()
+            self._block_hash_condition = condition
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with condition:
+            while self._running:
+                value = getattr(self, "_recent_block_hashes", {}).get(int(block_number))
+                if value is not None:
+                    return bytes(value)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                condition.wait(timeout=min(remaining, 1.0))
+        return None
+
     def _process_block_range(
         self,
         last_block: int,
@@ -594,6 +657,7 @@ class CapacityAuditMinerWorker:
                     "will retry on the next catch-up"
                 )
                 break
+            self._remember_block_hash(block_number, block_hash)
             self._current_block_seen = max(self._current_block_seen, int(block_number))
             self._on_block(block_number, block_hash, subtensor)
             last_block = block_number
@@ -620,6 +684,7 @@ class CapacityAuditMinerWorker:
     def _run(self) -> None:
         last_block = 0
         watchdog_s = self._block_stream_watchdog_s()
+        reconnect_failures = 0
         while self._running:
             subtensor = None
             try:
@@ -724,14 +789,14 @@ class CapacityAuditMinerWorker:
                         last_header_at = float(state.last_header_at or 0.0)
                         last_block = int(state.last_block)
                         started_at = float(state.started_at)
-                    last_block = catch_up_if_due(now, last_block, active)
-                    if last_header_at and last_header_at != getattr(self, "_prev_header_at", 0.0):
-                        self._prev_header_at = last_header_at
-                        self._note_sub_success()
                     if error is not None:
                         bt.logging.warning(f"Capacity audit block stream ended: {error}")
                         self._note_sub_failure()
                         break
+                    last_block = catch_up_if_due(now, last_block, active)
+                    if last_header_at and last_header_at != getattr(self, "_prev_header_at", 0.0):
+                        self._prev_header_at = last_header_at
+                        self._note_sub_success()
                     reference_at = last_header_at or started_at
                     if not active and now - reference_at > watchdog_s:
                         bt.logging.warning(
@@ -742,18 +807,39 @@ class CapacityAuditMinerWorker:
 
                 stop_event.set()
                 last_block = int(getattr(state, "last_block", last_block) or last_block)
+                stream_error = getattr(state, "error", None)
+                stream_had_header = bool(getattr(state, "last_header_at", 0.0))
                 self._close_subtensor(subtensor)
                 subtensor = None
-                if self._running:
+                if self._running and not (stream_error is not None and not stream_had_header):
                     last_block = self._poll_catch_up(last_block)
+                if self._running:
+                    if stream_had_header:
+                        reconnect_failures = 0
+                    else:
+                        reconnect_failures += 1
+                        delay_s = self._block_stream_reconnect_delay(reconnect_failures)
+                        bt.logging.warning(
+                            "Capacity audit block stream reconnect backoff: "
+                            f"attempt={reconnect_failures} delay_s={delay_s:g}"
+                        )
+                        time.sleep(delay_s)
             except Exception as exc:
                 bt.logging.warning(f"Capacity audit miner worker error: {exc}")
                 self._note_sub_failure()
-                last_block = self._poll_catch_up(last_block)
-                time.sleep(min(60.0, self.poll_interval_s * 2))
+                reconnect_failures += 1
+                delay_s = self._block_stream_reconnect_delay(reconnect_failures)
+                time.sleep(delay_s)
             finally:
                 if subtensor is not None:
                     self._close_subtensor(subtensor)
+
+    def _block_stream_reconnect_delay(self, failures: int) -> float:
+        """Return bounded exponential delay after a stream made no progress."""
+
+        base_s = max(1.0, float(self.poll_interval_s) * 2.0)
+        exponent = max(0, min(5, int(failures) - 1))
+        return min(60.0, base_s * float(1 << exponent))
 
     def _selection_hashes(self, selection_block: int, selection_block_hash: bytes, subtensor) -> Optional[list[bytes]]:
         count = max(1, int(self.runtime_cfg.beacon_hash_count or 1))
@@ -772,10 +858,11 @@ class CapacityAuditMinerWorker:
         return hashes
 
     def _on_block(self, block_number: int, block_hash: bytes, subtensor=None) -> None:
-        due = self._pending.pop(block_number, [])
-        for audit_slot in due:
-            prepared = self._pop_prepared_audit(audit_slot.audit_id)
-            self._run_audit_slot(audit_slot, block_hash, subtensor, prepared=prepared)
+        # The dedicated B_start waiter owns workload release. Running the same
+        # slot here would block this subscription callback through timed work,
+        # challenge wait, and proof assembly, preventing the stream from
+        # retaining the B_proof hash needed by that very audit.
+        self._pending.pop(block_number, None)
 
         epoch_blocks = self._epoch_blocks(subtensor)
         if block_number % epoch_blocks == 0:
@@ -893,10 +980,15 @@ class CapacityAuditMinerWorker:
                     return
                 now = time.time()
                 try:
-                    if subtensor is None:
-                        subtensor = self._subtensor()
-                    current_block = self._get_live_current_head_block(subtensor)
-                    current_block = max(int(current_block or 0), int(self._current_block_seen or 0))
+                    audit_hash = self._cached_block_hash(audit_slot.audit_block)
+                    current_block = int(self._current_block_seen or 0)
+                    if audit_hash is None:
+                        if subtensor is None:
+                            subtensor = self._subtensor()
+                        current_block = max(
+                            int(self._get_live_current_head_block(subtensor) or 0),
+                            current_block,
+                        )
                     now = time.time()
                     if int(current_block or 0) > int(last_head or 0):
                         last_head = int(current_block or 0)
@@ -913,14 +1005,15 @@ class CapacityAuditMinerWorker:
                         time.sleep(start_poll_s)
                         continue
                     if int(current_block or 0) >= int(audit_slot.audit_block):
-                        audit_hash = self._get_block_hash(subtensor, audit_slot.audit_block)
+                        if audit_hash is None and subtensor is not None:
+                            audit_hash = self._get_block_hash(subtensor, audit_slot.audit_block)
                         if audit_hash is None:
                             audit_hash = self._get_block_hash_fresh(audit_slot.audit_block)
                         if audit_hash is not None:
                             self._run_audit_slot(
                                 audit_slot,
                                 audit_hash,
-                                subtensor=subtensor,
+                                subtensor=None,
                                 prepared=prepared,
                             )
                             return
@@ -1315,8 +1408,7 @@ class CapacityAuditMinerWorker:
         active_subtensor = subtensor
         owns_active_subtensor = False
         last_refresh_at = 0.0
-        last_head = 0
-        last_head_at = time.time()
+        fallback_interval_s = max(12.0, float(self.poll_interval_s or 0.0) * 4.0)
 
         def close_owned_subtensor() -> None:
             nonlocal active_subtensor, owns_active_subtensor
@@ -1326,17 +1418,21 @@ class CapacityAuditMinerWorker:
             owns_active_subtensor = False
 
         while self._running and time.time() < deadline:
+            challenge_hash = self._cached_block_hash(audit_slot.proof_challenge_block)
+            if challenge_hash is not None:
+                close_owned_subtensor()
+                return derive_proof_challenge_seed(
+                    transcript,
+                    challenge_hash,
+                    lease,
+                    slot_id(audit_slot.slot),
+                    0,
+                )
             current_block = 0
-            if active_subtensor is not None:
+            now = time.time()
+            if active_subtensor is not None and now - last_refresh_at >= fallback_interval_s:
+                last_refresh_at = now
                 current_block, _head_hash = self._get_live_current_head_block_and_hash(active_subtensor)
-                now = time.time()
-                if int(current_block or 0) > int(last_head or 0):
-                    last_head = int(current_block or 0)
-                    last_head_at = now
-                elif now - last_head_at > 18.0:
-                    close_owned_subtensor()
-                    last_head_at = now
-                    continue
                 if current_block >= audit_slot.proof_challenge_block:
                     challenge_hash = self._get_block_hash(
                         active_subtensor,
@@ -1351,11 +1447,9 @@ class CapacityAuditMinerWorker:
                             slot_id(audit_slot.slot),
                             0,
                         )
-            now = time.time()
-            if now - last_refresh_at >= 3.0:
+            if active_subtensor is None and now - last_refresh_at >= fallback_interval_s:
                 last_refresh_at = now
                 try:
-                    close_owned_subtensor()
                     active_subtensor = self._subtensor()
                     owns_active_subtensor = True
                     current_block, _head_hash = self._get_live_current_head_block_and_hash(active_subtensor)
@@ -1375,10 +1469,22 @@ class CapacityAuditMinerWorker:
                             )
                 except Exception:
                     close_owned_subtensor()
-            if current_block < audit_slot.proof_challenge_block:
-                time.sleep(min(3.0, max(0.5, self.poll_interval_s)))
-                continue
-            time.sleep(1.0)
+            remaining = deadline - time.time()
+            if remaining <= 0.0:
+                break
+            cached = self._wait_for_cached_block_hash(
+                audit_slot.proof_challenge_block,
+                min(1.0, remaining),
+            )
+            if cached is not None:
+                close_owned_subtensor()
+                return derive_proof_challenge_seed(
+                    transcript,
+                    cached,
+                    lease,
+                    slot_id(audit_slot.slot),
+                    0,
+                )
         close_owned_subtensor()
         return None
 
@@ -1425,9 +1531,15 @@ class CapacityAuditMinerWorker:
             ])
         workload_spec = dict(audit_slot.workload_spec or {})
         for key, value in workload_spec.items():
-            if key in {"workload_version", "pass_count"}:
+            if key in {"workload_version", "pass_count", "proof_protocol_version"}:
                 continue
             cmd.extend([f"--{key.replace('_', '-')}", str(value)])
+        # This worker version always emits the strict arithmetic payload.  Old
+        # workers do not add this flag and therefore remain explicit v1 during
+        # the bounded protocol-compatibility window.
+        cmd.extend(
+            ["--proof-protocol-version", str(CURRENT_COMBINED_PROOF_PROTOCOL_VERSION)]
+        )
         return cmd
 
     def _prepare_audit_process(
@@ -1701,17 +1813,16 @@ class CapacityAuditMinerWorker:
                     f"audit_id={audit_slot.audit_id[:12]}"
                 )
             else:
-                accepted = self._publish_proof(proof_payload) or 0
-                if accepted > 0:
+                queued = self._publish_proof(proof_payload) or 0
+                if queued > 0:
                     bt.logging.info(
-                        f"Capacity audit artifacts published: "
-                        f"audit_id={audit_slot.audit_id[:12]} validators={accepted}"
+                        f"Capacity audit proof queued: "
+                        f"audit_id={audit_slot.audit_id[:12]} validators={queued}"
                     )
                 else:
-                    bt.logging.info(
-                        f"Capacity audit artifacts not accepted by validators: "
-                        f"audit_id={audit_slot.audit_id[:12]} "
-                        "slot was not scheduled or endpoints were unavailable"
+                    bt.logging.debug(
+                        "Capacity audit proof queue complete: "
+                        f"audit_id={audit_slot.audit_id[:12]} validators=0"
                     )
         self._extend_busy_selection_until_current_head(audit_slot, subtensor=subtensor)
         self._clear_audit_drain(audit_slot.audit_id)
@@ -1752,23 +1863,7 @@ class CapacityAuditMinerWorker:
         final_timing: Optional[dict] = None,
     ) -> dict:
         artifact = self._base_artifact(audit_slot)
-        combined_commit = {}
-        if isinstance(final_timing, dict) and str(final_timing.get("proof_format") or "") == COMBINED_PROOF_FORMAT:
-            combined_commit = {
-                "format": COMBINED_PROOF_FORMAT,
-                "workload_version": final_timing.get("workload_version"),
-                "pass_count": final_timing.get("pass_count"),
-                "capacity_transcript_root": final_timing.get("capacity_transcript_root"),
-                "capacity_tail_transcript_root": final_timing.get("capacity_tail_transcript_root"),
-                "fp64_transcript_root": final_timing.get("fp64_transcript_root"),
-                "combined_transcript_root": final_timing.get("combined_transcript_root"),
-                "capacity_params": final_timing.get("capacity_params"),
-                "capacity_tail_params": final_timing.get("capacity_tail_params"),
-                "fp64_params": final_timing.get("fp64_params"),
-                "workspace_mode": final_timing.get("workspace_mode"),
-                "timed_cuda_component_s": final_timing.get("timed_cuda_component_s"),
-                "timed_wall_s": final_timing.get("timed_wall_s"),
-            }
+        combined_commit = combined_commitment_from_final_timing(final_timing)
         artifact.update({
             "artifact_type": "capacity_audit_final_receipt",
             "pass0_root": pass0_root,
@@ -1793,7 +1888,7 @@ class CapacityAuditMinerWorker:
         proof_payload = final_summary.get("proof_payload")
         if (
             isinstance(proof_payload, dict)
-            and str(proof_payload.get("format") or "") == COMBINED_PROOF_FORMAT
+            and combined_proof_protocol_version(proof_payload) is not None
         ):
             capacity_proof = proof_payload.get("capacity_proof") if isinstance(proof_payload, dict) else {}
             proof_sampled = capacity_proof.get("sampled") if isinstance(capacity_proof, dict) else None
@@ -1845,116 +1940,191 @@ class CapacityAuditMinerWorker:
     ) -> int:
         audit_id = str(artifact.get("audit_id") or "")
         artifact_type = str(artifact.get("artifact_type") or "")
-        accepted = 0
-        for attempt in range(max(1, int(attempts))):
-            pending: list[str] = []
-            all_validator_urls = self._validator_endpoint_urls(force_refresh=attempt > 0)
-            validator_urls = all_validator_urls
-            if audit_id:
-                validator_urls = tuple(
-                    base for base in validator_urls if not self._validator_rejected_audit(base, audit_id)
+        validator_urls = self._validator_endpoint_urls(nonblocking=True)
+        if not validator_urls:
+            bt.logging.warning(
+                f"Capacity audit publish has no validator endpoints: "
+                f"audit_id={audit_id[:12]} type={artifact_type}"
+            )
+            return 0
+        delivery = _ValidatorDelivery(
+            path=path,
+            artifact=artifact,
+            attempts=max(1, int(attempts)),
+            retry_delay_s=max(0.0, float(retry_delay_s)),
+        )
+        queued = 0
+        for endpoint in validator_urls:
+            if audit_id and self._validator_rejected_audit(endpoint, audit_id):
+                continue
+            endpoint_queue = self._publisher_queue(endpoint)
+            try:
+                endpoint_queue.put_nowait(delivery)
+                queued += 1
+            except queue.Full:
+                bt.logging.warning(
+                    "Capacity audit endpoint queue full; dropping only this destination: "
+                    f"audit_id={audit_id[:12]} type={artifact_type} endpoint={endpoint}"
                 )
-            if not validator_urls:
-                message = (
-                    f"Capacity audit publish has no validator endpoints: "
-                    f"audit_id={audit_id[:12]} "
-                    f"type={artifact_type}"
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
                 )
-                if audit_id and all_validator_urls:
-                    bt.logging.info(
-                        f"{message}; slot was not scheduled by known validators"
-                    )
-                else:
-                    bt.logging.warning(message)
-                return accepted
+        return queued
 
-            def _post(base: str):
-                try:
-                    resp = httpx.post(
-                        f"{base}{path}",
-                        json=artifact,
-                        timeout=AUDIT_PUBLISH_TIMEOUT_S,
-                    )
-                    return base, resp, None
-                except Exception as exc:
-                    return base, None, exc
+    def _publisher_queue(self, endpoint: str) -> queue.Queue[_ValidatorDelivery]:
+        endpoint = str(endpoint or "").rstrip("/")
+        with self._publisher_lock:
+            existing = self._publisher_queues.get(endpoint)
+            if existing is not None:
+                return existing
+            endpoint_queue: queue.Queue[_ValidatorDelivery] = queue.Queue(maxsize=8)
+            thread = threading.Thread(
+                target=self._publisher_worker,
+                args=(endpoint, endpoint_queue),
+                name=f"capacity-publisher-{len(self._publisher_threads) + 1}",
+                daemon=True,
+            )
+            self._publisher_queues[endpoint] = endpoint_queue
+            self._publisher_threads[endpoint] = thread
+            thread.start()
+            return endpoint_queue
 
-            with ThreadPoolExecutor(max_workers=max(1, len(validator_urls))) as executor:
-                future_map = {executor.submit(_post, base): base for base in validator_urls}
-                for future in as_completed(future_map):
-                    base = future_map[future]
-                    try:
-                        base, resp, exc = future.result()
-                    except Exception as exc:  # defensive; _post should capture transport errors
-                        resp = None
-                    if exc is not None or resp is None:
-                        bt.logging.warning(
-                            f"Capacity audit publish error: audit_id={audit_id[:12]} "
-                            f"type={artifact_type} url={base}{path}: {exc}"
-                        )
-                        self._record_validator_publish_result(base, False, failure_kind="transient")
-                        pending.append(base)
-                        continue
-                    if resp.status_code < 300:
-                        self._record_validator_publish_result(base, True)
-                        accepted += 1
-                        continue
-                    retryable = resp.status_code in (409, 425, 429, 500, 502, 503, 504)
-                    if self._is_unknown_audit_slot_response(resp.status_code, resp.text):
-                        bt.logging.info(
-                            f"Capacity audit validator did not schedule slot: "
-                            f"audit_id={audit_id[:12]} type={artifact_type} "
-                            f"B_select={artifact.get('B_select')} "
-                            f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
-                            f"url={base}{path}"
-                        )
-                        self._record_validator_audit_rejection(base, audit_id)
-                        continue
-                    bt.logging.warning(
-                        f"Capacity audit publish failed: audit_id={audit_id[:12]} "
-                        f"type={artifact_type} B_select={artifact.get('B_select')} "
-                        f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
-                        f"url={base}{path} status={resp.status_code} body={resp.text[:200]}"
+    def _publisher_worker(
+        self,
+        endpoint: str,
+        endpoint_queue: queue.Queue[_ValidatorDelivery],
+    ) -> None:
+        while not self._publisher_stop.is_set() or not endpoint_queue.empty():
+            try:
+                delivery = endpoint_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._deliver_to_validator(endpoint, delivery)
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Capacity audit publisher worker error: endpoint={endpoint}: {exc}"
+                )
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
+                )
+            finally:
+                endpoint_queue.task_done()
+
+    def _deliver_to_validator(
+        self,
+        endpoint: str,
+        delivery: _ValidatorDelivery,
+    ) -> None:
+        path = delivery.path
+        artifact = delivery.artifact
+        audit_id = str(artifact.get("audit_id") or "")
+        artifact_type = str(artifact.get("artifact_type") or "")
+        if audit_id and self._validator_rejected_audit(endpoint, audit_id):
+            return
+        for attempt in range(delivery.attempts):
+            try:
+                resp = httpx.post(
+                    f"{endpoint}{path}",
+                    json=artifact,
+                    timeout=AUDIT_PUBLISH_TIMEOUT_S,
+                )
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Capacity audit publish error: audit_id={audit_id[:12]} "
+                    f"type={artifact_type} url={endpoint}{path}: {exc}"
+                )
+                self._record_validator_publish_result(
+                    endpoint,
+                    False,
+                    failure_kind="transient",
+                )
+                retryable = True
+            else:
+                if resp.status_code < 300:
+                    self._record_validator_publish_result(endpoint, True)
+                    break
+                if self._is_unknown_audit_slot_response(resp.status_code, resp.text):
+                    bt.logging.debug(
+                        "Capacity audit endpoint response: "
+                        f"audit_id={audit_id[:12]} type={artifact_type} "
+                        f"status=slot_unknown url={endpoint}{path}"
                     )
-                    failure_kind = self._validator_endpoint_failure_kind(resp.status_code)
-                    if failure_kind:
-                        self._record_validator_publish_result(
-                            base,
-                            False,
-                            failure_kind=failure_kind,
-                        )
-                    if retryable:
-                        pending.append(base)
-            if not pending or attempt + 1 >= max(1, int(attempts)):
-                return accepted
-            time.sleep(max(0.1, float(retry_delay_s)))
-        return accepted
+                    self._record_validator_audit_rejection(endpoint, audit_id)
+                    return
+                bt.logging.warning(
+                    f"Capacity audit publish failed: audit_id={audit_id[:12]} "
+                    f"type={artifact_type} B_select={artifact.get('B_select')} "
+                    f"B_start={artifact.get('B_start')} B_proof={artifact.get('B_proof')} "
+                    f"url={endpoint}{path} status={resp.status_code} body={resp.text[:200]}"
+                )
+                failure_kind = self._validator_endpoint_failure_kind(resp.status_code)
+                if failure_kind:
+                    self._record_validator_publish_result(
+                        endpoint,
+                        False,
+                        failure_kind=failure_kind,
+                    )
+                retryable = resp.status_code in (409, 425, 429, 500, 502, 503, 504)
+                if not retryable:
+                    return
+            if attempt + 1 >= delivery.attempts:
+                return
+            if self._publisher_stop.wait(max(0.1, delivery.retry_delay_s)):
+                return
+
+    def _wait_for_async_publishes_for_test(self, timeout_s: float = 2.0) -> bool:
+        """Wait for current publisher queues without affecting production flow."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while time.monotonic() < deadline:
+            with self._publisher_lock:
+                queues = tuple(self._publisher_queues.values())
+            if all(endpoint_queue.unfinished_tasks == 0 for endpoint_queue in queues):
+                return True
+            time.sleep(0.005)
+        return False
 
     def _validator_rejected_audit(self, endpoint: str, audit_id: str) -> bool:
-        rejected = getattr(self, "_audit_endpoint_rejections", None)
-        if not isinstance(rejected, dict):
-            return False
-        return str(endpoint or "") in rejected.get(str(audit_id or ""), set())
+        with self._audit_endpoint_rejections_lock:
+            rejected = getattr(self, "_audit_endpoint_rejections", None)
+            if not isinstance(rejected, dict):
+                return False
+            return str(endpoint or "") in rejected.get(str(audit_id or ""), set())
 
     def _record_validator_audit_rejection(self, endpoint: str, audit_id: str) -> None:
         audit_id = str(audit_id or "")
         endpoint = str(endpoint or "")
         if not audit_id or not endpoint:
             return
-        rejected = getattr(self, "_audit_endpoint_rejections", None)
-        if not isinstance(rejected, dict):
-            rejected = {}
-            self._audit_endpoint_rejections = rejected
-        rejected.setdefault(audit_id, set()).add(endpoint)
-        bt.logging.info(
-            f"Capacity audit validator did not recognize slot; "
-            f"skipping later artifacts for audit_id={audit_id[:12]} endpoint={endpoint}"
+        with self._audit_endpoint_rejections_lock:
+            rejected = getattr(self, "_audit_endpoint_rejections", None)
+            if not isinstance(rejected, dict):
+                rejected = {}
+                self._audit_endpoint_rejections = rejected
+            rejected.setdefault(audit_id, set()).add(endpoint)
+        bt.logging.debug(
+            "Capacity audit endpoint response recorded: "
+            f"audit_id={audit_id[:12]} endpoint={endpoint}"
         )
 
-    def _validator_endpoint_urls(self, *, force_refresh: bool = False) -> tuple[str, ...]:
+    def _validator_endpoint_urls(
+        self,
+        *,
+        force_refresh: bool = False,
+        nonblocking: bool = False,
+    ) -> tuple[str, ...]:
         resolver = getattr(self, "_validator_endpoint_resolver", None)
         if resolver is None:
             return tuple(getattr(self, "validator_urls", ()) or ())
+        if nonblocking:
+            method = getattr(resolver, "current_urls_nonblocking", None)
+            if callable(method):
+                return method()
         return resolver.current_urls(force_refresh=force_refresh)
 
     def _record_validator_publish_result(
@@ -1966,10 +2136,11 @@ class CapacityAuditMinerWorker:
     ) -> None:
         resolver = getattr(self, "_validator_endpoint_resolver", None)
         if resolver is not None:
-            try:
-                resolver.record_publish_result(endpoint, success, failure_kind=failure_kind)
-            except TypeError:
-                resolver.record_publish_result(endpoint, success)
+            with self._publisher_result_lock:
+                try:
+                    resolver.record_publish_result(endpoint, success, failure_kind=failure_kind)
+                except TypeError:
+                    resolver.record_publish_result(endpoint, success)
 
     @staticmethod
     def _validator_endpoint_failure_kind(status_code: int) -> str:

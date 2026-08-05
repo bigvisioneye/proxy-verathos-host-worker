@@ -49,6 +49,29 @@ class MaintenanceGraceConfig:
     suppress_proxy_proof_strikes: bool = True
 
 
+DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS = (1, 3)
+LOCAL_PROOF_PROTOCOL_VERSIONS = (1, 3)
+_RESERVED_INFERENCE_PROOF_PROTOCOL_VERSIONS = frozenset({2})
+_MAX_PROOF_PROTOCOL_VERSION = 255
+
+
+@dataclass(frozen=True)
+class ProofProtocolRolloutConfig:
+    """Owner-selected proof protocols, independent of maintenance grace."""
+
+    allowed_protocol_versions: tuple[int, ...] = (
+        DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS
+    )
+
+
+@dataclass(frozen=True)
+class ProofV3HardAuditorConfig:
+    """Epoch-pinned authority allowed to reveal proof-v3 hard nonces."""
+
+    enabled: bool = False
+    validator_hotkey_ss58: str = ""
+
+
 @dataclass(frozen=True)
 class RuntimeSubnetConfig:
     schema_version: int
@@ -73,6 +96,8 @@ class RuntimeSubnetConfig:
     capacity_audit_slot_refresh_blocks: int
     capacity_audit_slot_snapshot_stale_blocks: int
     capacity_audit_proof_verify_workers: int
+    proof_protocol_rollout: ProofProtocolRolloutConfig
+    proof_v3_hard_auditor: ProofV3HardAuditorConfig
     maintenance_grace: MaintenanceGraceConfig
     payload: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
     source: str = ""
@@ -282,6 +307,100 @@ def _maintenance_grace_to_dict(row: MaintenanceGraceConfig) -> dict[str, Any]:
     return dict(asdict(row))
 
 
+def _proof_protocol_rollout_to_dict(
+    row: ProofProtocolRolloutConfig,
+) -> dict[str, Any]:
+    return {
+        "allowed_protocol_versions": list(row.allowed_protocol_versions),
+    }
+
+
+def _proof_v3_hard_auditor_to_dict(
+    row: ProofV3HardAuditorConfig,
+) -> dict[str, Any]:
+    return dict(asdict(row))
+
+
+def _parse_proof_v3_hard_auditor(
+    payload: Mapping[str, Any],
+) -> ProofV3HardAuditorConfig:
+    raw = payload.get("proof_v3_hard_auditor", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise SubnetRuntimeConfigError(
+            "proof_v3_hard_auditor must be an object"
+        )
+    cfg = ProofV3HardAuditorConfig(
+        enabled=_optional_bool(raw, "enabled", False),
+        validator_hotkey_ss58=_optional_str(
+            raw,
+            "validator_hotkey_ss58",
+            "",
+            maximum_length=128,
+        ),
+    )
+    if cfg.enabled and not cfg.validator_hotkey_ss58:
+        raise SubnetRuntimeConfigError(
+            "enabled proof_v3_hard_auditor requires validator_hotkey_ss58"
+        )
+    return cfg
+
+
+def _parse_proof_protocol_rollout(
+    payload: Mapping[str, Any],
+) -> ProofProtocolRolloutConfig:
+    raw = payload.get("proof_protocol_rollout", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise SubnetRuntimeConfigError("proof_protocol_rollout must be an object")
+
+    unknown = set(raw).difference({"allowed_protocol_versions"})
+    if unknown:
+        raise SubnetRuntimeConfigError(
+            "proof_protocol_rollout contains unsupported fields: "
+            + ", ".join(sorted(unknown))
+        )
+    versions_raw = raw.get(
+        "allowed_protocol_versions",
+        list(DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS),
+    )
+    if not isinstance(versions_raw, list) or not versions_raw:
+        raise SubnetRuntimeConfigError(
+            "proof_protocol_rollout.allowed_protocol_versions must be a "
+            "non-empty list"
+        )
+    versions: list[int] = []
+    for index, value in enumerate(versions_raw):
+        _reject_bool(
+            value,
+            f"proof_protocol_rollout.allowed_protocol_versions[{index}]",
+        )
+        if not isinstance(value, int):
+            raise SubnetRuntimeConfigError(
+                "proof_protocol_rollout.allowed_protocol_versions entries "
+                "must be integers"
+            )
+        version = int(value)
+        if not 1 <= version <= _MAX_PROOF_PROTOCOL_VERSION:
+            raise SubnetRuntimeConfigError(
+                "proof protocol versions must be between 1 and "
+                f"{_MAX_PROOF_PROTOCOL_VERSION}"
+            )
+        if version in _RESERVED_INFERENCE_PROOF_PROTOCOL_VERSIONS:
+            raise SubnetRuntimeConfigError(
+                "inference proof protocol v2 is reserved and cannot be enabled"
+            )
+        versions.append(version)
+    if versions != sorted(set(versions)):
+        raise SubnetRuntimeConfigError(
+            "proof_protocol_rollout.allowed_protocol_versions must be sorted "
+            "and contain no duplicates"
+        )
+    return ProofProtocolRolloutConfig(tuple(versions))
+
+
 def _parse_maintenance_grace(payload: Mapping[str, Any]) -> MaintenanceGraceConfig:
     raw = payload.get("maintenance_grace", {})
     if raw is None:
@@ -332,6 +451,57 @@ def maintenance_grace_active(
             grace.until_unix_ts
         )
     return epoch_active or time_active
+
+
+def legacy_v1_compatibility_active(
+    rollout: ProofProtocolRolloutConfig | None,
+    *,
+    current_epoch: int | None = None,
+    now: float | None = None,
+) -> bool:
+    """Return whether inference proof v1 is currently owner-allowed."""
+
+    del current_epoch, now
+    return proof_protocol_allowed(rollout, 1)
+
+
+def proof_protocol_allowed(
+    rollout: ProofProtocolRolloutConfig | None,
+    version: int,
+) -> bool:
+    """Return whether the owner-selected allowlist admits ``version``."""
+
+    effective = rollout or ProofProtocolRolloutConfig()
+    return int(version) in effective.allowed_protocol_versions
+
+
+def select_proof_protocol_version(
+    rollout: ProofProtocolRolloutConfig | None,
+    *,
+    locally_supported: tuple[int, ...] = LOCAL_PROOF_PROTOCOL_VERSIONS,
+    peer_advertised: tuple[int, ...],
+) -> int | None:
+    """Select the newest mutually supported owner-allowed protocol."""
+
+    effective = rollout or ProofProtocolRolloutConfig()
+    common = (
+        set(int(v) for v in effective.allowed_protocol_versions)
+        .intersection(int(v) for v in locally_supported)
+        .intersection(int(v) for v in peer_advertised)
+    )
+    return max(common) if common else None
+
+
+def proof_v3_required(
+    rollout: ProofProtocolRolloutConfig | None,
+) -> bool:
+    """Return whether this v1/v3 binary must refuse v1 and use v3.
+
+    A future-only allowlist such as ``[4]`` also returns true so an older
+    binary fails closed instead of silently falling back to v1.
+    """
+
+    return not proof_protocol_allowed(rollout, 1)
 
 
 def build_default_subnet_config_payload(
@@ -442,6 +612,12 @@ def build_default_subnet_config_payload(
             "proof_verify_workers": int(neuron_config.capacity_audit_proof_verify_workers),
             "gpu_classes": [_gpu_class_to_dict(row) for row in DEFAULT_GPU_CLASSES],
         },
+        "proof_protocol_rollout": _proof_protocol_rollout_to_dict(
+            proof_protocol_rollout_config_from_neuron_config(neuron_config)
+        ),
+        "proof_v3_hard_auditor": _proof_v3_hard_auditor_to_dict(
+            proof_v3_hard_auditor_config_from_neuron_config(neuron_config)
+        ),
         "maintenance_grace": _maintenance_grace_to_dict(
             maintenance_grace_config_from_neuron_config(neuron_config)
         ),
@@ -602,6 +778,8 @@ def validate_subnet_config_payload(
         audit_data, "slot_snapshot_stale_blocks", minimum=0
     )
     proof_verify_workers = _require_int(audit_data, "proof_verify_workers", minimum=1)
+    proof_protocol_rollout = _parse_proof_protocol_rollout(payload)
+    proof_v3_hard_auditor = _parse_proof_v3_hard_auditor(payload)
     maintenance_grace = _parse_maintenance_grace(payload)
 
     normalized = build_default_subnet_config_payload(
@@ -665,6 +843,12 @@ def validate_subnet_config_payload(
         "proof_verify_workers": proof_verify_workers,
         "gpu_classes": [_gpu_class_to_dict(row) for row in gpu_classes],
     }
+    normalized["proof_protocol_rollout"] = _proof_protocol_rollout_to_dict(
+        proof_protocol_rollout
+    )
+    normalized["proof_v3_hard_auditor"] = _proof_v3_hard_auditor_to_dict(
+        proof_v3_hard_auditor
+    )
     normalized["maintenance_grace"] = _maintenance_grace_to_dict(maintenance_grace)
 
     return RuntimeSubnetConfig(
@@ -690,6 +874,8 @@ def validate_subnet_config_payload(
         capacity_audit_slot_refresh_blocks=slot_refresh_blocks,
         capacity_audit_slot_snapshot_stale_blocks=slot_snapshot_stale_blocks,
         capacity_audit_proof_verify_workers=proof_verify_workers,
+        proof_protocol_rollout=proof_protocol_rollout,
+        proof_v3_hard_auditor=proof_v3_hard_auditor,
         maintenance_grace=maintenance_grace,
         payload=normalized,
         source=source,
@@ -778,6 +964,13 @@ def apply_runtime_config_to_neuron_config(
     config.capacity_audit_proof_verify_workers = (
         runtime.capacity_audit_proof_verify_workers
     )
+    rollout = runtime.proof_protocol_rollout
+    config.proof_protocol_allowed_versions = rollout.allowed_protocol_versions
+    hard_auditor = runtime.proof_v3_hard_auditor
+    config.proof_v3_hard_auditor_policy_enabled = hard_auditor.enabled
+    config.proof_v3_hard_auditor_hotkey_ss58 = (
+        hard_auditor.validator_hotkey_ss58
+    )
     grace = runtime.maintenance_grace
     config.maintenance_grace_enabled = grace.enabled
     config.maintenance_grace_open_ended = grace.open_ended
@@ -817,6 +1010,41 @@ def maintenance_grace_config_from_neuron_config(config: Any) -> MaintenanceGrace
         ),
         suppress_proxy_proof_strikes=bool(
             getattr(config, "maintenance_grace_suppress_proxy_proof_strikes", True)
+        ),
+    )
+
+
+def proof_protocol_rollout_config_from_neuron_config(
+    config: Any,
+) -> ProofProtocolRolloutConfig:
+    raw = getattr(
+        config,
+        "proof_protocol_allowed_versions",
+        DEFAULT_ALLOWED_PROOF_PROTOCOL_VERSIONS,
+    )
+    if isinstance(raw, str):
+        raw = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    return ProofProtocolRolloutConfig(tuple(int(v) for v in raw))
+
+
+def proof_v3_hard_auditor_config_from_neuron_config(
+    config: Any,
+) -> ProofV3HardAuditorConfig:
+    return ProofV3HardAuditorConfig(
+        enabled=bool(
+            getattr(
+                config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+        ),
+        validator_hotkey_ss58=str(
+            getattr(
+                config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
         ),
     )
 

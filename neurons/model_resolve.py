@@ -167,20 +167,70 @@ def eligible_capacity_models_for_vram(
     on_chain_models: Optional[Iterable[str]] = None,
     min_utility_ratio: float = CAPACITY_RECOMMENDATION_MIN_UTILITY_RATIO,
 ) -> list[RecommendedCapacityModel]:
-    from verallm.registry import recommend_models
+    """Return qualified checkpoint/quant pairs that fit the physical VRAM tier.
+
+    Capacity admission is deliberately distinct from model recommendation.
+    A higher-tier GPU may serve a qualified checkpoint inherited from any
+    lower tier; the hot-capacity audit, rather than a preferred quantization
+    format, enforces exclusive endpoint capacity.  Configurations whose
+    minimum registered tier exceeds the physical GPU tier remain ineligible.
+
+    ``min_utility_ratio`` is retained for API compatibility with older callers
+    but no longer narrows the security admission set.
+    """
+    from verallm.registry.models import ALL_MODELS, VRAMTier
 
     tier = vram_tier_for_gb(int(vram_gb or 0))
     if tier is None:
         return []
-    recs = recommend_models(tier, verified_only=True)
-    recs = _filter_capacity_recommendations(recs, on_chain_models)
-    if not recs:
-        return []
-    eligible = _capacity_eligible_recommendations_from_ranked(
-        recs,
-        min_utility_ratio=min_utility_ratio,
+    del min_utility_ratio
+
+    on_chain_set = (
+        None
+        if on_chain_models is None
+        else {str(model_id).lower() for model_id in on_chain_models}
     )
-    return [_recommendation_to_capacity_model(r, tier) for r in eligible]
+    eligible: dict[tuple[str, str], RecommendedCapacityModel] = {}
+    for model in ALL_MODELS:
+        if not model.verified_inference or model.multi_gpu:
+            continue
+        for config in model.tier_configs:
+            if config.tier == VRAMTier.MULTI_GPU or config.tier.value > tier.value:
+                continue
+            if (
+                on_chain_set is not None
+                and str(config.checkpoint).lower() not in on_chain_set
+            ):
+                continue
+            for quant_config in config.quant_configs:
+                key = (
+                    str(config.checkpoint).lower(),
+                    str(quant_config.quant).lower(),
+                )
+                candidate = RecommendedCapacityModel(
+                    model_id=str(config.checkpoint),
+                    quant=str(quant_config.quant),
+                    max_context_len=int(quant_config.max_model_len or 0),
+                    tier_name=str(config.tier.name),
+                    registry_id=str(model.id),
+                )
+                current = eligible.get(key)
+                if current is None:
+                    eligible[key] = candidate
+                    continue
+                current_tier = VRAMTier[current.tier_name]
+                if config.tier.value < current_tier.value:
+                    eligible[key] = candidate
+
+    return sorted(
+        eligible.values(),
+        key=lambda entry: (
+            -VRAMTier[entry.tier_name].value,
+            entry.registry_id,
+            entry.model_id.lower(),
+            entry.quant.lower(),
+        ),
+    )
 
 
 def recommended_capacity_model_for_vram(
@@ -217,7 +267,7 @@ def validate_capacity_recommended_model(
         on_chain_models=on_chain_models,
     )
     if not eligible:
-        return False, f"no verified recommended model for {int(vram_gb or 0)}GB VRAM", None
+        return False, f"no qualified model fits {int(vram_gb or 0)}GB VRAM", None
     checkpoint_matches = [
         e for e in eligible
         if str(model_id or "").lower() == e.model_id.lower()
@@ -225,7 +275,8 @@ def validate_capacity_recommended_model(
     if not checkpoint_matches:
         return (
             False,
-            f"capacity audit requires one of: {_format_capacity_expected(eligible)}",
+            f"capacity audit requires a qualified model fitting this GPU: "
+            f"{_format_capacity_expected(eligible)}",
             eligible[0],
         )
     quant_matches = [
@@ -236,7 +287,8 @@ def validate_capacity_recommended_model(
         expected = checkpoint_matches[0]
         return (
             False,
-            f"capacity audit requires quant={expected.quant} for {expected.model_id}",
+            f"capacity audit requires a qualified quantization for "
+            f"{expected.model_id}; eligible quant={expected.quant}",
             expected,
         )
     return True, "", quant_matches[0]

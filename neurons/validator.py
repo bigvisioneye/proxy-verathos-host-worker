@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import logging
 import math
@@ -42,14 +43,18 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as _FuturesTimeout
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 import ipaddress
 
 import bittensor as bt
 import httpx
 
-from neurons.canary import FULL_CONTEXT_TOKEN_CAP, CanaryScheduler, CanaryTest
+from neurons.canary import (
+    CanaryScheduler,
+    CanaryTest,
+    materialize_canary_prompt,
+)
 from neurons.capacity_audit import (
     CapacityAuditRuntimeConfig,
     CapacitySlot,
@@ -59,6 +64,7 @@ from neurons.capacity_audit import (
     capacity_audit_window_fits_epoch,
     capacity_audit_window_triggered,
     capacity_gpu_pass_count,
+    capacity_gpu_workload_spec,
     derive_audit_id,
     derive_audit_seed,
     derive_audit_seed_from_hashes,
@@ -73,18 +79,27 @@ from neurons.capacity_audit import (
     window_cohort_budget,
 )
 from neurons.capacity_audit_combined import (
-    COMBINED_PROOF_FORMAT,
+    CURRENT_COMBINED_PROOF_PROTOCOL_VERSION,
+    LEGACY_COMBINED_PROOF_PROTOCOL_VERSION,
+    combined_proof_protocol_version,
+    is_combined_proof_payload,
     verify_combined_proof_payload,
 )
 from neurons.config import NeuronConfig
 from neurons.discovery import ActiveMiner, discover_active_miners
 from neurons.subnet_runtime_config import (
     MaintenanceGraceConfig,
+    ProofProtocolRolloutConfig,
     RuntimeSubnetConfigClient,
     apply_runtime_config_to_neuron_config,
     capacity_audit_config_from_neuron_config,
+    legacy_v1_compatibility_active,
     maintenance_grace_active,
     maintenance_grace_config_from_neuron_config,
+    proof_protocol_allowed,
+    proof_v3_required,
+    proof_protocol_rollout_config_from_neuron_config,
+    select_proof_protocol_version,
 )
 from neurons.model_resolve import validate_capacity_recommended_model
 from neurons.version import spec_version, version_str, validator_version, validator_version_str
@@ -117,10 +132,278 @@ from verallm.chain.mock import create_clients
 from verallm.chain.types import ScoringParams
 from verallm.chain.wallet import derive_evm_private_key, derive_evm_address
 from verallm.api.client import ValidatorClient
+from verallm.api.proof_protocol import (
+    LEGACY_PROOF_PROTOCOL_VERSION,
+    PROOF_PROTOCOL_V3,
+    SUPPORTED_PROOF_PROTOCOL_VERSIONS,
+)
 from verallm.config import Config
+from verallm.proof_policy import (
+    CURRENT_PROOF_PROTOCOL_VERSION,
+    evaluate_proof_policy,
+    verify_with_proof_policy,
+)
+from verallm.proof_v3.canary_policy import (
+    MAX_CANARY_FULL_PAIR_HOLD_SECONDS_V3,
+    canary_prompt_token_tolerance_v3,
+)
 from verallm.registry import get_model, MODELS_BY_ID
 
 logger = logging.getLogger(__name__)
+_PROOF_V2_ARTIFACT_REFRESH_SECONDS = 3600.0
+
+
+class _ProofV3ValidatorConfigurationError(RuntimeError):
+    """Local v3 configuration is unavailable; the miner is not at fault."""
+
+
+class _ProofV3FullPairBarrier:
+    """Keep two full-canary precommits secret until both serves are frozen."""
+
+    def __init__(self, pair_id: str, hold_seconds: int) -> None:
+        try:
+            pair_bytes = bytes.fromhex(pair_id)
+        except (TypeError, ValueError):
+            pair_bytes = b""
+        if (
+            len(pair_bytes) != 16
+            or pair_id != pair_bytes.hex()
+            or type(hold_seconds) is not int
+            or not 0 < hold_seconds <= MAX_CANARY_FULL_PAIR_HOLD_SECONDS_V3
+        ):
+            raise _ProofV3ValidatorConfigurationError(
+                "proof-v3 full-pair barrier metadata is malformed"
+            )
+        self.pair_id = pair_id
+        self.hold_seconds = int(hold_seconds)
+        self._condition = threading.Condition()
+        self._next_slot = 0
+        self._precommitted: Set[int] = set()
+        self._hard_slots: Set[int] = set()
+        self._exchanges: Dict[int, object] = {}
+        self._completed: Set[int] = set()
+        self._first_precommit_at: float | None = None
+        self._failure: BaseException | None = None
+        self._failure_attributed = False
+        self._departed: Set[int] = set()
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("proof-v3 full-pair barrier expired")
+        return remaining
+
+    def _raise_failure_locked(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    def wait_for_inference_turn(self, slot: int) -> None:
+        if slot not in (0, 1):
+            raise _ProofV3ValidatorConfigurationError(
+                "proof-v3 full-pair slot is malformed"
+            )
+        deadline = time.monotonic() + self.hold_seconds
+        with self._condition:
+            while self._failure is None and self._next_slot != slot:
+                self._condition.wait(self._remaining(deadline))
+            self._raise_failure_locked()
+
+    @staticmethod
+    def _fail_exchanges(exchanges: Sequence[object]) -> None:
+        for exchange in exchanges:
+            fail_closed = getattr(exchange, "fail_closed", None)
+            if callable(fail_closed):
+                try:
+                    fail_closed()
+                except Exception:
+                    pass
+
+    def _pending_exchanges_locked(self) -> Tuple[object, ...]:
+        return tuple(
+            exchange
+            for slot, exchange in self._exchanges.items()
+            if slot not in self._completed
+        )
+
+    def mark_precommitted(
+        self,
+        slot: int,
+        *,
+        hard_audit: bool,
+        exchange: object,
+    ) -> None:
+        if not callable(getattr(exchange, "fail_closed", None)):
+            raise _ProofV3ValidatorConfigurationError(
+                "proof-v3 full-pair exchange cannot fail closed"
+            )
+        with self._condition:
+            self._raise_failure_locked()
+            if slot != self._next_slot or slot in self._precommitted:
+                raise RuntimeError(
+                    "proof-v3 full-pair precommit order is inconsistent"
+                )
+            now = time.monotonic()
+            self._precommitted.add(slot)
+            self._exchanges[slot] = exchange
+            if hard_audit:
+                self._hard_slots.add(slot)
+            self._next_slot += 1
+            if slot == 0:
+                self._first_precommit_at = now
+            self._condition.notify_all()
+
+    def wait_until_both_precommitted(self) -> None:
+        with self._condition:
+            if self._first_precommit_at is None:
+                raise RuntimeError(
+                    "proof-v3 full-pair wait preceded the first precommit"
+                )
+            deadline = self._first_precommit_at + self.hold_seconds
+            while self._failure is None and len(self._precommitted) != 2:
+                self._condition.wait(self._remaining(deadline))
+            self._raise_failure_locked()
+            if len(self._hard_slots) != 1:
+                raise RuntimeError(
+                    "proof-v3 full-pair must contain exactly one hard slot"
+                )
+
+    def mark_completed(self, slot: int) -> None:
+        with self._condition:
+            self._raise_failure_locked()
+            if len(self._precommitted) != 2 or slot in self._completed:
+                raise RuntimeError(
+                    "proof-v3 full-pair completion order is inconsistent"
+                )
+            self._completed.add(slot)
+            self._condition.notify_all()
+
+    def worker_completed(self, slot: int) -> None:
+        pending: Tuple[object, ...] = ()
+        with self._condition:
+            if slot not in (0, 1):
+                raise _ProofV3ValidatorConfigurationError(
+                    "proof-v3 full-pair worker slot is malformed"
+                )
+            if self._failure is None and slot not in self._completed:
+                self._failure = _ProofV3ValidatorConfigurationError(
+                    "proof-v3 full-pair worker exited before completion"
+                )
+                pending = self._pending_exchanges_locked()
+            self._condition.notify_all()
+        self._fail_exchanges(pending)
+
+    def abort(self, failure: BaseException) -> bool:
+        pending: Tuple[object, ...] = ()
+        with self._condition:
+            had_precommit = bool(self._precommitted)
+            if self._failure is None:
+                self._failure = failure
+                pending = self._pending_exchanges_locked()
+            self._condition.notify_all()
+        self._fail_exchanges(pending)
+        return had_precommit
+
+    def claim_failure_attribution(self) -> bool:
+        with self._condition:
+            if self._failure_attributed:
+                return False
+            self._failure_attributed = True
+            return True
+
+    def depart(self, slot: int) -> bool:
+        with self._condition:
+            if slot not in (0, 1):
+                raise _ProofV3ValidatorConfigurationError(
+                    "proof-v3 full-pair departure slot is malformed"
+                )
+            self._departed.add(slot)
+            return len(self._departed) == 2
+
+
+def _resolve_proof_v2_manifest_paths(
+    cli_paths: Optional[List[str]],
+    *,
+    chain_id: int | None = None,
+    netuid: int | None = None,
+) -> tuple[str, ...]:
+    """Resolve explicit, environment, then authenticated bundled manifests."""
+
+    if cli_paths is not None:
+        return tuple(path for path in cli_paths if path)
+    environment_paths = tuple(
+        path
+        for path in os.environ.get("VERATHOS_PROOF_V2_MANIFESTS", "").split(
+            os.pathsep
+        )
+        if path
+    )
+    if environment_paths:
+        return environment_paths
+    from verallm.proof_v2.runtime import bundled_proof_v2_manifest_paths
+
+    return tuple(
+        str(path)
+        for path in bundled_proof_v2_manifest_paths(
+            chain_id=chain_id,
+            netuid=netuid,
+        )
+    )
+
+
+def _resolve_proof_v3_release_paths(
+    cli_paths: Optional[List[str]],
+) -> tuple[str, ...]:
+    """Resolve explicit then environment-configured v3 release descriptors."""
+
+    if cli_paths is not None:
+        return tuple(path for path in cli_paths if path)
+    return tuple(
+        path
+        for path in os.environ.get("VERATHOS_PROOF_V3_RELEASES", "").split(
+            os.pathsep
+        )
+        if path
+    )
+
+
+def _resolve_proof_v3_canary_policy_path(cli_path: Optional[str]) -> str:
+    """Resolve an explicit or environment-configured signed canary policy."""
+
+    if cli_path is not None:
+        return str(cli_path).strip()
+    return os.environ.get("VERATHOS_PROOF_V3_CANARY_POLICY", "").strip()
+
+
+def _effective_canary_counts(
+    config: object,
+    signed_policy: object | None,
+    *,
+    hard_audit_enabled: bool,
+) -> tuple[int, int, int]:
+    """Resolve the exact official canary inventory for one endpoint."""
+
+    if signed_policy is not None:
+        if hard_audit_enabled:
+            low = 0
+            advertised_light = int(
+                signed_policy.minimum_advertised_context_light_canaries
+            )
+            hard = 0
+        else:
+            low = int(signed_policy.minimum_low_context_canaries)
+            advertised_light = 0
+            hard = 0
+    else:
+        if hard_audit_enabled:
+            low = 0
+            advertised_light = 1
+            hard = 0
+        else:
+            low = max(2, int(getattr(config, "canary_small_count", 0)))
+            advertised_light = 0
+            hard = 0
+    return low, advertised_light, hard
 
 
 def _validator_probation_state_path() -> str:
@@ -231,6 +514,105 @@ def _get_tokenizer(model_id: str):
         return tokenizer
 
 
+def _tokenizer_chat_template_kwargs(
+    tokenizer,
+    *,
+    enable_thinking: bool,
+) -> dict[str, object]:
+    """Match the miner's bounded chat-template capability selection."""
+
+    import inspect
+
+    try:
+        source = inspect.getsource(tokenizer.apply_chat_template)
+    except (AttributeError, TypeError, OSError):
+        source = ""
+    template = getattr(tokenizer, "chat_template", "") or ""
+    if "enable_thinking" in source or "enable_thinking" in template:
+        return {"enable_thinking": enable_thinking}
+    if "reasoning_effort" in template:
+        return {
+            "reasoning_effort": "medium" if enable_thinking else "none"
+        }
+    return {}
+
+
+def _tokenize_proof_v3_chat(
+    model_id: str,
+    messages: Sequence[Mapping[str, object]],
+    *,
+    enable_thinking: bool,
+) -> tuple[int, ...]:
+    """Produce the exact token sequence the v3 miner must execute."""
+
+    tokenizer = _get_tokenizer(model_id)
+    values = tokenizer.apply_chat_template(
+        list(messages),
+        tokenize=True,
+        add_generation_prompt=True,
+        **_tokenizer_chat_template_kwargs(
+            tokenizer,
+            enable_thinking=enable_thinking,
+        ),
+    )
+    from verallm.proof_v3.request import canonical_tokenizer_token_ids_v3
+
+    try:
+        return canonical_tokenizer_token_ids_v3(values)
+    except ValueError as exc:
+        raise RuntimeError(
+            "proof-v3 tokenizer returned malformed token ids"
+        ) from exc
+
+
+def _proof_v3_canary_runtime_policy(
+    qualified_release,
+    *,
+    hard_audit: bool,
+):
+    """Build one validator-owned light or 100%-hard v3 canary policy."""
+
+    from verallm.proof_v3.relation import RuntimeHardAuditPolicyV3
+
+    signed = (
+        qualified_release.qualified_profile.profile.relation_spec.audit_policy
+    )
+    return RuntimeHardAuditPolicyV3(
+        request_kind="canary" if hard_audit else "organic",
+        effective_organic_hard_bps=signed.minimum_organic_hard_bps,
+        effective_canary_hard_bps=10_000,
+        effective_probation_failures=signed.probation_failures,
+        nonce_selection_abi_id=signed.nonce_selection_abi_id,
+        tier_selection_abi_id=signed.tier_selection_abi_id,
+        selection_abi_id=signed.selection_abi_id,
+    )
+
+
+def _proof_v3_hard_auditor_active(
+    config: object,
+    validator_hotkey_ss58: str,
+) -> bool:
+    """Require verify mode and the exact subnet-configured validator."""
+
+    configured_hotkey = str(
+        getattr(config, "proof_v3_hard_auditor_hotkey_ss58", "") or ""
+    )
+    return bool(
+        str(
+            getattr(config, "proof_v3_verdict_source", "follower")
+            or "follower"
+        ).strip().lower()
+        == "verify"
+        and getattr(
+            config,
+            "proof_v3_hard_auditor_policy_enabled",
+            False,
+        )
+        and configured_hotkey
+        and configured_hotkey == str(validator_hotkey_ss58 or "")
+    )
+
+
 def _compute_expected_input_commitment(
     model_id: str,
     prompt: str,
@@ -264,22 +646,12 @@ def _compute_expected_input_commitment(
                 messages, tokenize=True, add_generation_prompt=True,
             )
         else:
-            # Replicate _chat_template_kwargs
-            import inspect
-            try:
-                src = inspect.getsource(tokenizer.apply_chat_template)
-            except (TypeError, OSError):
-                src = ""
-            tpl = getattr(tokenizer, "chat_template", "") or ""
-            kwargs = {}
-            if "enable_thinking" in src or "enable_thinking" in tpl:
-                kwargs["enable_thinking"] = enable_thinking
-            elif "reasoning_effort" in tpl:
-                kwargs["reasoning_effort"] = "none" if not enable_thinking else "medium"
-
             formatted = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
-                **kwargs,
+                **_tokenizer_chat_template_kwargs(
+                    tokenizer,
+                    enable_thinking=enable_thinking,
+                ),
             )
             token_ids = tokenizer.encode(formatted)
     except Exception:
@@ -421,27 +793,146 @@ class ValidatorNeuron:
         self._miner_debug_cache_lock = threading.Lock()
         self._miner_debug_refresh_in_flight = False
         self._miner_debug_last_scheduled_at = 0.0
+        from neurons.verdict_follower import VerdictSnapshotFollower
+
+        self._verdict_snapshot_follower = VerdictSnapshotFollower()
+        self._proof_v3_verdict_source_latched = "follower"
+        self._proof_v3_verdict_source_latched_epoch: int | None = None
+        self._owner_verdict_url_latched = ""
+        self._verdict_snapshot_hex = ""
+        self._verdict_snapshot_history: Dict[int, str] = {}
+        try:
+            from neurons.verdict_records import VerdictSnapshotV1
+
+            persisted_snapshot = str(
+                self._db.get_meta("gleipnir_verdict_snapshot_v1") or ""
+            )
+            if persisted_snapshot:
+                decoded_snapshot = VerdictSnapshotV1.from_bytes(
+                    bytes.fromhex(persisted_snapshot)
+                )
+                self._verdict_snapshot_hex = persisted_snapshot
+                self._verdict_snapshot_history[
+                    int(decoded_snapshot.epoch_number)
+                ] = persisted_snapshot
+            persisted_history = str(
+                self._db.get_meta("gleipnir_verdict_snapshots_v1") or ""
+            )
+            if persisted_history:
+                history = json.loads(persisted_history)
+                if not isinstance(history, dict):
+                    raise ValueError("verdict snapshot history must be an object")
+                for raw_epoch, encoded in history.items():
+                    epoch = int(raw_epoch)
+                    if epoch < 0 or not isinstance(encoded, str):
+                        raise ValueError("verdict snapshot history is malformed")
+                    decoded = VerdictSnapshotV1.from_bytes(bytes.fromhex(encoded))
+                    if int(decoded.epoch_number) != epoch:
+                        raise ValueError("verdict snapshot history epoch mismatch")
+                    self._verdict_snapshot_history[epoch] = encoded
+                self._verdict_snapshot_history = dict(
+                    sorted(self._verdict_snapshot_history.items())[-4:]
+                )
+        except Exception as exc:
+            bt.logging.warning(
+                "Ignoring malformed persisted verdict snapshot: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
         # Epoch state
         self._current_epoch: int = 0
         self._epoch_start_block: int = 0
         self._canary_scheduler: Optional[CanaryScheduler] = None
         self._canary_scheduler_lock = threading.Lock()
+        self._canary_accounting_lock = threading.Lock()
         self._epoch_miners: List[ActiveMiner] = []
         self._epoch_miners_discovery_valid: bool = False
         # {(lowercase miner_address, model_index): expected_receipt_count}
         self._expected_receipts: Dict[Tuple[str, int], int] = {}
+        # Exact signed obligation IDs planned for each miner/model this epoch.
+        self._expected_canary_obligations: Dict[
+            Tuple[str, int],
+            Dict[bytes, Tuple[str, int]],
+        ] = {}
+        self._hard_canary_obligation_ids: Set[bytes] = set()
+        self._validator_canary_failures: Set[Tuple[str, int]] = set()
+        self._canary_penalized_keys: Set[Tuple[str, int]] = set()
+        # External validators independently replay the configured hard
+        # auditor's retained proof. Missing owner receipts stay neutral;
+        # present-but-invalid bundles become ordinary proof failures.
+        self._shared_hard_proof_verdicts: Dict[
+            Tuple[str, int],
+            bool,
+        ] = {}
+        self._shared_hard_prefetch_lock = threading.Lock()
+        self._shared_hard_prefetch_results: Dict[
+            Tuple[int, str, int, bytes],
+            Tuple[str, str],
+        ] = {}
+        self._shared_hard_prefetch_inflight: Set[
+            Tuple[int, str, int, str]
+        ] = set()
+        self._shared_hard_prefetch_waves: Set[Tuple[int, int]] = set()
+        self._shared_hard_processed_receipts: Set[bytes] = set()
+        self._load_shared_hard_processed_receipts()
+        self._shared_hard_processed_failures: Set[bytes] = set()
+        self._load_shared_hard_processed_failures()
         # {epoch_number: {(miner_address, model_index): in_flight_count}}
         self._inflight_canaries: Dict[int, Dict[Tuple[str, int], int]] = {}
+        # Submitted work is tracked before its executor worker starts so epoch
+        # close can neutralize both queued and actively running validator work.
+        self._queued_canaries: Dict[int, Dict[Tuple[str, int], int]] = {}
+        # Exact submitted obligations remain here until their worker returns.
+        # Epoch close removes only these specific unfinished obligations from
+        # scoring; it must not neutralize unrelated completed canaries for the
+        # same endpoint.
+        self._unfinished_canary_tests: Dict[
+            Tuple[int, bytes],
+            CanaryTest,
+        ] = {}
+        # Sealing an epoch makes every late worker result stale immediately,
+        # before _current_epoch advances.
+        self._sealed_canary_epochs: Set[int] = set()
+        # Any request actually started before its scoring boundary retains a
+        # bounded terminal outcome after that boundary.  Queued/unstarted work
+        # is validator-local and neutral; a miner cannot make an accepted
+        # request disappear merely by delaying it into the next epoch.
+        self._cross_epoch_canaries: Set[Tuple[int, bytes]] = set()
         self._closing_inflight_canaries: Dict[int, Dict[Tuple[str, int], int]] = {}
+        self._proof_v3_full_pair_barriers: Dict[
+            str,
+            _ProofV3FullPairBarrier,
+        ] = {}
+        self._proof_v3_full_pair_barriers_lock = threading.Lock()
+        # Only one post-commit hard audit may consume an endpoint's prover at
+        # a time. Light traffic remains concurrent; this prevents one hard
+        # proof from starving the next hard request's one-second precommit.
+        self._proof_v3_hard_execution_locks: Dict[
+            Tuple[str, int],
+            threading.Lock,
+        ] = {}
+        self._proof_v3_hard_execution_locks_lock = threading.Lock()
         # {(lowercase miner_address, model_index): 503_skip_count} — reset each epoch
         self._busy_skips: Dict[Tuple[str, int], int] = {}
-        # Miners that entered probation via busy-skips (not real proof failure)
-        # — maps to list of unix timestamps when 503s occurred, used to verify
-        # organic receipts overlap temporally (miner was genuinely busy then)
-        self._busy_skip_probations: Dict[Tuple[str, int], List[int]] = {}
+        # Signed-receipt reconciliation uses exact validator-observed intervals.
+        self._busy_skip_probations: Dict[
+            Tuple[str, int],
+            List[Tuple[float, float, str, bytes]],
+        ] = {}
         # {model_id: ModelSpec} — cached per epoch, avoids RPC per canary
         self._model_spec_cache: Dict[str, object] = {}
+        # Exact Solidity ModelSpec structs are retained separately. Proof-v2
+        # manifests must be matched against this lossless chain view before
+        # they can be attached to a verifier client.
+        self._on_chain_model_spec_cache: Dict[str, object] = {}
+        # Values are VerifiedProofV2Manifest records authenticated during
+        # setup against the current ModelRegistry owner/multisig authority.
+        self._proof_v2_manifests: Dict[str, object] = {}
+        self._proof_v2_remote_refresh_after: float = 0.0
+        # Fully qualified, authority-authenticated proof-v3 releases. These
+        # contain validator artifacts and signed profiles, never model weights.
+        self._proof_v3_releases: Dict[str, object] = {}
+        self._proof_v3_canary_policy = None
         # Remote miner_version tracking — opens a forgiveness window after a
         # release lands in the public repo, so miners restarting to pull the
         # new code don't get probation for "canary errors" that are really
@@ -450,17 +941,40 @@ class ValidatorNeuron:
         self._miner_version_bump_at: float = 0.0
         self._miner_version_last_check: float = 0.0
         self._restart_forgiven: Set[Tuple[str, int]] = set()
-        # Per-key set of (address, model_index) that had zero full-context
-        # canary successes in the previous epoch.  Capability FAILURE only
-        # probates when BOTH the previous and current epoch hit zero, so
-        # one transient validator-side blip doesn't probate the network.
-        self._zero_fc_last_epoch: Set[Tuple[str, int]] = set()
+        # One bounded full-context deferral, persisted in validator_meta.
+        self._full_context_debt: Dict[Tuple[str, int], int] = {}
+        self._load_full_context_debt()
+        # Last independently verified hard-audit pass per endpoint. This is a
+        # rolling security floor, not an exact per-epoch counter: random hard
+        # draws continue after a pass, while a two-epoch drought forces one
+        # hidden post-precommit hard mark.
+        self._hard_audit_pass_lock = threading.Lock()
+        self._last_hard_audit_pass_epoch: Dict[Tuple[str, int], int] = {}
+        self._load_hard_audit_pass_epochs()
+        # A late hard proof is security-relevant even after its throughput
+        # epoch closes. Track the last source epoch reconciled into probation
+        # so an out-of-order completion cannot create a duplicate/retroactive
+        # clean pass after a newer failure.
+        self._probation_recovery_epoch_lock = threading.Lock()
+        self._last_probation_recovery_source_epoch: Dict[
+            Tuple[str, int],
+            int,
+        ] = {}
+        self._load_probation_recovery_source_epochs()
         # Epoch close state
         self._pending_epoch_close: Optional[int] = None
+        # Finalized-block callbacks can overlap while receipt pulling and
+        # scoring hold the first callback for tens of seconds.  The completed
+        # epoch guard alone is not sufficient because two callbacks can both
+        # observe the old value before either close finishes.  Keep the whole
+        # close transaction single-flight so scoring, EMA updates, the audit
+        # log and the weight submission are each produced exactly once.
+        self._epoch_close_lock = threading.Lock()
         self._auto_updater = None  # Set by main() if --auto-update
         self._epoch_close_block: int = 0
         self._epoch_close_retry_after: float = 0.0  # monotonic time
         self._epoch_close_backoff: float = 30.0  # seconds, doubles on failure
+        self._weight_update_due: bool = False
         self._last_known_block: int = 0  # fallback for _get_current_block
         self._last_block_hash_warning_at: float = 0.0
         self._capacity_audit_server = None
@@ -475,6 +989,16 @@ class ValidatorNeuron:
         self._capacity_audit_verifier_unhealthy = False
         self._capacity_audit_verifier_last_error = ""
         self._capacity_audit_cfg = capacity_audit_config_from_neuron_config(config)
+        self._proof_protocol_rollout_cfg = (
+            proof_protocol_rollout_config_from_neuron_config(config)
+        )
+        repaired_audits = self._db.reconcile_capacity_audit_duplicate_timing_misses()
+        if repaired_audits["slot_rows"] or repaired_audits["history_rows"]:
+            bt.logging.warning(
+                "Capacity audit timing reconciliation repaired duplicate-delivery "
+                f"classifications: active={repaired_audits['slot_rows']} "
+                f"history={repaired_audits['history_rows']}"
+            )
         self._maintenance_grace_cfg = maintenance_grace_config_from_neuron_config(config)
         self._subnet_runtime_config_client = RuntimeSubnetConfigClient.from_config(
             config,
@@ -499,12 +1023,19 @@ class ValidatorNeuron:
         # other's freshly written drains before selecting endpoint slots.
         self._capacity_audit_executor = ThreadPoolExecutor(max_workers=1)
         self._capacity_audit_discovery_executor = ThreadPoolExecutor(max_workers=1)
+        # Receipt deadlines are based on completed-body arrival. Keep signature
+        # validation and SQLite work off the ingest event loop so one receipt
+        # cannot delay the timestamp assigned to another.
+        self._capacity_audit_receipt_executor = ThreadPoolExecutor(max_workers=4)
         self._miner_debug_executor = ThreadPoolExecutor(max_workers=1)
         proof_workers = max(
             1,
             int(getattr(config, "capacity_audit_proof_verify_workers", 4) or 4),
         )
         self._capacity_audit_proof_executor = ThreadPoolExecutor(max_workers=proof_workers)
+        self._shared_hard_prefetch_executor = ThreadPoolExecutor(
+            max_workers=min(8, proof_workers),
+        )
 
     def _refresh_subnet_runtime_config(
         self,
@@ -529,9 +1060,11 @@ class ValidatorNeuron:
             getattr(self.config, "capacity_audit_proof_verify_workers", 4) or 4
         )
         apply_runtime_config_to_neuron_config(runtime, self.config)
+        self._enforce_proof_v3_verdict_owner_guard()
         self._scoring = runtime.scoring
         self._last_good_scoring = runtime.scoring
         self._capacity_audit_cfg = runtime.capacity_audit
+        self._proof_protocol_rollout_cfg = runtime.proof_protocol_rollout
         self._maintenance_grace_cfg = runtime.maintenance_grace
         self._probation_tracker.required_passes = runtime.scoring.probation_required_passes
         self._probation_tracker.escalation_epochs = runtime.probation_escalation_epochs
@@ -558,6 +1091,66 @@ class ValidatorNeuron:
             f"authoritative={authoritative}"
         )
         return True
+
+    def _configured_proof_v3_verdict_source(self) -> str:
+        source = str(
+            getattr(self.config, "proof_v3_verdict_source", "follower")
+            or "follower"
+        ).strip().lower()
+        if source not in {"verify", "follower"}:
+            bt.logging.warning(
+                f"Invalid proof-v3 verdict source {source!r}; using follower"
+            )
+            return "follower"
+        return source
+
+    def _enforce_proof_v3_verdict_owner_guard(self) -> None:
+        """Require the configured owner to opt into local verification."""
+
+        owner = str(
+            getattr(
+                self.config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
+        )
+        local = str(getattr(self, "_validator_hotkey_ss58", "") or "")
+        if (
+            owner
+            and local == owner
+            and self._configured_proof_v3_verdict_source() == "follower"
+        ):
+            raise RuntimeError(
+                "configured proof-v3 hard auditor must explicitly set "
+                "VERATHOS_PROOF_V3_VERDICT_SOURCE=verify (or "
+                "--proof-v3-verdict-source=verify)"
+            )
+
+    def _latch_proof_v3_verdict_source(self, epoch_number: int) -> None:
+        self._enforce_proof_v3_verdict_owner_guard()
+        self._proof_v3_verdict_source_latched = (
+            self._configured_proof_v3_verdict_source()
+        )
+        self._owner_verdict_url_latched = str(
+            getattr(self.config, "owner_verdict_url", "") or ""
+        ).strip()
+        self._proof_v3_verdict_source_latched_epoch = int(epoch_number)
+        bt.logging.info(
+            "Proof-v3 verdict source latched for epoch "
+            f"{int(epoch_number)}: "
+            f"{self._proof_v3_verdict_source_latched}"
+        )
+
+    def _proof_v3_follower_mode_active(self) -> bool:
+        return bool(
+            getattr(
+                self,
+                "_proof_v3_verdict_source_latched",
+                "verify",
+            )
+            == "follower"
+        )
 
     def _maintenance_grace_active(
         self,
@@ -593,6 +1186,50 @@ class ValidatorNeuron:
             )
         return cfg.reason or "maintenance grace"
 
+    def _legacy_v1_compatibility_active(
+        self,
+        *,
+        current_epoch: int | None = None,
+    ) -> bool:
+        cfg = getattr(self, "_proof_protocol_rollout_cfg", None)
+        if cfg is None:
+            base_config = getattr(self, "config", None)
+            cfg = (
+                proof_protocol_rollout_config_from_neuron_config(base_config)
+                if base_config is not None
+                else ProofProtocolRolloutConfig()
+            )
+        epoch = current_epoch
+        if epoch is None:
+            epoch = getattr(self, "_current_epoch", None)
+        return legacy_v1_compatibility_active(cfg, current_epoch=epoch)
+
+    def _proof_v3_required(self) -> bool:
+        """Return the proof-version requirement independently of maintenance."""
+
+        cfg = getattr(self, "_proof_protocol_rollout_cfg", None)
+        if cfg is None:
+            base_config = getattr(self, "config", None)
+            cfg = (
+                proof_protocol_rollout_config_from_neuron_config(base_config)
+                if base_config is not None
+                else ProofProtocolRolloutConfig()
+            )
+        return proof_v3_required(cfg)
+
+    def _proof_v3_allowed(self) -> bool:
+        """Return whether the epoch-pinned rollout permits proof v3."""
+
+        cfg = getattr(self, "_proof_protocol_rollout_cfg", None)
+        if cfg is None:
+            base_config = getattr(self, "config", None)
+            cfg = (
+                proof_protocol_rollout_config_from_neuron_config(base_config)
+                if base_config is not None
+                else ProofProtocolRolloutConfig()
+            )
+        return proof_protocol_allowed(cfg, 3)
+
     @property
     def _subtensor(self):
         """Lazy Subtensor connection — only connects when actually needed.
@@ -623,6 +1260,349 @@ class ValidatorNeuron:
             bt_log.info("Subtensor connected")
         return self.__subtensor
 
+    def _load_proof_v2_manifests(self) -> None:
+        """Authenticate configured proof-v2 manifests against current chain state."""
+
+        paths = tuple(
+            getattr(self.config, "proof_v2_manifest_paths", ()) or ()
+        )
+        remote_base_urls = tuple(
+            getattr(self.config, "proof_v2_artifact_base_urls", ()) or ()
+        )
+        self._proof_v2_manifests = {}
+        if not paths and not remote_base_urls:
+            bt.logging.warning(
+                "No proof-v2 manifests configured; proof-v2 verification will "
+                "fail closed"
+            )
+            return
+
+        from verallm.proof_v2.runtime import load_verified_proof_v2_manifests
+
+        verified: Dict[str, object] = {}
+        if paths:
+            try:
+                verified.update(
+                    load_verified_proof_v2_manifests(
+                        paths,
+                        chain_config=self.config,
+                        model_registry_client=self._model_client,
+                    )
+                )
+            except Exception as exc:
+                self._proof_v2_manifests = {}
+                bt.logging.error(f"Proof-v2 manifest authentication failed: {exc}")
+                raise
+
+        if remote_base_urls:
+            from verallm.proof_v2.artifact_store import (
+                resolve_remote_proof_v2_manifests,
+            )
+
+            try:
+                remote = resolve_remote_proof_v2_manifests(
+                    remote_base_urls,
+                    chain_config=self.config,
+                    model_registry_client=self._model_client,
+                    cache_directory=getattr(
+                        self.config,
+                        "proof_v2_artifact_cache_dir",
+                        None,
+                    ),
+                )
+            except Exception as exc:
+                bt.logging.error(
+                    f"Remote proof-v2 artifact resolution failed: {exc}"
+                )
+            else:
+                for model_id, item in remote.manifests.items():
+                    existing = verified.get(model_id)
+                    if existing is not None:
+                        if (
+                            existing.manifest.digest()
+                            != item.manifest.digest()
+                        ):
+                            bt.logging.warning(
+                                "Ignoring remote proof-v2 manifest for "
+                                f"{model_id}; a different authenticated local "
+                                "override is configured"
+                            )
+                        continue
+                    verified[model_id] = item
+                if remote.missing_model_ids:
+                    bt.logging.warning(
+                        "No published proof-v2 manifest for registered model(s): "
+                        + ", ".join(remote.missing_model_ids)
+                    )
+                for model_id, failure in remote.failures.items():
+                    bt.logging.error(
+                        f"Proof-v2 artifact failed for {model_id}: {failure}"
+                    )
+                bt.logging.info(
+                    "Loaded remote proof-v2 artifact index from "
+                    f"{remote.index_source_url}"
+                )
+
+        try:
+            exact_specs: Dict[str, object] = {}
+            for model_id in verified:
+                exact_spec = self._model_client.get_on_chain_model_spec(model_id)
+                if exact_spec is None:
+                    raise RuntimeError(
+                        f"proof-v2 manifest model is not registered: {model_id}"
+                    )
+                exact_specs[model_id] = exact_spec
+        except Exception as exc:
+            self._proof_v2_manifests = {}
+            bt.logging.error(f"Proof-v2 manifest authentication failed: {exc}")
+            raise
+
+        if not verified:
+            bt.logging.warning(
+                "No authenticated proof-v2 manifests are available; proof-v2 "
+                "verification will fail closed"
+            )
+            return
+        self._proof_v2_manifests = verified
+        self._on_chain_model_spec_cache.update(exact_specs)
+        bt.logging.info(
+            f"Authenticated {len(verified)} proof-v2 manifest(s)"
+        )
+        if remote_base_urls:
+            self._proof_v2_remote_refresh_after = (
+                time.monotonic() + _PROOF_V2_ARTIFACT_REFRESH_SECONDS
+            )
+
+    def _load_proof_v3_releases(self) -> None:
+        """Authenticate configured weightless v3 releases against ModelRegistry."""
+
+        paths = tuple(
+            getattr(self.config, "proof_v3_release_paths", ()) or ()
+        )
+        remote_base_urls = tuple(
+            getattr(self.config, "proof_v3_artifact_base_urls", ()) or ()
+        )
+        self._proof_v3_releases = {}
+        self._proof_v3_canary_policy = None
+        if not paths and not remote_base_urls:
+            bt.logging.warning(
+                "No proof-v3 releases configured; v3 canaries are unavailable"
+            )
+            return
+        from verallm.proof_v3.economic_release_catalog import (
+            load_qualified_proof_v3_catalog,
+        )
+
+        releases = {}
+        indexed_policy_path = ""
+        if paths:
+            try:
+                releases.update(
+                    load_qualified_proof_v3_catalog(
+                        paths,
+                        model_registry_client=self._model_client,
+                    )
+                )
+            except Exception as exc:
+                bt.logging.error(
+                    f"Proof-v3 release authentication failed: {exc}"
+                )
+                raise
+        if remote_base_urls:
+            from verallm.proof_v3.artifact_store import (
+                resolve_remote_proof_v3_releases,
+            )
+
+            remote = resolve_remote_proof_v3_releases(
+                remote_base_urls,
+                chain_config=self.config,
+                model_registry_client=self._model_client,
+                cache_directory=getattr(
+                    self.config,
+                    "proof_v3_artifact_cache_dir",
+                    None,
+                ),
+            )
+            for model_id, item in remote.releases.items():
+                existing = releases.get(model_id)
+                if existing is not None:
+                    if (
+                        existing.qualified_profile.profile.digest()
+                        != item.release.qualified_profile.profile.digest()
+                    ):
+                        bt.logging.warning(
+                            "Ignoring remote proof-v3 release for "
+                            f"{model_id}; a different authenticated local "
+                            "override is configured"
+                        )
+                    continue
+                releases[model_id] = item.release
+            if remote.missing_model_ids:
+                bt.logging.warning(
+                    "No published proof-v3 release for registered model(s): "
+                    + ", ".join(remote.missing_model_ids)
+                )
+            for model_id, failure in remote.failures.items():
+                bt.logging.error(
+                    f"Proof-v3 artifact failed for {model_id}: {failure}"
+                )
+            bt.logging.info(
+                "Loaded remote proof-v3 artifact index from "
+                f"{remote.index_source_url}"
+            )
+            indexed_policy_path = str(
+                getattr(remote, "canary_policy_path", "") or ""
+            ).strip()
+        self._proof_v3_releases = releases
+        bt.logging.info(
+            f"Authenticated {len(releases)} proof-v3 release(s)"
+        )
+        if self._proof_v3_required() and not releases:
+            raise RuntimeError(
+                "proof-v3 required mode needs at least one authenticated "
+                "model release"
+            )
+        policy_path = str(
+            getattr(self.config, "proof_v3_canary_policy_path", "") or ""
+        ).strip()
+        if not policy_path:
+            policy_path = indexed_policy_path
+        self._proof_v3_canary_policy = None
+        if not policy_path:
+            if self._proof_v3_required():
+                raise RuntimeError(
+                    "proof-v3 required mode needs an authority-signed canary policy"
+                )
+            bt.logging.warning(
+                "No signed proof-v3 canary policy configured; validators will "
+                "use bounded v1 compatibility instead of v3 hard canaries"
+            )
+            return
+        from verallm.proof_v3.canary_policy import (
+            load_signed_canary_policy_document_v3,
+            qualify_canary_policy_v3,
+        )
+
+        authority = self._model_client.get_manifest_authority()
+        document = load_signed_canary_policy_document_v3(policy_path)
+        self._proof_v3_canary_policy = qualify_canary_policy_v3(
+            document,
+            qualified_releases=releases,
+            expected_authority_signers=tuple(authority.signers),
+            authority_threshold=int(authority.threshold),
+        )
+        bt.logging.info(
+            "Authenticated proof-v3 canary policy "
+            f"{self._proof_v3_canary_policy.policy_abi_id}"
+        )
+
+    def _refresh_remote_proof_v2_manifests(
+        self,
+        model_ids: Set[str] | None = None,
+    ) -> None:
+        """Periodically add newly published authenticated model manifests."""
+
+        remote_base_urls = tuple(
+            getattr(self.config, "proof_v2_artifact_base_urls", ()) or ()
+        )
+        if not remote_base_urls:
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_proof_v2_remote_refresh_after", 0.0):
+            return
+        self._proof_v2_remote_refresh_after = (
+            now + _PROOF_V2_ARTIFACT_REFRESH_SECONDS
+        )
+        requested = (
+            set(model_ids)
+            if model_ids is not None
+            else set(self._model_client.get_model_list())
+        )
+        missing = requested.difference(
+            getattr(self, "_proof_v2_manifests", {})
+        )
+        if not missing:
+            return
+
+        from verallm.proof_v2.artifact_store import (
+            resolve_remote_proof_v2_manifests,
+        )
+
+        try:
+            remote = resolve_remote_proof_v2_manifests(
+                remote_base_urls,
+                chain_config=self.config,
+                model_registry_client=self._model_client,
+                cache_directory=getattr(
+                    self.config,
+                    "proof_v2_artifact_cache_dir",
+                    None,
+                ),
+                model_ids=missing,
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Proof-v2 artifact refresh failed; retaining verified cache: {exc}"
+            )
+            return
+
+        updated = dict(getattr(self, "_proof_v2_manifests", {}))
+        added = 0
+        for model_id, item in remote.manifests.items():
+            previous = updated.get(model_id)
+            if (
+                previous is None
+                or previous.manifest.digest() != item.manifest.digest()
+            ):
+                added += 1
+            updated[model_id] = item
+            exact_spec = self._model_client.get_on_chain_model_spec(model_id)
+            if exact_spec is not None:
+                self._on_chain_model_spec_cache[model_id] = exact_spec
+        self._proof_v2_manifests = updated
+        if added:
+            bt.logging.info(
+                f"Refreshed {added} proof-v2 manifest(s) from "
+                f"{remote.index_source_url}"
+            )
+        for model_id, failure in remote.failures.items():
+            bt.logging.warning(
+                f"Proof-v2 artifact refresh failed for {model_id}: {failure}"
+            )
+
+    def _attach_verified_proof_v2_manifest(
+        self,
+        client: ValidatorClient,
+        model_id: str,
+    ) -> bool:
+        """Attach one startup-authenticated manifest after exact spec binding."""
+
+        exact_spec = getattr(self, "_on_chain_model_spec_cache", {}).get(model_id)
+        if exact_spec is None:
+            # Leaving the client unconfigured makes a v2 payload fail in the
+            # canonical verifier while legacy v1 remains independently usable.
+            client.proof_v2_manifest = None
+            return False
+
+        client._on_chain_model_spec = exact_spec
+        verified = getattr(self, "_proof_v2_manifests", {}).get(model_id)
+        if verified is None:
+            client.proof_v2_manifest = None
+            return False
+        try:
+            client.set_verified_proof_v2_manifest(verified.manifest)
+        except Exception as exc:
+            # A registry update can invalidate a manifest after startup. Keep
+            # v2 fail-closed instead of converting this into a skipped check.
+            client.proof_v2_manifest = None
+            getattr(self, "_proof_v2_manifests", {}).pop(model_id, None)
+            self._proof_v2_remote_refresh_after = 0.0
+            bt.logging.warning(
+                f"Proof-v2 manifest no longer matches {model_id}: {exc}"
+            )
+            return False
+        return True
+
     def setup(self):
         """Initialize chain clients and Bittensor wallet."""
         try:
@@ -643,7 +1623,17 @@ class ValidatorNeuron:
 
         bt.logging.info("Creating chain clients...")
         self._model_client, self._miner_client, self._payment_client = create_clients(self.config)
+        self._load_proof_v2_manifests()
         runtime_config_loaded = self._refresh_subnet_runtime_config(force=True)
+        if select_proof_protocol_version(
+            self._proof_protocol_rollout_cfg,
+            peer_advertised=(1, 3),
+        ) is None:
+            raise RuntimeError(
+                "subnet allows no inference proof protocol supported by this "
+                "validator binary"
+            )
+        self._load_proof_v3_releases()
 
         # SubnetConfig client for TEE measurement verification, blacklists, scoring params
         _sn_config_addr = getattr(self.config, "subnet_config_address", "")
@@ -696,6 +1686,7 @@ class ValidatorNeuron:
 
         # SS58 hotkey address for Sr25519 request signing (miner auth)
         self._validator_hotkey_ss58 = wallet.hotkey.ss58_address
+        self._enforce_proof_v3_verdict_owner_guard()
 
         # Cached at the top of every _close_epoch (one eth_call/epoch, ~72 min).
         # Used by verify_service_receipt's total-stake gate.  Broader than
@@ -1782,7 +2773,13 @@ class ValidatorNeuron:
                 "slot_id": sid,
                 "lease_id": lease_id(slot, epoch_number),
                 "claimed_gpu_class": gpu_row.match_gpu_name,
+                "gpu_index": 0,
                 "pass_count": capacity_gpu_pass_count(gpu_row),
+                "workload_spec": (
+                    capacity_gpu_workload_spec(gpu_row)
+                    if hasattr(gpu_row, "workload_version")
+                    else {}
+                ),
                 "deadline_s": gpu_row.deadline_s or cfg.deadline_s,
                 "transport_grace_s": cfg.transport_grace_s,
                 "payload_deadline_s": cfg.payload_deadline_s,
@@ -1963,8 +2960,10 @@ class ValidatorNeuron:
             windows = self._db.get_capacity_audit_windows_for_finalization(finalized_block)
         except Exception as exc:
             bt.logging.debug(f"Capacity audit finalization lookup failed: {exc}")
+            self._apply_finalized_capacity_audit_probations()
             return
         if not windows:
+            self._apply_finalized_capacity_audit_probations()
             return
 
         confirmed = 0
@@ -2023,6 +3022,7 @@ class ValidatorNeuron:
                 f"Capacity audit finalized confirmation: confirmed_updates={confirmed} "
                 f"reorged={reorged} finalized_block={finalized_block}"
             )
+        self._apply_finalized_capacity_audit_probations()
 
     def _recover_capacity_audit_hashes_for_artifact(self, row: dict, artifact: dict) -> dict:
         """Best-effort B_start/B_proof hash recovery for late audit artifacts."""
@@ -2091,8 +3091,22 @@ class ValidatorNeuron:
     ) -> None:
         if not self._capacity_audit_cfg.enabled:
             return
+        probation_policy = getattr(
+            self,
+            "_capacity_audit_failure_requires_probation",
+            None,
+        )
+        if not callable(probation_policy):
+            probation_policy = (
+                ValidatorNeuron._capacity_audit_failure_requires_probation.__get__(
+                    self
+                )
+            )
         expired = self._db.expire_capacity_audit_misses(
             require_proof_payload=self._capacity_audit_cfg.require_proof_payload,
+            probation_required=probation_policy(
+                proof_policy_required=False,
+            ),
             return_slots=True,
         )
         expired_slots = expired if isinstance(expired, list) else []
@@ -2101,15 +3115,7 @@ class ValidatorNeuron:
             bt.logging.info(f"Capacity audit: expired {expired_count} pending slots")
             for slot in expired_slots:
                 verdict = str(slot.get("verdict") or "")
-                if verdict == "hard_proof_miss":
-                    self._on_capacity_audit_failure(
-                        str(slot.get("miner_address") or ""),
-                        int(slot.get("model_index") or 0),
-                        endpoint=str(slot.get("endpoint") or ""),
-                        verdict=verdict,
-                        failure_reason=str(slot.get("failure_reason") or ""),
-                    )
-                else:
+                if verdict != "hard_proof_miss":
                     bt.logging.info(
                         f"Capacity audit timing miss recorded pending receipt reconciliation: "
                         f"{str(slot.get('miner_address') or '')[:10]} "
@@ -2117,6 +3123,7 @@ class ValidatorNeuron:
                         f"verdict={verdict or 'unknown'}"
                     )
             self._write_shared_state()
+            self._apply_finalized_capacity_audit_probations()
         self._start_capacity_audit_windows(
             audit_block=block_number,
             audit_block_hash=block_hash,
@@ -2244,6 +3251,11 @@ class ValidatorNeuron:
             row = self._db.get_capacity_audit_slot(audit_id, address, model_index)
         if row is None:
             return {}, "unknown audit slot"
+        if str(row.get("chain_status") or "") == "reorged":
+            # A reorg is terminal evidence for this window.  In particular, a
+            # queued proof worker must never turn it back into a pass/failure
+            # after the finality monitor has invalidated its chain anchors.
+            return {}, "capacity audit window was reorged"
         if str(artifact.get("slot_id") or "") != str(row["slot_id"]):
             return {}, "slot_id mismatch"
         if int(artifact.get("B_select", row["selection_block"])) != int(row["selection_block"]):
@@ -2262,6 +3274,16 @@ class ValidatorNeuron:
         claimed = str(artifact.get("claimed_gpu_class") or row["claimed_gpu_class"] or "")
         if claimed and str(row["claimed_gpu_class"]) and claimed != str(row["claimed_gpu_class"]):
             return {}, "claimed_gpu_class mismatch"
+        expected_gpu_index = int(row.get("gpu_index") or 0)
+        # This value is part of the validator-scheduled challenge domain.  It
+        # must be signed into every pass0/final/proof artifact, not defaulted
+        # when absent, otherwise artifact ABI variants can silently omit a
+        # binding that changes the proof seeds.
+        if "gpu_index" not in artifact:
+            return {}, "missing gpu_index"
+        artifact_gpu_index = artifact["gpu_index"]
+        if type(artifact_gpu_index) is not int or artifact_gpu_index != expected_gpu_index:
+            return {}, "gpu_index mismatch"
         row = self._recover_capacity_audit_hashes_for_artifact(row, artifact)
         return row, None
 
@@ -2311,8 +3333,78 @@ class ValidatorNeuron:
                 return 400, {"ok": False, "error": "missing final_root"}
             if not transcript:
                 return 400, {"ok": False, "error": "missing final_transcript_commit"}
+
+            if row.get("final_received_at") is not None:
+                try:
+                    stored_final = json.loads(str(row.get("final_artifact") or "{}"))
+                except Exception:
+                    stored_final = {}
+                if stored_final != artifact:
+                    return 409, {
+                        "ok": False,
+                        "error": "final receipt already committed",
+                    }
+                return 200, {
+                    "ok": True,
+                    "verdict": str(row.get("verdict") or "pending"),
+                    "timing_status": str(row.get("timing_status") or "pending"),
+                }
+
+            final_protocol_version = combined_proof_protocol_version(
+                artifact.get("combined")
+            )
+            final_observed_block: Optional[int] = None
+            if final_protocol_version == CURRENT_COMBINED_PROOF_PROTOCOL_VERSION:
+                proof_challenge_block = int(row.get("proof_challenge_block") or 0)
+                if proof_challenge_block <= 0:
+                    return 409, {
+                        "ok": False,
+                        "error": "proof challenge block required",
+                    }
+                if str(row.get("proof_challenge_block_hash") or ""):
+                    final_observed_block, live_head_ok = (
+                        proof_challenge_block,
+                        True,
+                    )
+                else:
+                    final_observed_block, live_head_ok = (
+                        self._observe_live_capacity_audit_head()
+                    )
+                if not live_head_ok or final_observed_block <= 0:
+                    return 503, {
+                        "ok": False,
+                        "error": "live chain head unavailable",
+                    }
+                if final_observed_block >= proof_challenge_block:
+                    stored, recorded = self._db.record_capacity_audit_final(
+                        audit_id=audit_id,
+                        address=address,
+                        model_index=model_index,
+                        final_root=final_root,
+                        transcript_root=transcript,
+                        artifact=artifact,
+                        timing_status="invalid_chronology",
+                        verdict="hard_proof_miss",
+                        failure_reason="v2_final_commitment_not_pre_challenge",
+                        probation_required=self._capacity_audit_failure_requires_probation(
+                            proof_policy_required=True,
+                        ),
+                        final_observed_block=final_observed_block,
+                        received_at=ts,
+                    )
+                    if recorded:
+                        self._write_shared_state()
+                        self._apply_finalized_capacity_audit_probations()
+                    return 200, {
+                        "ok": True,
+                        "verdict": str(
+                            (stored or {}).get("verdict") or "hard_proof_miss"
+                        ),
+                        "timing_status": "invalid_chronology",
+                    }
+
             if row.get("pass0_root") and pass0_root and pass0_root != row.get("pass0_root"):
-                self._db.record_capacity_audit_final(
+                stored, recorded = self._db.record_capacity_audit_final(
                     audit_id=audit_id,
                     address=address,
                     model_index=model_index,
@@ -2322,16 +3414,17 @@ class ValidatorNeuron:
                     timing_status="invalid_transcript",
                     verdict="hard_proof_miss",
                     failure_reason="pass0_root_mismatch",
+                    probation_required=self._capacity_audit_failure_requires_probation(
+                        proof_policy_required=False,
+                    ),
+                    final_observed_block=final_observed_block,
                     received_at=ts,
                 )
-                self._on_capacity_audit_failure(
-                    address,
-                    model_index,
-                    endpoint=str(row.get("endpoint") or ""),
-                    verdict="hard_proof_miss",
-                    failure_reason="pass0_root_mismatch",
+                self._apply_finalized_capacity_audit_probations()
+                stored_verdict = str(
+                    (stored or {}).get("verdict") or "hard_proof_miss"
                 )
-                return 200, {"ok": True, "verdict": "hard_proof_miss"}
+                return 200, {"ok": True, "verdict": stored_verdict}
 
             start_at = row.get("audit_start_observed_at")
             if start_at is None:
@@ -2352,7 +3445,7 @@ class ValidatorNeuron:
                     timing_status = "miss"
                     verdict = "timing_miss"
                     failure_reason = "deadline_exceeded"
-            self._db.record_capacity_audit_final(
+            stored, recorded = self._db.record_capacity_audit_final(
                 audit_id=audit_id,
                 address=address,
                 model_index=model_index,
@@ -2362,14 +3455,42 @@ class ValidatorNeuron:
                 timing_status=timing_status,
                 verdict=verdict,
                 failure_reason=failure_reason,
+                final_observed_block=final_observed_block,
                 received_at=ts,
             )
-            if verdict == "timing_miss":
+            if stored is None:
+                return 404, {"ok": False, "error": "capacity audit slot not found"}
+            if not recorded:
+                try:
+                    stored_final = json.loads(
+                        str(stored.get("final_artifact") or "{}")
+                    )
+                except Exception:
+                    stored_final = {}
+                if stored_final != artifact:
+                    return 409, {
+                        "ok": False,
+                        "error": "final receipt already committed",
+                    }
+                return 200, {
+                    "ok": True,
+                    "verdict": str(stored.get("verdict") or "pending"),
+                    "timing_status": str(
+                        stored.get("timing_status") or "pending"
+                    ),
+                }
+            verdict = str(stored.get("verdict") or verdict)
+            timing_status = str(stored.get("timing_status") or timing_status)
+            if recorded and verdict == "timing_miss":
                 bt.logging.info(
                     f"Capacity audit timing miss recorded pending receipt reconciliation: "
                     f"{address[:10]} model_index={model_index} audit_id={audit_id[:12]}"
                 )
-            if verdict == "timing_pass" and not self._capacity_audit_cfg.require_proof_payload:
+            if (
+                recorded
+                and verdict == "timing_pass"
+                and not self._capacity_audit_cfg.require_proof_payload
+            ):
                 self._db.release_capacity_audit_drain(
                     audit_id=audit_id,
                     address=address,
@@ -2392,6 +3513,8 @@ class ValidatorNeuron:
             def _record_hard_payload_miss(
                 reason: str,
                 proof_verify_ms: Optional[float] = None,
+                *,
+                proof_policy_required: bool = False,
             ) -> tuple[int, dict]:
                 self._db.record_capacity_audit_proof_verdict(
                     audit_id=audit_id,
@@ -2401,28 +3524,75 @@ class ValidatorNeuron:
                     verdict="hard_proof_miss",
                     failure_reason=reason,
                     proof_verify_ms=proof_verify_ms,
+                    probation_required=self._capacity_audit_failure_requires_probation(
+                        proof_policy_required=proof_policy_required,
+                    ),
                     received_at=ts,
                 )
-                self._on_capacity_audit_failure(
-                    address,
-                    model_index,
-                    endpoint=str(row.get("endpoint") or ""),
-                    verdict="hard_proof_miss",
-                    failure_reason=reason,
-                )
                 self._write_shared_state()
+                self._apply_finalized_capacity_audit_probations()
                 body = {"ok": True, "verdict": "hard_proof_miss", "proof_status": "invalid_payload"}
                 if proof_verify_ms is not None:
                     body["proof_verify_ms"] = proof_verify_ms
                 return 200, body
 
             proof = artifact.get("sampled_pass_proof")
-            if isinstance(proof, dict) and str(proof.get("format") or "") == COMBINED_PROOF_FORMAT:
+            if is_combined_proof_payload(proof):
+                combined_protocol_version = combined_proof_protocol_version(proof)
+                if combined_protocol_version is None:
+                    return _record_hard_payload_miss(
+                        "unsupported_or_ambiguous_capacity_proof_protocol",
+                        proof_policy_required=True,
+                    )
+                if (
+                    combined_protocol_version
+                    == CURRENT_COMBINED_PROOF_PROTOCOL_VERSION
+                ):
+                    try:
+                        final_artifact = json.loads(
+                            str(row.get("final_artifact") or "{}")
+                        )
+                    except Exception:
+                        final_artifact = {}
+                    final_protocol_version = combined_proof_protocol_version(
+                        final_artifact.get("combined")
+                        if isinstance(final_artifact, dict)
+                        else None
+                    )
+                    if (
+                        final_protocol_version
+                        != CURRENT_COMBINED_PROOF_PROTOCOL_VERSION
+                    ):
+                        return _record_hard_payload_miss(
+                            "missing_v2_pre_challenge_final_commitment",
+                            proof_policy_required=True,
+                        )
+                    proof_challenge_block = int(
+                        row.get("proof_challenge_block") or 0
+                    )
+                    final_observed_block = row.get("final_observed_block")
+                    if (
+                        proof_challenge_block <= 0
+                        or type(final_observed_block) is not int
+                        or final_observed_block <= 0
+                        or final_observed_block >= proof_challenge_block
+                    ):
+                        return _record_hard_payload_miss(
+                            "v2_final_commitment_not_pre_challenge",
+                            proof_policy_required=True,
+                        )
+                legacy_compatibility = self._legacy_v1_compatibility_active()
+                if (
+                    combined_protocol_version
+                    == LEGACY_COMBINED_PROOF_PROTOCOL_VERSION
+                    and not legacy_compatibility
+                ):
+                    return _record_hard_payload_miss(
+                        "legacy_capacity_proof_protocol_not_accepted",
+                        proof_policy_required=True,
+                    )
                 proof_verify_ms: Optional[float] = None
-                try:
-                    gpu_index = int(artifact.get("gpu_index") or 0)
-                except Exception:
-                    gpu_index = 0
+                gpu_index = int(row.get("gpu_index") or 0)
                 proof_challenge_block_hash = str(row.get("proof_challenge_block_hash") or "")
                 if not proof_challenge_block_hash:
                     proof_challenge_block = int(row.get("proof_challenge_block") or 0)
@@ -2458,6 +3628,9 @@ class ValidatorNeuron:
                     final_artifact = {}
                 verify_start = time.perf_counter()
                 try:
+                    expected_workload_spec = (
+                        self._capacity_audit_expected_workload_spec(row)
+                    )
                     ok, reason = verify_combined_proof_payload(
                         proof=proof,
                         final_artifact=final_artifact,
@@ -2466,6 +3639,7 @@ class ValidatorNeuron:
                         gpu_index=gpu_index,
                         proof_seed_hex=proof_seed,
                         proof_challenge_seed_hex=proof_challenge_seed,
+                        expected_workload_spec=expected_workload_spec,
                     )
                 except Exception as exc:
                     proof_verify_ms = (time.perf_counter() - verify_start) * 1000.0
@@ -2501,7 +3675,27 @@ class ValidatorNeuron:
                     }
                 proof_verify_ms = (time.perf_counter() - verify_start) * 1000.0
                 if not ok:
-                    return _record_hard_payload_miss(reason, proof_verify_ms)
+                    policy = evaluate_proof_policy(
+                        protocol_version=combined_protocol_version,
+                        verification_passed=False,
+                        legacy_v1_compatibility_active=legacy_compatibility,
+                    )
+                    return _record_hard_payload_miss(
+                        reason,
+                        proof_verify_ms,
+                        proof_policy_required=policy.probation_required,
+                    )
+                policy = evaluate_proof_policy(
+                    protocol_version=combined_protocol_version,
+                    verification_passed=True,
+                    legacy_v1_compatibility_active=legacy_compatibility,
+                )
+                if not policy.accepted:
+                    return _record_hard_payload_miss(
+                        policy.reason,
+                        proof_verify_ms,
+                        proof_policy_required=policy.probation_required,
+                    )
                 self._mark_capacity_audit_verifier_healthy()
 
                 proof_path = os.path.join(
@@ -2511,7 +3705,11 @@ class ValidatorNeuron:
                 with open(proof_path, "w") as f:
                     json.dump(artifact, f, sort_keys=True)
                 current_verdict = str(row.get("verdict") or "pending")
-                proof_status = "combined_proof_verified"
+                proof_status = (
+                    "legacy_combined_proof_compatibility_accepted"
+                    if policy.legacy_compatibility_accepted
+                    else "combined_proof_verified"
+                )
                 self._db.record_capacity_audit_proof_verdict(
                     audit_id=audit_id,
                     address=address,
@@ -2537,7 +3735,10 @@ class ValidatorNeuron:
                     "proof_verify_ms": proof_verify_ms,
                 }
 
-            return _record_hard_payload_miss("unsupported_proof_payload_format")
+            return _record_hard_payload_miss(
+                "unsupported_proof_payload_format",
+                proof_policy_required=True,
+            )
 
         return 400, {"ok": False, "error": "unknown artifact_type"}
 
@@ -2638,11 +3839,21 @@ class ValidatorNeuron:
         received_at: Optional[float] = None,
     ) -> tuple[int, dict]:
         ts = time.time() if received_at is None else float(received_at)
-        status, body, _row = self._prepare_capacity_audit_proof_enqueue(
+        status, body, row = self._prepare_capacity_audit_proof_enqueue(
             artifact,
             received_at=ts,
         )
         if status >= 300:
+            return status, body
+        if self._proof_v3_follower_mode_active():
+            assert row is not None
+            self._db.release_capacity_audit_drain(
+                audit_id=str(row["audit_id"]),
+                address=str(row["miner_address"]),
+                model_index=int(row["model_index"]),
+                released_at=ts,
+            )
+            self._write_shared_state()
             return status, body
         self._capacity_audit_proof_executor.submit(
             self._run_capacity_audit_proof_verification,
@@ -2656,7 +3867,7 @@ class ValidatorNeuron:
         from fastapi.responses import JSONResponse
         app = FastAPI(title="Verathos Capacity Audit Ingest")
 
-        async def _read_payload(request: Request) -> tuple[int, dict]:
+        async def _read_payload(request: Request) -> tuple[int, dict, float]:
             max_bytes = int(
                 getattr(
                     self._capacity_audit_cfg,
@@ -2666,18 +3877,19 @@ class ValidatorNeuron:
                 or 32 * 1024 * 1024
             )
             body = await request.body()
+            received_at = time.time()
             if len(body) > max_bytes:
                 return 413, {
                     "error": "payload_too_large",
                     "max_bytes": max_bytes,
-                }
+                }, received_at
             try:
                 payload = json.loads(body.decode("utf-8"))
             except Exception:
-                return 400, {"error": "invalid_json"}
+                return 400, {"error": "invalid_json"}, received_at
             if not isinstance(payload, dict):
-                return 400, {"error": "payload_must_be_object"}
-            return 200, payload
+                return 400, {"error": "payload_must_be_object"}, received_at
+            return 200, payload, received_at
 
         @app.get("/capacity/audit/v1/health")
         async def _health():
@@ -2688,18 +3900,62 @@ class ValidatorNeuron:
                 "protocol_version": PROTOCOL_VERSION,
             }
 
+        @app.get("/v1/verdicts/current")
+        async def _verdict_snapshot(epoch: int | None = None):
+            """Serve owner-signed bytes directly from the owner validator."""
+
+            if not _proof_v3_hard_auditor_active(
+                self.config,
+                getattr(self, "_validator_hotkey_ss58", ""),
+            ):
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "verdict snapshot unavailable"},
+                    headers={"Cache-Control": "no-store", "Retry-After": "15"},
+                )
+            snapshot = (
+                (getattr(self, "_verdict_snapshot_history", {}) or {}).get(
+                    int(epoch),
+                    "",
+                )
+                if epoch is not None
+                else str(getattr(self, "_verdict_snapshot_hex", "") or "")
+            )
+            if not snapshot:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "verdict snapshot unavailable",
+                        **({"epoch": int(epoch)} if epoch is not None else {}),
+                    },
+                    headers={"Cache-Control": "no-store", "Retry-After": "15"},
+                )
+            return JSONResponse(
+                content={"snapshot": snapshot},
+                headers={"Cache-Control": "public, max-age=15"},
+            )
+
         async def _receipt(request):
-            read_status, payload = await _read_payload(request)
+            read_status, payload, received_at = await _read_payload(request)
             if read_status != 200:
                 return JSONResponse(status_code=read_status, content=payload)
-            status, body = self.ingest_capacity_audit_artifact(payload)
+            loop = asyncio.get_running_loop()
+            status, body = await loop.run_in_executor(
+                self._capacity_audit_receipt_executor,
+                self._ingest_capacity_audit_receipt,
+                payload,
+                received_at,
+            )
             return JSONResponse(status_code=status, content=body)
 
         async def _proof(request):
-            read_status, payload = await _read_payload(request)
+            read_status, payload, received_at = await _read_payload(request)
             if read_status != 200:
                 return JSONResponse(status_code=read_status, content=payload)
-            status, body = self.submit_capacity_audit_proof_artifact(payload)
+            status, body = self.submit_capacity_audit_proof_artifact(
+                payload,
+                received_at=received_at,
+            )
             return JSONResponse(status_code=status, content=body)
 
         _receipt.__annotations__["request"] = Request
@@ -2708,6 +3964,28 @@ class ValidatorNeuron:
         app.post("/capacity/audit/v1/proof")(_proof)
 
         return app
+
+    def _ingest_capacity_audit_receipt(
+        self,
+        artifact: dict,
+        received_at: float,
+    ) -> tuple[int, dict]:
+        processing_started_at = time.time()
+        try:
+            return self.ingest_capacity_audit_artifact(
+                artifact,
+                received_at=received_at,
+            )
+        finally:
+            queue_delay_s = max(0.0, processing_started_at - received_at)
+            processing_s = max(0.0, time.time() - processing_started_at)
+            if queue_delay_s >= 0.5 or processing_s >= 0.5:
+                bt.logging.warning(
+                    "Capacity audit receipt ingest delay: "
+                    f"queue_s={queue_delay_s:.3f} processing_s={processing_s:.3f} "
+                    f"type={artifact.get('artifact_type') or artifact.get('type') or ''} "
+                    f"audit_id={str(artifact.get('audit_id') or '')[:12]}"
+                )
 
     def _start_capacity_audit_ingest_server(self) -> None:
         if not self._capacity_audit_cfg.enabled:
@@ -2771,6 +4049,31 @@ class ValidatorNeuron:
                     "hosted subnet config is unavailable or invalid"
                 )
         return False
+
+    def _capacity_audit_expected_workload_spec(self, row: Mapping[str, Any]) -> dict:
+        """Return the validator-scheduled immutable workload for proof checks."""
+
+        stored = row.get("workload_spec")
+        if isinstance(stored, str) and stored:
+            decoded = json.loads(stored)
+        elif isinstance(stored, dict):
+            decoded = stored
+        else:
+            decoded = {}
+        if isinstance(decoded, dict) and decoded.get("workload_version"):
+            return decoded
+
+        # Compatibility for audit rows scheduled immediately before this DB
+        # column existed.  The calibrated row is validator-owned runtime data,
+        # never a parameter supplied by the proof payload.
+        gpu_row = match_gpu_class(
+            str(row.get("claimed_gpu_class") or ""),
+            int(row.get("vram_gb") or 0),
+            self._capacity_audit_cfg,
+        )
+        if gpu_row is None:
+            raise RuntimeError("scheduled capacity workload is unavailable")
+        return capacity_gpu_workload_spec(gpu_row)
 
     def _capacity_audit_on_chain_model_ids(self, epoch_number: int) -> Optional[List[str]]:
         cache_epoch = getattr(self, "_capacity_audit_model_gate_cache_epoch", None)
@@ -2836,6 +4139,11 @@ class ValidatorNeuron:
             return ""
         if not self._capacity_audit_enforcement_enabled(epoch_number):
             return ""
+        if self._proof_v3_follower_mode_active():
+            return self._follower_capacity_gate_reason(
+                address,
+                model_index,
+            )
         if getattr(self, "_capacity_audit_verifier_unhealthy", False):
             reason = str(getattr(self, "_capacity_audit_verifier_last_error", "") or "")
             suffix = f": {reason[:160]}" if reason else ""
@@ -2882,6 +4190,11 @@ class ValidatorNeuron:
         if uid is None or not cfg.enabled or cfg.mode != "score_gate":
             return ""
         if not self._capacity_audit_enforcement_enabled(epoch_number):
+            return ""
+        if self._proof_v3_follower_mode_active():
+            # The signed per-entry capacity_gated bit already includes the
+            # owner's endpoint and UID-quorum decision. Applying it in the
+            # endpoint seam avoids recomputing owner evidence locally.
             return ""
         if getattr(self, "_capacity_audit_verifier_unhealthy", False):
             return ""
@@ -3193,28 +4506,98 @@ class ValidatorNeuron:
             self._write_shared_state()
         return updated
 
-    def _on_capacity_audit_failure(
+    def _capacity_audit_failure_requires_probation(
         self,
-        miner_address: str,
-        model_index: int,
         *,
-        endpoint: str = "",
-        verdict: str = "",
-        failure_reason: str = "",
-    ) -> None:
+        proof_policy_required: bool = False,
+    ) -> bool:
+        """Freeze probation policy when capacity failure evidence is observed."""
+
+        follower_mode = getattr(
+            self,
+            "_proof_v3_follower_mode_active",
+            None,
+        )
+        if callable(follower_mode) and follower_mode():
+            return False
         cfg = self._capacity_audit_cfg
         if not cfg.enabled or cfg.mode not in ("score_gate", "enforce"):
-            return
-        if not self._capacity_audit_enforcement_enabled():
-            return
-        if not miner_address:
-            return
-        bt.logging.info(
-            f"Capacity audit failure -> probation: {miner_address[:10]} "
-            f"model_index={model_index} verdict={verdict or 'unknown'} "
-            f"reason={failure_reason or 'unknown'}"
+            return False
+        if self._maintenance_grace_active(
+            action="suppress_capacity_score_gate"
+        ) or self._maintenance_grace_active(action="suppress_probation"):
+            return False
+        if proof_policy_required:
+            return True
+        enforcement_enabled = getattr(
+            self,
+            "_capacity_audit_enforcement_enabled",
+            None,
         )
-        self._on_proof_failure(miner_address, int(model_index), endpoint=endpoint)
+        if not callable(enforcement_enabled):
+            enforcement_enabled = (
+                ValidatorNeuron._capacity_audit_enforcement_enabled.__get__(self)
+            )
+        if not enforcement_enabled():
+            return False
+        return True
+
+    def _apply_finalized_capacity_audit_probations(self) -> int:
+        """Apply each chain-finalized capacity proof penalty exactly once."""
+
+        follower_mode = getattr(
+            self,
+            "_proof_v3_follower_mode_active",
+            None,
+        )
+        if callable(follower_mode) and follower_mode():
+            return 0
+        if self._maintenance_grace_active(
+            action="suppress_capacity_score_gate"
+        ) or self._maintenance_grace_active(action="suppress_probation"):
+            return 0
+
+        try:
+            candidates = self._db.get_finalized_capacity_audit_probation_candidates()
+        except Exception as exc:
+            bt.logging.debug(
+                f"Capacity audit probation candidate lookup failed: {exc}"
+            )
+            return 0
+        applied = 0
+        for candidate in candidates:
+            audit_id = str(candidate.get("audit_id") or "")
+            address = str(candidate.get("miner_address") or "").lower()
+            model_index = int(candidate.get("model_index") or 0)
+            if not audit_id or not address:
+                continue
+            result = self._db.apply_finalized_capacity_audit_probation_once(
+                audit_id=audit_id,
+                address=address,
+                model_index=model_index,
+                epoch=int(self._current_epoch),
+            )
+            if result is None:
+                continue
+            applied += 1
+            if result.get("miner_exists"):
+                key = self._miner_model_key(address, model_index)
+                endpoint = str(result.get("endpoint") or "")
+                self._probation_tracker.enter_probation(
+                    key,
+                    self._current_epoch,
+                    endpoint=endpoint,
+                )
+                self.scorer.halve_ema(address, model_index)
+            bt.logging.info(
+                f"Finalized capacity proof failure -> probation: "
+                f"audit_id={audit_id[:12]} miner={address[:10]} "
+                f"model_index={model_index} "
+                f"reason={str(result.get('failure_reason') or 'unknown')}"
+            )
+        if applied:
+            self._write_shared_state()
+        return applied
 
     def on_finalized_block(
         self,
@@ -3237,6 +4620,11 @@ class ValidatorNeuron:
         epoch_blocks = self.config.epoch_blocks
         blocks_into_epoch = block_number % epoch_blocks
         blocks_until_next = epoch_blocks - blocks_into_epoch
+        if block_number % self.config.set_weights_epoch_blocks == 0:
+            # Weight setting must use the score from the epoch being closed.
+            # When close is delayed for grace/in-flight work, retain the due
+            # update and submit it immediately after that close succeeds.
+            self._weight_update_due = True
         sched_count = len(self._canary_scheduler.tests) if self._canary_scheduler else 0
         bt.logging.info(
             f"Block {block_number} | epoch {blocks_into_epoch}/{epoch_blocks} "
@@ -3270,19 +4658,29 @@ class ValidatorNeuron:
             block_hash,
             block_hash_real=block_hash_real,
         )
+        self._maybe_schedule_shared_hard_prefetch(
+            block_number=block_number,
+            blocks_into_epoch=blocks_into_epoch,
+        )
 
         # 1. Epoch boundary → start new epoch
         if block_number % epoch_blocks == 0:
-            # If there's a pending epoch close, close it first
-            if self._pending_epoch_close is not None:
-                self._try_close_epoch(self._pending_epoch_close)
-
-            self._start_new_epoch(block_number)
+            if self._pending_epoch_close is None:
+                self._start_new_epoch(block_number)
+            else:
+                bt.logging.info(
+                    f"Epoch {self._pending_epoch_close} reached its boundary; "
+                    "closing before the next epoch starts"
+                )
+                self._seal_canary_epoch_for_close(
+                    self._pending_epoch_close
+                )
 
         # 1b. Retry failed epoch start — skip while background setup is in flight.
         elif (
             blocks_into_epoch <= 30  # only retry in first ~6 min
             and self._pending_epoch_close is not None
+            and self._current_epoch == block_number // epoch_blocks
             and not getattr(self, "_epoch_setup_in_progress", False)
             and (
                 self._canary_scheduler is None
@@ -3309,90 +4707,15 @@ class ValidatorNeuron:
                     )
                 self._dispatch_canary_tests(pending)
 
-        # 3. Epoch close: grace blocks after epoch boundary
+        # 3. Epoch close: canaries have already reserved their complete
+        # inference/proof/verification budget and never consume close grace.
         if (self._pending_epoch_close is not None
                 and block_number >= self._epoch_close_block):
-            self._try_close_epoch(self._pending_epoch_close)
-
-        # 4. Weight-setting boundary
-        if block_number % self.config.set_weights_epoch_blocks == 0:
-            model_budgets = getattr(self, "_last_model_emission_budgets", {})
-            model_bucket_mode = bool(model_budgets)
-            model_unallocated = 0.0
-            if model_bucket_mode:
-                weights, model_unallocated = self.scorer.get_model_bucket_weights(
-                    model_budgets,
-                    model_groups=getattr(self, "_last_model_emission_groups", {}),
-                    group_budgets=getattr(self, "_last_model_group_budgets", {}),
-                )
-            else:
-                weights = self.scorer.get_weights()
-
-            if weights or (model_bucket_mode and model_unallocated > 0):
-                emission_burn = max(0.0, min(1.0, self._scoring.emission_burn))
-                if model_bucket_mode:
-                    # In bucket mode, blacklisted and unserved model shares are
-                    # burned. Renormalizing them would leak that budget back to
-                    # already-served models.
-                    if self._blacklisted_uids:
-                        for uid in self._blacklisted_uids:
-                            removed = weights.get(uid, 0.0)
-                            if removed > 0:
-                                model_unallocated += removed
-                                weights[uid] = 0.0
-
-                    miner_share = sum(weights.values())
-                    model_unallocated = min(
-                        1.0,
-                        max(model_unallocated, 1.0 - miner_share),
-                    )
-                    miner_scale = 1.0 - emission_burn
-                    if miner_scale < 1.0:
-                        for uid in list(weights.keys()):
-                            weights[uid] *= miner_scale
-                    burn_weight = emission_burn + miner_scale * model_unallocated
-                    if burn_weight > 0:
-                        weights[self._burn_uid] = (
-                            weights.get(self._burn_uid, 0.0) + burn_weight
-                        )
-                    self._last_model_bucket_burn = burn_weight
-                    if burn_weight > 0:
-                        bt.logging.info(
-                            f"Emission burn: {emission_burn:.0%} global + "
-                            f"{model_unallocated:.1%} unallocated model buckets "
-                            f"to UID {self._burn_uid}"
-                        )
-                else:
-                    # Zero out blacklisted miners before weight normalization
-                    if self._blacklisted_uids:
-                        for uid in self._blacklisted_uids:
-                            if uid in weights:
-                                weights[uid] = 0.0
-                        # Re-normalize after zeroing
-                        total = sum(weights.values())
-                        if total > 0:
-                            weights = {uid: s / total for uid, s in weights.items()}
-                    # Apply emission burn: redirect a fraction of weight to burn UID
-                    if emission_burn > 0:
-                        for uid in list(weights.keys()):
-                            weights[uid] *= (1.0 - emission_burn)
-                        weights[self._burn_uid] = weights.get(self._burn_uid, 0.0) + emission_burn
-                        bt.logging.info(f"Emission burn: {emission_burn:.0%} to UID {self._burn_uid}")
-                # Run set_weights + retries on executor so this callback returns fast.
-                def _set_weights_with_retry(_w=dict(weights)):
-                    for _sw_attempt in range(1, 4):
-                        try:
-                            self._set_weights(_w)
-                            self._last_weights = _w
-                            return
-                        except Exception as _sw_err:
-                            if _sw_attempt == 3:
-                                bt.logging.error(f"set_weights failed after 3 attempts: {_sw_err}")
-                            else:
-                                _sw_delay = 30 * (2 ** (_sw_attempt - 1))
-                                bt.logging.warning(f"set_weights attempt {_sw_attempt}/3 failed: {_sw_err} — retrying in {_sw_delay}s")
-                                time.sleep(_sw_delay)
-                self._control_executor.submit(_set_weights_with_retry)
+            closing_epoch = self._pending_epoch_close
+            if self._try_close_epoch(closing_epoch):
+                current_epoch = block_number // epoch_blocks
+                if current_epoch > closing_epoch:
+                    self._start_new_epoch(block_number - blocks_into_epoch)
 
         self._schedule_miner_debug_refresh(
             current_epoch=block_number // max(1, int(epoch_blocks)),
@@ -3405,6 +4728,104 @@ class ValidatorNeuron:
                 f"(>12s; main loop is falling behind chain)"
             )
 
+    def _schedule_weight_update(self) -> None:
+        """Submit the weight update derived from the just-closed epoch."""
+
+        model_budgets = getattr(self, "_last_model_emission_budgets", {})
+        model_bucket_mode = bool(model_budgets)
+        model_unallocated = 0.0
+        probation_entries = {
+            (str(address).lower(), int(model_index))
+            for address, model_indices in self._db.get_probation_addresses().items()
+            for model_index in model_indices
+        }
+        if model_bucket_mode:
+            weights, model_unallocated = self.scorer.get_model_bucket_weights(
+                model_budgets,
+                model_groups=getattr(self, "_last_model_emission_groups", {}),
+                group_budgets=getattr(self, "_last_model_group_budgets", {}),
+                excluded_entries=probation_entries,
+            )
+        else:
+            weights = self.scorer.get_weights(
+                excluded_entries=probation_entries,
+            )
+
+        if not weights and not (model_bucket_mode and model_unallocated > 0):
+            return
+        emission_burn = max(0.0, min(1.0, self._scoring.emission_burn))
+        if model_bucket_mode:
+            # In bucket mode, blacklisted and unserved model shares are
+            # burned. Renormalizing them would leak that budget back to
+            # already-served models.
+            if self._blacklisted_uids:
+                for uid in self._blacklisted_uids:
+                    removed = weights.get(uid, 0.0)
+                    if removed > 0:
+                        model_unallocated += removed
+                        weights[uid] = 0.0
+
+            miner_share = sum(weights.values())
+            model_unallocated = min(
+                1.0,
+                max(model_unallocated, 1.0 - miner_share),
+            )
+            miner_scale = 1.0 - emission_burn
+            if miner_scale < 1.0:
+                for uid in list(weights.keys()):
+                    weights[uid] *= miner_scale
+            burn_weight = emission_burn + miner_scale * model_unallocated
+            if burn_weight > 0:
+                weights[self._burn_uid] = (
+                    weights.get(self._burn_uid, 0.0) + burn_weight
+                )
+            self._last_model_bucket_burn = burn_weight
+            if burn_weight > 0:
+                bt.logging.info(
+                    f"Emission burn: {emission_burn:.0%} global + "
+                    f"{model_unallocated:.1%} unallocated model buckets "
+                    f"to UID {self._burn_uid}"
+                )
+        else:
+            # Zero out blacklisted miners before weight normalization.
+            if self._blacklisted_uids:
+                for uid in self._blacklisted_uids:
+                    if uid in weights:
+                        weights[uid] = 0.0
+                total = sum(weights.values())
+                if total > 0:
+                    weights = {uid: score / total for uid, score in weights.items()}
+            if emission_burn > 0:
+                for uid in list(weights.keys()):
+                    weights[uid] *= 1.0 - emission_burn
+                weights[self._burn_uid] = (
+                    weights.get(self._burn_uid, 0.0) + emission_burn
+                )
+                bt.logging.info(
+                    f"Emission burn: {emission_burn:.0%} to UID {self._burn_uid}"
+                )
+
+        def _set_weights_with_retry(_weights=dict(weights)):
+            for attempt in range(1, 4):
+                try:
+                    self._set_weights(_weights)
+                    self._last_weights = _weights
+                    return
+                except Exception as exc:
+                    if attempt == 3:
+                        bt.logging.error(
+                            f"set_weights failed after 3 attempts: {exc}"
+                        )
+                    else:
+                        delay = 30 * (2 ** (attempt - 1))
+                        bt.logging.warning(
+                            f"set_weights attempt {attempt}/3 failed: {exc} "
+                            f"— retrying in {delay}s"
+                        )
+                        time.sleep(delay)
+
+        self._control_executor.submit(_set_weights_with_retry)
+
     # ------------------------------------------------------------------
     # Epoch lifecycle
     # ------------------------------------------------------------------
@@ -3414,16 +4835,27 @@ class ValidatorNeuron:
         epoch_number = epoch_start_block // self.config.epoch_blocks
         self._refresh_subnet_runtime_config(current_epoch=epoch_number, force=True)
         epoch_number = epoch_start_block // self.config.epoch_blocks
+        if getattr(
+            self,
+            "_proof_v3_verdict_source_latched_epoch",
+            None,
+        ) != int(epoch_number):
+            self._latch_proof_v3_verdict_source(epoch_number)
         if epoch_number != self._current_epoch:
             self._reset_canary_executor()
         self._current_epoch = epoch_number
         self._epoch_start_block = epoch_start_block
 
-        # Schedule epoch close for after grace window
+        # Canary execution ends at the epoch boundary. Receipt pulling and
+        # scoring happen immediately; grace is never used to finish tests.
         self._pending_epoch_close = epoch_number
         self._epoch_close_block = (
-            epoch_start_block + self.config.epoch_blocks + self.config.epoch_grace_blocks
+            epoch_start_block + self.config.epoch_blocks
         )
+        sealed = getattr(self, "_sealed_canary_epochs", set())
+        self._sealed_canary_epochs = {
+            value for value in sealed if value >= epoch_number
+        }
 
         # Dispatch no-ops until background sets the scheduler.
         self._canary_scheduler = None
@@ -3455,52 +4887,1277 @@ class ValidatorNeuron:
 
     def _canary_epoch_active(self, epoch_number: int) -> bool:
         """Return True while a canary still belongs to the active epoch."""
-        return self._running and epoch_number == self._current_epoch
+        return bool(
+            self._running
+            and epoch_number == self._current_epoch
+            and epoch_number
+            not in getattr(self, "_sealed_canary_epochs", set())
+        )
+
+    @staticmethod
+    def _canary_execution_id(
+        test: CanaryTest,
+        epoch_number: int,
+    ) -> Tuple[int, bytes]:
+        try:
+            obligation_id = bytes.fromhex(str(test.obligation_id))
+        except ValueError as exc:
+            raise _ProofV3ValidatorConfigurationError(
+                "canary execution obligation id is malformed"
+            ) from exc
+        if len(obligation_id) != 16:
+            raise _ProofV3ValidatorConfigurationError(
+                "canary execution obligation id is malformed"
+            )
+        return int(epoch_number), obligation_id
+
+    def _canary_execution_active(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+    ) -> bool:
+        """Allow an already-started request to reach a terminal outcome."""
+
+        if self._canary_epoch_active(epoch_number):
+            return True
+        if not self._running:
+            return False
+        return self._canary_execution_id(test, epoch_number) in getattr(
+            self,
+            "_cross_epoch_canaries",
+            set(),
+        )
+
+    def _mark_cross_epoch_canary_started(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+    ) -> None:
+        active = getattr(self, "_cross_epoch_canaries", None)
+        if active is None:
+            active = set()
+            self._cross_epoch_canaries = active
+        active.add(
+            self._canary_execution_id(test, epoch_number)
+        )
+
+    def _mark_cross_epoch_canary_finished(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+    ) -> None:
+        getattr(self, "_cross_epoch_canaries", set()).discard(
+            self._canary_execution_id(test, epoch_number)
+        )
+
+    def _pending_cross_epoch_full_obligations(
+        self,
+        epoch_number: int,
+        key: Tuple[str, int],
+    ) -> Set[bytes]:
+        """Return started full obligations still resolving after the boundary."""
+
+        canonical_key = self._miner_model_key(key[0], key[1])
+        active = getattr(self, "_cross_epoch_canaries", set())
+        pending: Set[bytes] = set()
+        for execution_id, test in tuple(
+            getattr(self, "_unfinished_canary_tests", {}).items()
+        ):
+            if (
+                execution_id[0] != int(epoch_number)
+                or execution_id not in active
+                or test.test_type != "full_context"
+                or self._miner_model_key(
+                    test.miner_address,
+                    test.model_index,
+                )
+                != canonical_key
+            ):
+                continue
+            pending.add(execution_id[1])
+        return pending
+
+    def _pending_cross_epoch_hard_obligations(
+        self,
+        epoch_number: int,
+        key: Tuple[str, int],
+    ) -> Set[bytes]:
+        """Return hard requests from one source epoch still terminating."""
+
+        canonical_key = self._miner_model_key(key[0], key[1])
+        active = getattr(self, "_cross_epoch_canaries", set())
+        pending: Set[bytes] = set()
+        for execution_id, test in tuple(
+            getattr(self, "_unfinished_canary_tests", {}).items()
+        ):
+            if (
+                execution_id[0] != int(epoch_number)
+                or execution_id not in active
+                or not bool(test.verify_proof)
+                or self._miner_model_key(
+                    test.miner_address,
+                    test.model_index,
+                )
+                != canonical_key
+            ):
+                continue
+            pending.add(execution_id[1])
+        return pending
+
+    def _complete_cross_epoch_full_success(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+    ) -> None:
+        """Clear only debt predating a successfully completed late full test."""
+
+        if test.test_type != "full_context":
+            return
+        key = self._miner_model_key(
+            test.miner_address,
+            test.model_index,
+        )
+        debt_epoch = self._full_context_debt.get(key)
+        if debt_epoch is None or int(debt_epoch) >= int(epoch_number):
+            return
+        self._full_context_debt.pop(key, None)
+        self._save_full_context_debt()
 
     @staticmethod
     def _miner_model_key(address: str, model_index: int) -> Tuple[str, int]:
         """Canonical in-memory key for per-epoch miner/model accounting."""
         return (str(address).lower(), int(model_index))
 
-    def _mark_canary_started(self, epoch_number: int, key: Tuple[str, int]) -> None:
-        """Count a canary only once it actually starts running."""
-        key = self._miner_model_key(key[0], key[1])
-        self._expected_receipts[key] = self._expected_receipts.get(key, 0) + 1
-        epoch_inflight = self._inflight_canaries.setdefault(epoch_number, {})
-        epoch_inflight[key] = epoch_inflight.get(key, 0) + 1
+    def _proof_v3_hard_execution_lock(
+        self,
+        test: CanaryTest,
+    ) -> threading.Lock:
+        """Return the endpoint-local lock used only by hard canaries."""
 
-    def _mark_canary_finished(self, epoch_number: int, key: Tuple[str, int]) -> None:
+        key = self._miner_model_key(
+            test.miner_address,
+            test.model_index,
+        )
+        guard = getattr(
+            self,
+            "_proof_v3_hard_execution_locks_lock",
+            None,
+        )
+        if guard is None:
+            guard = threading.Lock()
+            self._proof_v3_hard_execution_locks_lock = guard
+        with guard:
+            locks = getattr(
+                self,
+                "_proof_v3_hard_execution_locks",
+                None,
+            )
+            if locks is None:
+                locks = {}
+                self._proof_v3_hard_execution_locks = locks
+            lock = locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                locks[key] = lock
+            return lock
+
+    def _mark_canary_started(self, epoch_number: int, key: Tuple[str, int]) -> None:
+        """Track in-flight work without changing the planned obligation set."""
+        key = self._miner_model_key(key[0], key[1])
+        lock = getattr(self, "_canary_accounting_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._canary_accounting_lock = lock
+        with lock:
+            epoch_inflight = self._inflight_canaries.setdefault(
+                epoch_number,
+                {},
+            )
+            epoch_inflight[key] = epoch_inflight.get(key, 0) + 1
+
+    def _mark_canary_finished(
+        self,
+        epoch_number: int,
+        key: Tuple[str, int],
+        test: CanaryTest | None = None,
+    ) -> None:
         """Clear in-flight accounting when a canary finishes or is abandoned."""
         key = self._miner_model_key(key[0], key[1])
-        epoch_inflight = self._inflight_canaries.get(epoch_number)
-        if not epoch_inflight:
+        lock = getattr(self, "_canary_accounting_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._canary_accounting_lock = lock
+        with lock:
+            epoch_inflight = self._inflight_canaries.get(epoch_number)
+            if not epoch_inflight:
+                if test is not None:
+                    getattr(
+                        self,
+                        "_unfinished_canary_tests",
+                        {},
+                    ).pop(
+                        self._canary_execution_id(test, epoch_number),
+                        None,
+                    )
+                return
+            current = epoch_inflight.get(key, 0)
+            if current <= 1:
+                epoch_inflight.pop(key, None)
+            else:
+                epoch_inflight[key] = current - 1
+            if not epoch_inflight:
+                self._inflight_canaries.pop(epoch_number, None)
+            if test is not None:
+                getattr(
+                    self,
+                    "_unfinished_canary_tests",
+                    {},
+                ).pop(
+                    self._canary_execution_id(test, epoch_number),
+                    None,
+                )
+
+    def _mark_canary_queued(
+        self,
+        epoch_number: int,
+        key: Tuple[str, int],
+        test: CanaryTest | None = None,
+    ) -> None:
+        """Track submitted work before an executor worker begins it."""
+
+        key = self._miner_model_key(key[0], key[1])
+        lock = getattr(self, "_canary_accounting_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._canary_accounting_lock = lock
+        with lock:
+            queued_by_epoch = getattr(self, "_queued_canaries", None)
+            if queued_by_epoch is None:
+                queued_by_epoch = {}
+                self._queued_canaries = queued_by_epoch
+            queued = queued_by_epoch.setdefault(epoch_number, {})
+            queued[key] = queued.get(key, 0) + 1
+            if test is not None:
+                unfinished = getattr(
+                    self,
+                    "_unfinished_canary_tests",
+                    None,
+                )
+                if unfinished is None:
+                    unfinished = {}
+                    self._unfinished_canary_tests = unfinished
+                unfinished[
+                    self._canary_execution_id(test, epoch_number)
+                ] = test
+
+    def _mark_canary_dequeued(
+        self,
+        epoch_number: int,
+        key: Tuple[str, int],
+    ) -> None:
+        """Clear one queued marker when its worker starts."""
+
+        key = self._miner_model_key(key[0], key[1])
+        lock = getattr(self, "_canary_accounting_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._canary_accounting_lock = lock
+        with lock:
+            queued_by_epoch = getattr(self, "_queued_canaries", {})
+            queued = queued_by_epoch.get(epoch_number)
+            if not queued:
+                return
+            current = queued.get(key, 0)
+            if current <= 1:
+                queued.pop(key, None)
+            else:
+                queued[key] = current - 1
+            if not queued:
+                queued_by_epoch.pop(epoch_number, None)
+
+    def _seal_canary_epoch_for_close(self, epoch_number: int) -> Set[Tuple[str, int]]:
+        """Fence local work without erasing miner-visible terminal outcomes."""
+
+        sealed = getattr(self, "_sealed_canary_epochs", None)
+        if sealed is None:
+            sealed = set()
+            self._sealed_canary_epochs = sealed
+        if epoch_number in sealed:
+            return set()
+        sealed.add(epoch_number)
+
+        affected: Set[Tuple[str, int]] = set()
+        local_unstarted: Dict[Tuple[int, bytes], CanaryTest] = {}
+        miner_rejected_pending: Dict[Tuple[int, bytes], CanaryTest] = {}
+        started_inflight: Dict[Tuple[int, bytes], CanaryTest] = {}
+        scheduler_lock = getattr(self, "_canary_scheduler_lock", None)
+        scheduler = getattr(self, "_canary_scheduler", None)
+        if (
+            scheduler is not None
+            and scheduler.epoch_number == epoch_number
+        ):
+            if scheduler_lock is None:
+                pending = list(scheduler.tests)
+                scheduler.tests = []
+            else:
+                with scheduler_lock:
+                    pending = list(scheduler.tests)
+                    scheduler.tests = []
+            for test in pending:
+                execution_id = self._canary_execution_id(
+                    test,
+                    epoch_number,
+                )
+                if tuple(getattr(test, "rejection_intervals", ()) or ()):
+                    miner_rejected_pending[execution_id] = test
+                else:
+                    local_unstarted[execution_id] = test
+                affected.add(
+                    self._miner_model_key(
+                        test.miner_address,
+                        test.model_index,
+                    )
+                )
+
+        lock = getattr(self, "_canary_accounting_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._canary_accounting_lock = lock
+        with lock:
+            cross_epoch = getattr(self, "_cross_epoch_canaries", set())
+            for execution_id, test in tuple(
+                getattr(self, "_unfinished_canary_tests", {}).items()
+            ):
+                if execution_id[0] == epoch_number:
+                    if execution_id in cross_epoch:
+                        started_inflight[execution_id] = test
+                    elif tuple(
+                        getattr(test, "rejection_intervals", ()) or ()
+                    ):
+                        miner_rejected_pending[execution_id] = test
+                    else:
+                        local_unstarted[execution_id] = test
+                    affected.add(
+                        self._miner_model_key(
+                            test.miner_address,
+                            test.model_index,
+                        )
+                    )
+            affected.update(
+                getattr(self, "_queued_canaries", {}).pop(
+                    epoch_number,
+                    {},
+                ).keys()
+            )
+            affected.update(
+                self._inflight_canaries.pop(epoch_number, {}).keys()
+            )
+
+        # Never-started local work and requests still running at the boundary
+        # are removed from immutable source-epoch throughput accounting. A
+        # miner-observed 503 is different: even when its retry is pending, the
+        # exact obligation remains in the inventory so low work fails and full
+        # work can use only the signed one-shot busy deferral. A running request
+        # remains active until its configured deadline and produces either a
+        # late success or an immediate miner-attributed failure.
+        for test in (
+            list(local_unstarted.values())
+            + list(started_inflight.values())
+        ):
+            self._neutralize_canary_obligation(test)
+        with lock:
+            for execution_id in (
+                set(local_unstarted) | set(miner_rejected_pending)
+            ):
+                self._unfinished_canary_tests.pop(execution_id, None)
+
+        if affected:
+            bt.logging.warning(
+                f"Epoch {epoch_number}: neutralized "
+                f"{len(local_unstarted)} unstarted validator canary task(s) "
+                f"and retained {len(miner_rejected_pending)} "
+                "miner-rejected obligation(s) for reconciliation; "
+                f"retained {len(started_inflight)} started request(s) "
+                "to a bounded terminal outcome"
+            )
+        return affected
+
+    def _neutralize_canary_obligation(self, test: CanaryTest) -> None:
+        """Remove one validator-unfinished obligation from score accounting."""
+
+        key = self._miner_model_key(
+            test.miner_address,
+            test.model_index,
+        )
+        try:
+            obligation_id = bytes.fromhex(test.obligation_id)
+        except ValueError:
             return
-        current = epoch_inflight.get(key, 0)
-        if current <= 1:
-            epoch_inflight.pop(key, None)
+        inventory = self._expected_canary_obligations.get(key)
+        if inventory is None:
+            return
+        inventory.pop(obligation_id, None)
+        getattr(
+            self,
+            "_hard_canary_obligation_ids",
+            set(),
+        ).discard(obligation_id)
+        if inventory:
+            self._expected_receipts[key] = len(inventory)
         else:
-            epoch_inflight[key] = current - 1
-        if not epoch_inflight:
-            self._inflight_canaries.pop(epoch_number, None)
+            self._expected_canary_obligations.pop(key, None)
+            self._expected_receipts.pop(key, None)
 
     def _decrement_expected_receipt(self, epoch_number: int, key: Tuple[str, int]) -> None:
-        """Drop expected receipt count for active-epoch validator-side misses."""
-        if epoch_number != self._current_epoch:
-            return
-        key = self._miner_model_key(key[0], key[1])
-        if self._expected_receipts.get(key, 0) > 0:
-            self._expected_receipts[key] -= 1
+        """Compatibility no-op: planned 2+1 obligations are never weakened."""
+
+        return None
 
     def _effective_expected_receipts(self, epoch_number: int, key: Tuple[str, int]) -> int:
-        """Expected receipts minus canaries still in flight at close time."""
+        """Return the exact preplanned obligation count for an epoch."""
         key = self._miner_model_key(key[0], key[1])
-        expected = self._expected_receipts.get(key, 0)
-        inflight_epoch = self._closing_inflight_canaries.get(
-            epoch_number,
-            self._inflight_canaries.get(epoch_number, {}),
+        return max(0, self._expected_receipts.get(key, 0))
+
+    @staticmethod
+    def _canary_debt_key(key: Tuple[str, int]) -> str:
+        return f"{str(key[0]).lower()}|{int(key[1])}"
+
+    def _load_full_context_debt(self) -> None:
+        self._full_context_debt = {}
+        try:
+            raw = self._db.get_meta("proof_v3_full_context_debt_v1")
+            value = json.loads(raw) if raw else {}
+            if not isinstance(value, dict):
+                return
+            for encoded, epoch in value.items():
+                if not isinstance(encoded, str) or "|" not in encoded:
+                    continue
+                address, index = encoded.rsplit("|", 1)
+                if (
+                    not address
+                    or type(epoch) is not int
+                    or epoch < 0
+                ):
+                    continue
+                self._full_context_debt[
+                    self._miner_model_key(address, int(index))
+                ] = epoch
+        except Exception as exc:
+            bt.logging.warning(
+                f"Ignoring malformed proof-v3 full-context debt state: {exc}"
+            )
+            self._full_context_debt = {}
+
+    def _save_full_context_debt(self) -> None:
+        value = {
+            self._canary_debt_key(key): int(epoch)
+            for key, epoch in sorted(self._full_context_debt.items())
+        }
+        self._db.set_meta(
+            "proof_v3_full_context_debt_v1",
+            json.dumps(value, sort_keys=True, separators=(",", ":")),
         )
-        inflight = inflight_epoch.get(key, 0)
-        return max(0, expected - inflight)
+
+    def _migrate_full_context_debt_for_registrations(
+        self,
+        previous_miners: Sequence[ActiveMiner],
+        current_miners: Sequence[ActiveMiner],
+    ) -> None:
+        """Carry one-shot busy debt across model-index re-registration.
+
+        A contract model index is not a stable service identity.  A miner must
+        not regain its one authenticated-busy deferral merely by releasing and
+        re-registering the same model under a new index.  We conservatively
+        carry debt to every current entry for the same EVM address and model.
+        Hard-pass credit is intentionally not migrated: a new entry must earn
+        its own hidden hard pass.
+        """
+
+        if not self._full_context_debt:
+            return
+        prior_identity_by_key = {
+            self._miner_model_key(miner.address, miner.model_index): (
+                str(miner.address).lower(),
+                str(miner.model_id),
+            )
+            for miner in previous_miners
+        }
+        current_by_identity: Dict[
+            Tuple[str, str],
+            List[Tuple[str, int]],
+        ] = {}
+        for miner in current_miners:
+            identity = (
+                str(miner.address).lower(),
+                str(miner.model_id),
+            )
+            current_by_identity.setdefault(identity, []).append(
+                self._miner_model_key(
+                    miner.address,
+                    miner.model_index,
+                )
+            )
+
+        migrated = 0
+        for old_key, debt_epoch in tuple(self._full_context_debt.items()):
+            identity = prior_identity_by_key.get(old_key)
+            if identity is None:
+                continue
+            for new_key in current_by_identity.get(identity, ()):
+                if new_key in self._full_context_debt:
+                    continue
+                self._full_context_debt[new_key] = int(debt_epoch)
+                migrated += 1
+        if migrated:
+            self._save_full_context_debt()
+            bt.logging.info(
+                "Migrated proof-v3 full-context debt to "
+                f"{migrated} re-registered model entry/entries"
+            )
+
+    def _load_hard_audit_pass_epochs(self) -> None:
+        self._last_hard_audit_pass_epoch = {}
+        try:
+            raw = self._db.get_meta("proof_v3_hard_audit_pass_epochs_v1")
+            value = json.loads(raw) if raw else {}
+            if not isinstance(value, dict):
+                return
+            for encoded, epoch in value.items():
+                if (
+                    not isinstance(encoded, str)
+                    or "|" not in encoded
+                    or type(epoch) is not int
+                    or epoch < 0
+                ):
+                    continue
+                address, index = encoded.rsplit("|", 1)
+                self._last_hard_audit_pass_epoch[
+                    self._miner_model_key(address, int(index))
+                ] = epoch
+        except Exception as exc:
+            bt.logging.warning(
+                "Ignoring malformed proof-v3 hard-audit pass ledger: "
+                f"{exc}"
+            )
+            self._last_hard_audit_pass_epoch = {}
+
+    def _save_hard_audit_pass_epochs(self) -> None:
+        value = {
+            self._canary_debt_key(key): int(epoch)
+            for key, epoch in sorted(
+                self._last_hard_audit_pass_epoch.items()
+            )
+        }
+        self._db.set_meta(
+            "proof_v3_hard_audit_pass_epochs_v1",
+            json.dumps(value, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _record_hard_audit_pass(
+        self,
+        test: CanaryTest,
+        *,
+        completion_epoch: int,
+    ) -> None:
+        if not bool(test.verify_proof):
+            return
+        key = self._miner_model_key(
+            test.miner_address,
+            test.model_index,
+        )
+        lock = getattr(self, "_hard_audit_pass_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._hard_audit_pass_lock = lock
+        with lock:
+            prior = self._last_hard_audit_pass_epoch.get(key, -1)
+            if int(completion_epoch) <= prior:
+                return
+            self._last_hard_audit_pass_epoch[key] = int(completion_epoch)
+            self._save_hard_audit_pass_epochs()
+
+    def _load_probation_recovery_source_epochs(self) -> None:
+        self._last_probation_recovery_source_epoch = {}
+        try:
+            raw = self._db.get_meta(
+                "proof_v3_probation_recovery_source_epochs_v1"
+            )
+            value = json.loads(raw) if raw else {}
+            if not isinstance(value, dict):
+                return
+            for encoded, epoch in value.items():
+                if (
+                    not isinstance(encoded, str)
+                    or "|" not in encoded
+                    or type(epoch) is not int
+                    or epoch < 0
+                ):
+                    continue
+                address, index = encoded.rsplit("|", 1)
+                self._last_probation_recovery_source_epoch[
+                    self._miner_model_key(address, int(index))
+                ] = epoch
+        except Exception as exc:
+            bt.logging.warning(
+                "Ignoring malformed proof-v3 probation recovery ledger: "
+                f"{exc}"
+            )
+            self._last_probation_recovery_source_epoch = {}
+
+    def _save_probation_recovery_source_epochs(self) -> None:
+        value = {
+            self._canary_debt_key(key): int(epoch)
+            for key, epoch in sorted(
+                self._last_probation_recovery_source_epoch.items()
+            )
+        }
+        self._db.set_meta(
+            "proof_v3_probation_recovery_source_epochs_v1",
+            json.dumps(value, sort_keys=True, separators=(",", ":")),
+        )
+
+    def _mark_probation_recovery_failure_epoch(
+        self,
+        key: Tuple[str, int],
+        source_epoch: int,
+    ) -> None:
+        canonical_key = self._miner_model_key(key[0], key[1])
+        lock = getattr(self, "_probation_recovery_epoch_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._probation_recovery_epoch_lock = lock
+        with lock:
+            prior = self._last_probation_recovery_source_epoch.get(
+                canonical_key,
+                -1,
+            )
+            if int(source_epoch) <= prior:
+                return
+            self._last_probation_recovery_source_epoch[canonical_key] = int(
+                source_epoch
+            )
+            self._save_probation_recovery_source_epochs()
+
+    def _record_probation_recovery_source_pass(
+        self,
+        key: Tuple[str, int],
+        source_epoch: int,
+    ) -> bool:
+        """Count at most one clean recovery pass per ordered source epoch."""
+
+        canonical_key = self._miner_model_key(key[0], key[1])
+        lock = getattr(self, "_probation_recovery_epoch_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._probation_recovery_epoch_lock = lock
+        with lock:
+            prior = self._last_probation_recovery_source_epoch.get(
+                canonical_key,
+                -1,
+            )
+            if int(source_epoch) <= prior:
+                return False
+            if not self._probation_tracker.is_on_probation(canonical_key):
+                return False
+            self._last_probation_recovery_source_epoch[canonical_key] = int(
+                source_epoch
+            )
+            self._save_probation_recovery_source_epochs()
+            self._probation_tracker.record_pass(canonical_key)
+            self._db.record_pass(canonical_key[0], canonical_key[1])
+            return True
+
+    @staticmethod
+    def _probation_recovery_epoch_is_clean(
+        *,
+        obligation_failure: bool,
+        full_deferred: bool,
+        proof_tests: int,
+        proof_failures: int,
+    ) -> bool:
+        """Require an actual successful hard proof for probation recovery."""
+
+        return bool(
+            not obligation_failure
+            and not full_deferred
+            and int(proof_tests) > 0
+            and int(proof_failures) == 0
+        )
+
+    def _reconcile_late_hard_probation_pass(
+        self,
+        test: CanaryTest,
+        source_epoch: int,
+    ) -> bool:
+        """Apply one clean late source epoch after its final hard terminates."""
+
+        if not bool(test.verify_proof):
+            return False
+        key = self._miner_model_key(
+            test.miner_address,
+            test.model_index,
+        )
+        current_obligation = bytes.fromhex(test.obligation_id)
+        if self._pending_cross_epoch_hard_obligations(
+            source_epoch,
+            key,
+        ) != {current_obligation}:
+            return False
+        failures = self._db.get_proof_v3_hard_failures(
+            int(source_epoch),
+            int(source_epoch),
+        )
+        if any(
+            self._miner_model_key(
+                item.get("miner_address", ""),
+                item.get("model_index", -1),
+            )
+            == key
+            for item in failures
+        ):
+            self._mark_probation_recovery_failure_epoch(key, source_epoch)
+            return False
+        recorded = self._record_probation_recovery_source_pass(
+            key,
+            source_epoch,
+        )
+        if recorded:
+            bt.logging.info(
+                "Probation late hard-audit pass reconciled for "
+                f"{test.miner_address[:10]} model_index={test.model_index} "
+                f"source_epoch={source_epoch}"
+            )
+        return recorded
+
+    def _record_hard_audit_failure(
+        self,
+        *,
+        source_epoch: int,
+        miner_address: str,
+        model_id: str,
+        model_index: int,
+        obligation_id: bytes,
+        failure_code: str,
+    ) -> bool:
+        """Persist one owner-signed failure independently of the miner."""
+
+        if not _proof_v3_hard_auditor_active(
+            self.config,
+            self._validator_hotkey_ss58,
+        ):
+            return False
+        failure_key = (int(source_epoch), bytes(obligation_id))
+        lock = getattr(self, "_hard_audit_failure_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._hard_audit_failure_lock = lock
+        with lock:
+            recorded = getattr(
+                self,
+                "_hard_audit_failure_obligations",
+                None,
+            )
+            if recorded is None:
+                recorded = set()
+                self._hard_audit_failure_obligations = recorded
+            if failure_key in recorded:
+                self._mark_probation_recovery_failure_epoch(
+                    self._miner_model_key(miner_address, model_index),
+                    source_epoch,
+                )
+                return True
+            try:
+                from neurons.proof_v3_hard_outcome import (
+                    HardAuditFailureV3,
+                    sign_hard_audit_failure_v3,
+                )
+
+                outcome = sign_hard_audit_failure_v3(
+                    HardAuditFailureV3(
+                        source_epoch=int(source_epoch),
+                        miner_address=str(miner_address).lower(),
+                        model_id=str(model_id),
+                        model_index=int(model_index),
+                        obligation_id=bytes(obligation_id),
+                        failure_code=str(failure_code),
+                        observed_at=int(time.time()),
+                        validator_hotkey=self._validator_hotkey_bytes,
+                    ),
+                    self._validator_private_key,
+                )
+                self._db.store_proof_v3_hard_failure(
+                    outcome.to_dict(),
+                    outcome.digest(),
+                )
+                recorded.add(failure_key)
+                self._mark_probation_recovery_failure_epoch(
+                    self._miner_model_key(miner_address, model_index),
+                    source_epoch,
+                )
+                return True
+            except Exception as exc:
+                # Signing/persistence belongs to the validator. Never turn it
+                # into miner evidence or let it suppress local enforcement.
+                bt.logging.warning(
+                    "Proof-v3 hard failure publication failed locally "
+                    f"(NOT attributed to miner {str(miner_address)[:10]}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if self._canary_epoch_active(int(source_epoch)):
+                    self._validator_canary_failures.add(
+                        self._miner_model_key(
+                            miner_address,
+                            model_index,
+                        )
+                    )
+                return False
+
+    def _hard_audit_due_entries(
+        self,
+        *,
+        epoch_number: int,
+        drought_epochs: int,
+    ) -> Set[Tuple[str, int]]:
+        due: Set[Tuple[str, int]] = set()
+        with self._hard_audit_pass_lock:
+            for miner in self._epoch_miners:
+                key = self._miner_model_key(
+                    miner.address,
+                    miner.model_index,
+                )
+                last = self._last_hard_audit_pass_epoch.get(key)
+                if last is None or int(epoch_number) - last >= drought_epochs:
+                    due.add(key)
+        return due
+
+    def _load_shared_hard_processed_receipts(self) -> None:
+        self._shared_hard_processed_receipts = set()
+        try:
+            raw = self._db.get_meta(
+                "proof_v3_shared_hard_processed_receipts_v1"
+            )
+            values = json.loads(raw) if raw else []
+            if not isinstance(values, list):
+                return
+            for value in values:
+                if not isinstance(value, str) or len(value) != 64:
+                    continue
+                try:
+                    decoded = bytes.fromhex(value)
+                except ValueError:
+                    continue
+                if len(decoded) == 32:
+                    self._shared_hard_processed_receipts.add(decoded)
+        except Exception as exc:
+            bt.logging.warning(
+                "Ignoring malformed shared hard-receipt replay ledger: "
+                f"{exc}"
+            )
+            self._shared_hard_processed_receipts = set()
+
+    def _save_shared_hard_processed_receipts(self) -> None:
+        # Three retained epochs produce only a handful of records per
+        # endpoint. Keep a generous bounded tail so restart cannot replay old
+        # pass/failure verdicts indefinitely.
+        values = sorted(self._shared_hard_processed_receipts)
+        if len(values) > 16_384:
+            values = values[-16_384:]
+            self._shared_hard_processed_receipts = set(values)
+        self._db.set_meta(
+            "proof_v3_shared_hard_processed_receipts_v1",
+            json.dumps(
+                [value.hex() for value in values],
+                separators=(",", ":"),
+            ),
+        )
+
+    def _mark_shared_hard_receipt_processed(
+        self,
+        receipt: ServiceReceipt,
+    ) -> None:
+        from neurons.proof_v3_shared_hard import (
+            shared_hard_receipt_cache_key_v3,
+        )
+
+        key = shared_hard_receipt_cache_key_v3(receipt)
+        processed = getattr(
+            self,
+            "_shared_hard_processed_receipts",
+            None,
+        )
+        if processed is None:
+            processed = set()
+            self._shared_hard_processed_receipts = processed
+        if key in processed:
+            return
+        processed.add(key)
+        try:
+            self._save_shared_hard_processed_receipts()
+        except Exception as exc:
+            bt.logging.warning(
+                "Shared hard-receipt replay ledger persistence failed "
+                f"locally: {exc}"
+            )
+
+    def _load_shared_hard_processed_failures(self) -> None:
+        self._shared_hard_processed_failures = set()
+        try:
+            raw = self._db.get_meta(
+                "proof_v3_shared_hard_processed_failures_v1"
+            )
+            values = json.loads(raw) if raw else []
+            if not isinstance(values, list):
+                return
+            for value in values:
+                if not isinstance(value, str) or len(value) != 64:
+                    continue
+                try:
+                    decoded = bytes.fromhex(value)
+                except ValueError:
+                    continue
+                if len(decoded) == 32:
+                    self._shared_hard_processed_failures.add(decoded)
+        except Exception as exc:
+            bt.logging.warning(
+                "Ignoring malformed shared hard-failure replay ledger: "
+                f"{exc}"
+            )
+            self._shared_hard_processed_failures = set()
+
+    def _save_shared_hard_processed_failures(self) -> None:
+        values = sorted(self._shared_hard_processed_failures)
+        if len(values) > 16_384:
+            values = values[-16_384:]
+            self._shared_hard_processed_failures = set(values)
+        self._db.set_meta(
+            "proof_v3_shared_hard_processed_failures_v1",
+            json.dumps(
+                [value.hex() for value in values],
+                separators=(",", ":"),
+            ),
+        )
+
+    def _proof_v3_hard_failure_feed_url(self) -> str:
+        explicit = str(
+            getattr(self.config, "proof_v3_hard_failure_url", "") or ""
+        ).strip()
+        if explicit:
+            parsed = urlparse(explicit)
+            if parsed.scheme in ("http", "https") and parsed.netloc:
+                return explicit.rstrip("/")
+            return ""
+        config_url = str(
+            getattr(self.config, "subnet_config_url", "") or ""
+        ).strip()
+        parsed = urlparse(config_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return ""
+        return (
+            f"{parsed.scheme}://{parsed.netloc}"
+            "/v1/proof-v3/hard-failures"
+        )
+
+    def _fetch_shared_hard_failure_verdicts(
+        self,
+        *,
+        current_epoch: int,
+    ) -> Dict[Tuple[str, int], bool]:
+        """Consume positive, owner-signed failure evidence.
+
+        Missing/unreachable feeds and invalid records stay neutral. A valid
+        failure is sufficient on its own; absence is never interpreted as a
+        pass or a failure.
+        """
+
+        if self._proof_v3_follower_mode_active():
+            return {}
+
+        owner_ss58 = str(
+            getattr(
+                self.config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
+        )
+        if (
+            not getattr(
+                self.config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+            or not owner_ss58
+            or owner_ss58 == self._validator_hotkey_ss58
+        ):
+            return {}
+        feed_url = self._proof_v3_hard_failure_feed_url()
+        if not feed_url:
+            return {}
+        minimum_epoch = max(0, int(current_epoch) - 3)
+        try:
+            response = httpx.get(
+                feed_url,
+                params={
+                    "minimum_epoch": minimum_epoch,
+                    "maximum_epoch": int(current_epoch),
+                },
+                timeout=max(
+                    1.0,
+                    float(
+                        getattr(
+                            self.config,
+                            "subnet_config_timeout_seconds",
+                            5.0,
+                        )
+                        or 5.0
+                    ),
+                ),
+                follow_redirects=False,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            bt.logging.warning(
+                "Owner proof-v3 hard-failure feed unavailable; hard "
+                f"failure sharing remains neutral: {type(exc).__name__}"
+            )
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        rows = payload.get("failures")
+        if not isinstance(rows, list) or len(rows) > 16_384:
+            return {}
+
+        from neurons.proof_v3_hard_outcome import (
+            HardAuditFailureV3,
+            verify_hard_audit_failure_v3,
+        )
+
+        exact: Dict[Tuple[str, str, int], List[ActiveMiner]] = {}
+        identity: Dict[Tuple[str, str], List[ActiveMiner]] = {}
+        for miner in self._epoch_miners:
+            address = str(miner.address).lower()
+            model_id = str(miner.model_id)
+            exact.setdefault(
+                (address, model_id, int(miner.model_index)),
+                [],
+            ).append(miner)
+            identity.setdefault((address, model_id), []).append(miner)
+
+        verdicts: Dict[Tuple[str, int], bool] = {}
+        newly_processed = False
+        for value in rows:
+            try:
+                outcome = HardAuditFailureV3.from_dict(value)
+            except (TypeError, ValueError):
+                continue
+            if not minimum_epoch <= outcome.source_epoch <= int(current_epoch):
+                continue
+            if not verify_hard_audit_failure_v3(
+                outcome,
+                expected_validator_hotkey_ss58=owner_ss58,
+            ):
+                continue
+            digest = outcome.digest()
+            if digest in self._shared_hard_processed_failures:
+                continue
+            matches = exact.get(
+                (
+                    outcome.miner_address.lower(),
+                    outcome.model_id,
+                    outcome.model_index,
+                ),
+                [],
+            )
+            if not matches:
+                # Carry failure evidence across model-index re-registration,
+                # matching the persisted busy-debt rule.
+                matches = identity.get(
+                    (
+                        outcome.miner_address.lower(),
+                        outcome.model_id,
+                    ),
+                    [],
+                )
+            if not matches:
+                continue
+            for miner in matches:
+                verdicts[
+                    self._miner_model_key(
+                        miner.address,
+                        miner.model_index,
+                    )
+                ] = False
+            self._shared_hard_processed_failures.add(digest)
+            newly_processed = True
+        if newly_processed:
+            try:
+                self._save_shared_hard_processed_failures()
+            except Exception as exc:
+                bt.logging.warning(
+                    "Shared hard-failure replay ledger persistence failed "
+                    f"locally: {exc}"
+                )
+        return verdicts
+
+    def _register_canary_obligations(
+        self,
+        tests: Sequence[CanaryTest],
+    ) -> None:
+        self._expected_receipts = {}
+        self._expected_canary_obligations = {}
+        self._hard_canary_obligation_ids = set()
+        for test in tests:
+            key = self._miner_model_key(
+                test.miner_address,
+                test.model_index,
+            )
+            try:
+                obligation_id = bytes.fromhex(test.obligation_id)
+            except ValueError as exc:
+                raise RuntimeError("canary obligation id is malformed") from exc
+            if len(obligation_id) != 16:
+                raise RuntimeError("canary obligation id is malformed")
+            kind = "full" if test.test_type == "full_context" else "low"
+            inventory = self._expected_canary_obligations.setdefault(key, {})
+            if obligation_id in inventory:
+                raise RuntimeError("canary obligation id is duplicated")
+            inventory[obligation_id] = (
+                kind,
+                int(test.target_prompt_tokens),
+            )
+            if (
+                bool(test.verify_proof)
+                and PROOF_PROTOCOL_V3
+                in tuple(test.proof_protocol_versions or ())
+                and test.model_id
+                in getattr(self, "_proof_v3_releases", {})
+            ):
+                self._hard_canary_obligation_ids.add(obligation_id)
+            self._expected_receipts[key] = len(inventory)
+            if kind == "full" and key in self._full_context_debt:
+                test.is_full_context_debt = True
+
+    @staticmethod
+    def _receipt_completes_canary_obligation(
+        receipt: ServiceReceipt,
+        obligation_id: bytes,
+        expected: Tuple[str, int],
+    ) -> bool:
+        """Validate one signed receipt against one exact planned obligation."""
+
+        expected_kind, expected_target = expected
+        prompt_tokens = int(getattr(receipt, "prompt_tokens", 0) or 0)
+        tolerance = canary_prompt_token_tolerance_v3(int(expected_target))
+        return bool(
+            receipt.is_canary
+            and int(getattr(receipt, "receipt_version", 1) or 1) >= 4
+            and bytes(
+                getattr(receipt, "canary_obligation_id", b"") or b""
+            )
+            == obligation_id
+            and str(getattr(receipt, "canary_kind", "") or "")
+            == expected_kind
+            and int(
+                getattr(receipt, "canary_target_prompt_tokens", 0) or 0
+            )
+            == int(expected_target)
+            and 0 < prompt_tokens <= int(expected_target)
+            and int(expected_target) - prompt_tokens <= tolerance
+            and (
+                (
+                    bool(receipt.proof_requested)
+                    and bool(receipt.proof_verified)
+                )
+                or (
+                    not bool(receipt.proof_requested)
+                    and not bool(receipt.proof_verified)
+                )
+            )
+            and int(receipt.tokens_generated or 0) > 0
+        )
+
+    def _completed_canary_obligations(
+        self,
+        own_receipts: Sequence[ServiceReceipt],
+        expected: Mapping[bytes, Tuple[str, int]],
+    ) -> Set[bytes]:
+        completed: Set[bytes] = set()
+        duplicated: Set[bytes] = set()
+        for receipt in own_receipts:
+            obligation_id = bytes(
+                getattr(receipt, "canary_obligation_id", b"") or b""
+            )
+            item = expected.get(obligation_id)
+            if item is None:
+                continue
+            if obligation_id in completed:
+                duplicated.add(obligation_id)
+                continue
+            if self._receipt_completes_canary_obligation(
+                receipt,
+                obligation_id,
+                item,
+            ):
+                completed.add(obligation_id)
+        return completed.difference(duplicated)
+
+    def _busy_evidence_covers_full_obligations(
+        self,
+        key: Tuple[str, int],
+        missing_full: Set[bytes],
+        all_receipts: Sequence[ServiceReceipt],
+    ) -> bool:
+        """Require authorized observed work overlapping every full 503 window."""
+
+        if not missing_full:
+            return False
+        observed = [
+            interval
+            for receipt in all_receipts
+            if int(getattr(receipt, "tokens_generated", 0) or 0) > 0
+            and (
+                interval := receipt_observed_interval(receipt)
+            ) is not None
+            and interval[1] > interval[0]
+        ]
+        if not observed:
+            return False
+        records = self._busy_skip_probations.get(key, [])
+        for obligation_id in missing_full:
+            windows = [
+                (start, end)
+                for start, end, kind, recorded_id in records
+                if kind == "full" and recorded_id == obligation_id
+            ]
+            if not windows:
+                return False
+            for start, end in windows:
+                if not any(
+                    receipt_start <= end and receipt_end >= start
+                    for receipt_start, receipt_end in observed
+                ):
+                    return False
+        return True
+
+    @staticmethod
+    def _may_defer_full_context_obligations(
+        *,
+        missing_low: Set[bytes],
+        missing_full: Set[bytes],
+        prior_full_debt: bool,
+        suppress_probation: bool,
+        busy_evidence_covers: bool,
+    ) -> bool:
+        """Permit one authenticated-busy deferral, never a rolling rollover."""
+
+        return bool(
+            missing_full
+            and not missing_low
+            and not prior_full_debt
+            and not suppress_probation
+            and busy_evidence_covers
+        )
 
     def _capacity_audit_drained_keys(self) -> Set[Tuple[str, int]]:
         """Return endpoint slots currently drained for a capacity audit window."""
@@ -3579,8 +6236,17 @@ class ValidatorNeuron:
         block_number: Optional[int] = None,
         phase: str = "audit_gate_503",
     ) -> bool:
-        """Requeue one canary after the miner's local audit gate rejected it."""
+        """Requeue only when our own state authenticates the audit drain.
+
+        The peer's HTTP 503 body is diagnostic input, never authority for an
+        unscored deferral. Without an active validator-owned drain for this
+        exact miner/model slot, the response follows the ordinary bounded
+        busy path and cannot erase the canary obligation.
+        """
         if not self._canary_epoch_active(epoch_number):
+            return False
+        key = self._miner_model_key(test.miner_address, test.model_index)
+        if not self._capacity_audit_key_drained(key):
             return False
         if block_number is None:
             block_number = int(self._last_known_block or self._epoch_start_block or 0)
@@ -3927,6 +6593,11 @@ class ValidatorNeuron:
             self._canary_scheduler = None
             return
 
+        self._migrate_full_context_debt_for_registrations(
+            previous_miners,
+            self._epoch_miners,
+        )
+
         # Persist discovered miners to DB
         for miner in self._epoch_miners:
             self._db.upsert_entry(
@@ -3979,7 +6650,21 @@ class ValidatorNeuron:
         unique_models = {m.model_id for m in self._epoch_miners}
         for model_id in unique_models:
             try:
-                spec = self._model_client.get_model_spec(model_id)
+                exact_reader = getattr(
+                    self._model_client, "get_on_chain_model_spec", None
+                )
+                if callable(exact_reader):
+                    from verallm.chain.types import on_chain_to_model_spec
+
+                    exact_spec = exact_reader(model_id)
+                    if exact_spec is None:
+                        self._on_chain_model_spec_cache.pop(model_id, None)
+                        spec = None
+                    else:
+                        self._on_chain_model_spec_cache[model_id] = exact_spec
+                        spec = on_chain_to_model_spec(exact_spec)
+                else:
+                    spec = self._model_client.get_model_spec(model_id)
                 if spec is not None:
                     self._model_spec_cache[model_id] = spec
                     bt.logging.info(f"Cached ModelSpec for {model_id}")
@@ -3994,8 +6679,19 @@ class ValidatorNeuron:
                 else:
                     bt.logging.warning(f"Failed to fetch ModelSpec for {model_id}: {e} — no cache available")
 
-        # Reset expected receipt counts, busy-skip tracker, and canary error tracker
+        self._refresh_remote_proof_v2_manifests(unique_models)
+
+        # Reset per-epoch attempt state. Exact obligations are registered after
+        # the scheduler has produced the signed-policy plan.
         self._expected_receipts = {}
+        self._expected_canary_obligations = {}
+        self._validator_canary_failures = set()
+        self._canary_penalized_keys = set()
+        self._shared_hard_proof_verdicts = {}
+        with self._shared_hard_prefetch_lock:
+            self._shared_hard_prefetch_results = {}
+            self._shared_hard_prefetch_inflight = set()
+            self._shared_hard_prefetch_waves = set()
         self._busy_skips = {}
         self._busy_skip_probations = {}
         self._canary_errors: Dict[Tuple[str, int], int] = {}
@@ -4018,28 +6714,182 @@ class ValidatorNeuron:
                     miner.tee_enabled = False
                     miner.tee_platform = ""
 
-        # Plan canary tests (probation entries get 100% proof verification)
+        # Plan the exact authority-signed inventory. An unsigned hosted config
+        # must not silently inflate the official canary load or scoring budget.
+        # The built-in compatibility path retains the protocol's 2+1 floor.
+        canary_policy = getattr(self, "_proof_v3_canary_policy", None)
+        hard_audit_enabled = _proof_v3_hard_auditor_active(
+            self.config,
+            self._validator_hotkey_ss58,
+        )
+        low_count, advertised_light_count, full_count = _effective_canary_counts(
+            self.config,
+            canary_policy,
+            hard_audit_enabled=hard_audit_enabled,
+        )
+        if (
+            self._configured_proof_v3_verdict_source() == "verify"
+            and getattr(
+                self.config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+            and not hard_audit_enabled
+        ):
+            bt.logging.warning(
+                "This validator is in verify mode but is not the active "
+                "subnet-configured hard auditor; scheduling light canaries "
+                "and independently verifying retained hard bundles"
+            )
+        # Candidate timing covers the complete epoch. A hard request that has
+        # already started may finish across a scoring boundary; unfinished
+        # validator work is neutral for the closed epoch, never a miner miss.
+        low_completion_reserve_blocks = 1
+        full_completion_reserve_blocks = 1
+        hard_audit_drought_epochs = (
+            int(canary_policy.max_hard_audit_drought_epochs)
+            if canary_policy is not None
+            else 2
+        )
+        hard_audit_due_entries = (
+            self._hard_audit_due_entries(
+                epoch_number=epoch_number,
+                drought_epochs=hard_audit_drought_epochs,
+            )
+            if hard_audit_enabled
+            else set()
+        )
         self._canary_scheduler = CanaryScheduler(
             epoch_number=epoch_number,
             epoch_start_block=epoch_start_block,
             epoch_blocks=self.config.epoch_blocks,
             validator_hotkey=self._wallet.hotkey.ss58_address,
             validator_seed=self._validator_private_key,
-            small_count=self.config.canary_small_count,
-            full_context_count=self.config.canary_full_context_count,
-            proof_sample_rate=self.config.canary_proof_sample_rate,
+            small_count=low_count,
+            advertised_context_light_count=advertised_light_count,
+            full_context_count=full_count,
+            proof_sample_rate=1.0,
             probation_entries={
                 (addr, idx)
                 for addr, indices in self._db.get_probation_addresses().items()
                 for idx in indices
             },
+            low_context_min_tokens=(
+                canary_policy.low_context_min_tokens
+                if canary_policy is not None
+                else 512
+            ),
+            low_context_max_tokens=(
+                canary_policy.low_context_max_tokens
+                if canary_policy is not None
+                else 2_048
+            ),
+            low_context_max_decode_tokens=(
+                canary_policy.low_context_max_decode_tokens
+                if canary_policy is not None
+                else 192
+            ),
+            full_context_decode_reserve_tokens=(
+                canary_policy.full_context_decode_reserve_tokens
+                if canary_policy is not None
+                else 256
+            ),
+            full_context_max_decode_tokens=(
+                canary_policy.full_context_max_decode_tokens
+                if canary_policy is not None
+                else 96
+            ),
+            full_context_max_attempts=(
+                canary_policy.full_context_max_attempts
+                if canary_policy is not None
+                else 4
+            ),
+            hard_candidate_target_per_epoch=(
+                canary_policy.hard_auditor_candidate_target_per_epoch
+                if canary_policy is not None
+                else 2
+            ),
+            hard_candidate_bps=(
+                canary_policy.hard_auditor_candidate_hard_bps
+                if canary_policy is not None
+                else 5_000
+            ),
+            advertised_context_target_bps=(
+                canary_policy.advertised_context_target_bps
+                if canary_policy is not None
+                else 9_000
+            ),
+            hard_decode_anchor_bps=(
+                canary_policy.hard_decode_anchor_bps
+                if canary_policy is not None
+                else 2_500
+            ),
+            hard_decode_tail_bps=(
+                canary_policy.hard_decode_tail_bps
+                if canary_policy is not None
+                else 1_000
+            ),
+            late_decode_min_output_bps=(
+                canary_policy.late_decode_min_output_bps
+                if canary_policy is not None
+                else 9_000
+            ),
+            repeat_prefix_target_bps=(
+                canary_policy.repeat_prefix_target_bps
+                if canary_policy is not None
+                else 5_000
+            ),
+            repeat_prefix_min_tokens=(
+                canary_policy.repeat_prefix_min_tokens
+                if canary_policy is not None
+                else 256
+            ),
+            hard_audit_enabled=hard_audit_enabled,
+            hard_audit_due_entries=hard_audit_due_entries,
+            low_completion_reserve_blocks=(
+                low_completion_reserve_blocks
+            ),
+            full_completion_reserve_blocks=(
+                full_completion_reserve_blocks
+            ),
+            hard_context_limits_by_model={
+                str(model_id): int(
+                    release.qualified_profile.profile.max_verified_context_tokens
+                )
+                for model_id, release in getattr(
+                    self,
+                    "_proof_v3_releases",
+                    {},
+                ).items()
+            },
+            hard_decode_limits_by_model={
+                str(model_id): int(model_policy.max_hard_audit_decode_tokens)
+                for model_id in getattr(
+                    self,
+                    "_proof_v3_releases",
+                    {},
+                )
+                for model_policy in (
+                    (
+                        canary_policy.model_policy(str(model_id))
+                        if canary_policy is not None
+                        else None
+                    ),
+                )
+                if model_policy is not None
+            },
         )
         tests = self._canary_scheduler.plan_epoch(self._epoch_miners)
+        self._register_canary_obligations(tests)
 
         elapsed = time.monotonic() - t0
         _unique_miners = len({m.address for m in self._epoch_miners})
         _unique_endpoints = len(self._epoch_miners)
         bt.logging.info(f"Epoch {epoch_number}: planned {len(tests)} canary tests for {_unique_miners} miners ({_unique_endpoints} endpoints) ({elapsed:.1f}s)")
+        bt.logging.info(
+            f"Epoch {epoch_number}: canary schedule spans the complete epoch; "
+            "started hard audits may finish across its scoring boundary"
+        )
         # Per-miner-endpoint summary (much more readable than per-test lines)
         _summary: dict[tuple, dict] = {}
         for t in tests:
@@ -4063,38 +6913,166 @@ class ValidatorNeuron:
 
     def _dispatch_canary_tests(self, tests: List[CanaryTest]):
         """Dispatch canary tests to executor — non-blocking; errors via done-callback."""
-        def _on_done(test, future):
+        dispatch_epoch = int(self._current_epoch)
+
+        def _on_done(label, future):
             try:
                 future.result()
             except Exception as e:
                 bt.logging.info(
-                    f"Canary test failed for {test.miner_address[:10]} model={test.model_id}: {e}"
+                    f"Canary test failed for {label}: {e}"
                 )
 
+        paired: Dict[str, List[CanaryTest]] = {}
+        independent: List[CanaryTest] = []
         for test in tests:
-            future = self._executor.submit(
-                self._execute_canary_test, test, self._current_epoch,
+            pair_id = str(getattr(test, "full_pair_id", "") or "")
+            if pair_id:
+                paired.setdefault(pair_id, []).append(test)
+            else:
+                independent.append(test)
+
+        for pair_id, members in paired.items():
+            if (
+                len(members) != 2
+                or {int(item.full_pair_slot) for item in members} != {0, 1}
+                or {bool(item.verify_proof) for item in members}
+                != {False, True}
+                or any(item.test_type != "full_context" for item in members)
+            ):
+                raise _ProofV3ValidatorConfigurationError(
+                    "proof-v3 full-pair dispatch is incomplete"
+                )
+            pair_targets = {
+                (
+                    item.miner_address.lower(),
+                    item.miner_endpoint,
+                    item.model_id,
+                    int(item.model_index),
+                    int(item.target_block),
+                    item.full_pair_id,
+                    int(item.full_pair_hold_seconds),
+                )
+                for item in members
+            }
+            if len(pair_targets) != 1:
+                raise _ProofV3ValidatorConfigurationError(
+                    "proof-v3 full-pair dispatch metadata disagrees"
+                )
+            ordered = tuple(
+                sorted(members, key=lambda item: item.full_pair_slot)
             )
-            future.add_done_callback(lambda f, t=test: _on_done(t, f))
+            for item in ordered:
+                self._mark_canary_queued(
+                    dispatch_epoch,
+                    self._miner_model_key(
+                        item.miner_address,
+                        item.model_index,
+                    ),
+                    item,
+                )
+            future = self._executor.submit(
+                self._execute_canary_full_pair,
+                ordered,
+                dispatch_epoch,
+            )
+            label = (
+                f"{ordered[0].miner_address[:10]} "
+                f"model={ordered[0].model_id} pair={pair_id[:12]}"
+            )
+            future.add_done_callback(
+                lambda f, value=label: _on_done(value, f)
+            )
+
+        for test in independent:
+            self._mark_canary_queued(
+                dispatch_epoch,
+                self._miner_model_key(
+                    test.miner_address,
+                    test.model_index,
+                ),
+                test,
+            )
+            future = self._executor.submit(
+                self._execute_canary_test, test, dispatch_epoch,
+            )
+            label = f"{test.miner_address[:10]} model={test.model_id}"
+            future.add_done_callback(
+                lambda f, value=label: _on_done(value, f)
+            )
+
+    def _execute_canary_full_pair(
+        self,
+        tests: Tuple[CanaryTest, CanaryTest],
+        epoch_number: int,
+    ) -> None:
+        """Run one full pair in two workers while serializing their inference."""
+
+        failures: List[Exception] = []
+        lock = threading.Lock()
+        barrier = self._proof_v3_full_pair_barrier(tests[0])
+        if self._proof_v3_full_pair_barrier(tests[1]) is not barrier:
+            raise _ProofV3ValidatorConfigurationError(
+                "proof-v3 full-pair did not share one barrier"
+            )
+
+        def _run(test: CanaryTest) -> None:
+            try:
+                self._execute_canary_test(test, epoch_number)
+            except Exception as exc:
+                with lock:
+                    failures.append(exc)
+            finally:
+                try:
+                    barrier.worker_completed(int(test.full_pair_slot))
+                finally:
+                    self._release_proof_v3_full_pair_barrier(test, barrier)
+
+        workers = tuple(
+            threading.Thread(
+                target=_run,
+                args=(test,),
+                name=(
+                    "proof-v3-full-pair-"
+                    f"{test.full_pair_id[:8]}-{test.full_pair_slot}"
+                ),
+                daemon=True,
+            )
+            for test in tests
+        )
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        if failures:
+            raise RuntimeError(
+                "proof-v3 full-pair worker failed"
+            ) from failures[0]
 
     def _execute_canary_test(self, test: CanaryTest, epoch_number: int):
-        """Execute a single canary test: inference + optional proof verify + push receipt.
+        """Serialize only hard proving work for one endpoint."""
 
-        Runs in a thread pool worker.  Uses POST /chat (same endpoint as
-        organic proxy traffic) with randomized enable_thinking so miners
-        cannot fingerprint canaries.
+        if not bool(test.verify_proof):
+            return self._execute_canary_test_unlocked(test, epoch_number)
+        lock = self._proof_v3_hard_execution_lock(test)
+        with lock:
+            return self._execute_canary_test_unlocked(test, epoch_number)
 
-        Retries up to 3 times on HTTP 503 (miner busy) with exponential
-        backoff.  A legitimately busy miner frees up in seconds; a fake-503
-        evader would have to refuse every retry across the entire epoch.
+    def _execute_canary_test_unlocked(
+        self,
+        test: CanaryTest,
+        epoch_number: int,
+    ):
+        """Execute or randomly reschedule one exact canary obligation.
 
-        Additionally retries once on transport errors (RemoteProtocolError,
-        ReadError/Timeout, ConnectError/Timeout, WriteError) — a single TCP
-        glitch mid-stream on the full_context canary otherwise loses a
-        heavy receipt and craters the per-epoch throughput² score.
+        A 503 received before any proof-v3 precommit is a busy signal, not a
+        completed test. Low obligations are rescheduled within the same epoch;
+        full-context obligations receive the signed bounded number of attempts.
+        Once a precommit is frozen, the proof-v3 transport converts peer
+        abandonment into ``ProofV3PeerFailure`` and this wrapper never retries
+        or grants busy forgiveness.
         """
         import httpx as _httpx
-
         transport_retry_exc = (
             _httpx.RemoteProtocolError,
             _httpx.ReadError,
@@ -4104,6 +7082,9 @@ class ValidatorNeuron:
             _httpx.ConnectTimeout,
         )
 
+        key = self._miner_model_key(test.miner_address, test.model_index)
+        self._mark_canary_dequeued(epoch_number, key)
+
         if not self._canary_epoch_active(epoch_number):
             bt.logging.debug(
                 f"Skipping stale canary for {test.miner_address[:10]} "
@@ -4112,7 +7093,80 @@ class ValidatorNeuron:
             )
             return
 
-        key = self._miner_model_key(test.miner_address, test.model_index)
+        def _record_precommit_busy(
+            attempt_started: float,
+            attempt_finished: float,
+        ) -> None:
+            if not self._canary_epoch_active(epoch_number):
+                # A request dispatched before the score boundary has a bounded
+                # admission deadline. Delaying a precommit-free 503 across the
+                # boundary cannot turn miner-controlled latency into neutral
+                # validator work, regardless of the hidden hard/light mark.
+                if self._canary_execution_active(test, epoch_number):
+                    bt.logging.info(
+                        "Cross-epoch canary returned precommit busy "
+                        f"after its admission window for "
+                        f"{test.miner_address[:10]} "
+                        f"model_index={test.model_index}"
+                    )
+                    if bool(test.verify_proof):
+                        self._record_hard_audit_failure(
+                            source_epoch=epoch_number,
+                            miner_address=test.miner_address,
+                            model_id=test.model_id,
+                            model_index=test.model_index,
+                            obligation_id=bytes.fromhex(
+                                test.obligation_id
+                            ),
+                            failure_code="late_precommit_busy",
+                        )
+                    self._on_proof_failure(
+                        test.miner_address,
+                        test.model_index,
+                        endpoint=test.miner_endpoint,
+                    )
+                return
+            kind = "full" if test.test_type == "full_context" else "low"
+            test.rejection_intervals.append(
+                (attempt_started, attempt_finished)
+            )
+            self._busy_skips[key] = self._busy_skips.get(key, 0) + 1
+            self._busy_skip_probations.setdefault(key, []).append(
+                (
+                    attempt_started,
+                    attempt_finished,
+                    kind,
+                    bytes.fromhex(test.obligation_id),
+                )
+            )
+            may_retry = (
+                kind == "low"
+                or test.attempt_count < max(2, int(test.max_attempts or 0))
+            )
+            rescheduled = False
+            if may_retry and self._canary_epoch_active(epoch_number):
+                current_block = int(
+                    getattr(self, "_last_known_block", 0)
+                    or self._epoch_start_block
+                )
+                with self._canary_scheduler_lock:
+                    scheduler = self._canary_scheduler
+                    if (
+                        scheduler is not None
+                        and scheduler.epoch_number == epoch_number
+                    ):
+                        rescheduled = scheduler.reschedule(
+                            test,
+                            current_block=current_block,
+                        )
+            bt.logging.info(
+                f"Canary precommit busy for {test.miner_address[:10]} "
+                f"model={test.model_id} kind={kind} "
+                f"attempt={test.attempt_count}/"
+                f"{test.max_attempts if kind == 'full' else 'epoch'} "
+                f"rescheduled={rescheduled}"
+            )
+
         if self._requeue_capacity_audit_canary(
             test,
             epoch_number,
@@ -4120,81 +7174,399 @@ class ValidatorNeuron:
         ):
             return
 
+        # Mark exact execution identity first so an epoch boundary between
+        # dequeue and HTTP setup cannot misclassify this as unstarted work.
+        self._mark_cross_epoch_canary_started(test, epoch_number)
         self._mark_canary_started(epoch_number, key)
 
         try:
-            max_retries = 3
-            last_exc = None
-            for attempt in range(max_retries + 1):
-                if not self._canary_epoch_active(epoch_number):
-                    bt.logging.debug(
-                        f"Aborting stale canary retry for {test.miner_address[:10]} "
-                        f"model_index={test.model_index}: test_epoch={epoch_number}, "
-                        f"current_epoch={self._current_epoch}"
-                    )
-                    return
-                if self._requeue_capacity_audit_canary(
+            if not self._canary_execution_active(test, epoch_number):
+                return
+            if self._requeue_capacity_audit_canary(
+                test,
+                epoch_number,
+                phase=f"attempt_{test.attempt_count + 1}",
+            ):
+                return
+            test.attempt_count += 1
+            attempt_started = time.time()
+            try:
+                return self._execute_canary_test_once(
                     test,
                     epoch_number,
-                    phase=f"retry_{attempt}",
-                ):
-                    self._decrement_expected_receipt(epoch_number, key)
-                    return
-                try:
-                    return self._execute_canary_test_once(
-                        test, epoch_number, _transport_retry_allowed=True,
-                    )
-                except _httpx.HTTPStatusError as e:
-                    if e.response.status_code == 503 and attempt < max_retries:
-                        wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
-                        bt.logging.info(f"Canary retry {attempt + 1}/{max_retries} (miner busy) for {test.miner_address[:10]}, waiting {wait}s")
-                        import time as _time
-                        _time.sleep(wait)
-                        last_exc = e
-                        continue
-                    raise  # non-503 — let _execute_canary_test_once handle it
-                except transport_retry_exc as e:
-                    # One-shot transport retry — call inner again with
-                    # _transport_retry_allowed=False so a second failure falls
-                    # through to its normal error-bookkeeping path.
-                    _uid_tr = self._db.get_uid(test.miner_address)
-                    _uid_tr_s = f"UID {_uid_tr}" if _uid_tr is not None else "UID ?"
-                    bt.logging.info(
-                        f"Canary transport retry for {_uid_tr_s} {test.miner_address[:10]} "
-                        f"(type={test.test_type}): {type(e).__name__} — waiting 5s"
-                    )
-                    import time as _time
-                    _time.sleep(5)
-                    return self._execute_canary_test_once(
-                        test, epoch_number, _transport_retry_allowed=False,
-                    )
-                except Exception:
-                    raise  # non-HTTP errors — let inner handler deal with it
-
-            # All retries exhausted on 503 — handle as busy skip
-            if last_exc is not None:
-                if not self._canary_epoch_active(epoch_number):
-                    return
-                if self._is_capacity_audit_http_503(last_exc):
+                    _transport_retry_allowed=True,
+                )
+            except _httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 503:
+                    raise
+                attempt_finished = time.time()
+                if self._is_capacity_audit_http_503(exc):
                     if self._requeue_capacity_audit_gate_canary(
                         test,
                         epoch_number,
-                        phase="retry_exhausted",
+                        phase="precommit_busy",
                     ):
-                        self._decrement_expected_receipt(epoch_number, key)
                         return
-                bt.logging.info(f"Canary failed after {max_retries} retries (miner busy) for {test.miner_address[:10]} model={test.model_id}")
-                reject_ts = int(time.time())
-                self._decrement_expected_receipt(epoch_number, key)
-                self._busy_skips[key] = self._busy_skips.get(key, 0) + 1
-                # Record 503 timestamp for temporal overlap check at epoch close
-                self._busy_skip_probations.setdefault(key, []).append(reject_ts)
-                if self._busy_skips[key] > 3:
-                    # Logged only — penalty is deferred to epoch close where
-                    # organic receipts can prove the miner was genuinely busy.
-                    bt.logging.info(f"Miner {test.miner_address[:10]} model_index={test.model_index} returned 503 on {self._busy_skips[key]} canaries (>3 after retries) — will evaluate at epoch close")
+                _record_precommit_busy(attempt_started, attempt_finished)
+                return
+            except transport_retry_exc as exc:
+                # The proof-v3 exchange reclassifies post-precommit transport
+                # loss as a peer proof failure. Only a precommit-free network
+                # glitch reaches here and receives one immediate retry.
+                bt.logging.info(
+                    f"Canary precommit transport retry for "
+                    f"{test.miner_address[:10]} type={test.test_type}: "
+                    f"{type(exc).__name__}"
+                )
+                return self._execute_canary_test_once(
+                    test,
+                    epoch_number,
+                    _transport_retry_allowed=False,
+                )
         finally:
-            self._mark_canary_finished(epoch_number, key)
+            self._mark_cross_epoch_canary_finished(test, epoch_number)
+            self._mark_canary_finished(epoch_number, key, test)
+
+    def _proof_v3_release_for_canary(self, test: CanaryTest):
+        """Return the exact qualified release for one v3 light/hard canary."""
+
+        release = getattr(self, "_proof_v3_releases", {}).get(test.model_id)
+        policy = getattr(self, "_proof_v3_canary_policy", None)
+        rollout = getattr(self, "_proof_protocol_rollout_cfg", None)
+        if rollout is None:
+            rollout = proof_protocol_rollout_config_from_neuron_config(
+                self.config
+            )
+        locally_ready = [LEGACY_PROOF_PROTOCOL_VERSION]
+        if release is not None and policy is not None:
+            locally_ready.append(PROOF_PROTOCOL_V3)
+        advertised_versions = tuple(
+            int(version)
+            for version in (test.proof_protocol_versions or (1,))
+        )
+        selected = select_proof_protocol_version(
+            rollout,
+            locally_supported=tuple(locally_ready),
+            peer_advertised=advertised_versions,
+        )
+        any_local_allowed = any(
+            proof_protocol_allowed(rollout, version)
+            for version in locally_ready
+        )
+        if selected is None and not any_local_allowed:
+            raise _ProofV3ValidatorConfigurationError(
+                "subnet allows no proof protocol supported by this validator"
+            )
+        if selected is None:
+            from verallm.api.proof_v3_validator import ProofV3PeerFailure
+
+            raise ProofV3PeerFailure(
+                "miner advertises no mutually supported allowed proof protocol"
+            )
+        if selected == LEGACY_PROOF_PROTOCOL_VERSION:
+            return None
+        if selected != PROOF_PROTOCOL_V3:
+            raise _ProofV3ValidatorConfigurationError(
+                "selected proof protocol is unsupported by this validator"
+            )
+        assert release is not None and policy is not None
+        model_policy = policy.model_policy(test.model_id)
+        if model_policy is None:
+            raise _ProofV3ValidatorConfigurationError(
+                "signed canary policy does not cover the selected model"
+            )
+        profile = release.qualified_profile.profile
+        if model_policy.execution_profile_digest != profile.digest():
+            raise _ProofV3ValidatorConfigurationError(
+                "signed canary policy profile binding is stale"
+            )
+        quant = str(getattr(test, "quant", "") or "").strip().lower()
+        if not quant or quant not in model_policy.allowed_quantizations:
+            from verallm.api.proof_v3_validator import ProofV3PeerFailure
+
+            raise ProofV3PeerFailure(
+                "advertised quantization is not qualified by the signed v3 policy"
+            )
+        if (
+            test.verify_proof
+            and int(getattr(test, "target_prompt_tokens", 0) or 0)
+            > int(profile.max_verified_context_tokens)
+        ):
+            raise _ProofV3ValidatorConfigurationError(
+                "hard canary target exceeds the signed v3 profile"
+            )
+        return release
+
+    def _proof_v3_quant_qualified(self, miner: ActiveMiner) -> bool:
+        """Check the advertised quant against the authenticated v3 release."""
+
+        release = getattr(self, "_proof_v3_releases", {}).get(miner.model_id)
+        policy = getattr(self, "_proof_v3_canary_policy", None)
+        rollout = getattr(self, "_proof_protocol_rollout_cfg", None)
+        if rollout is None:
+            rollout = proof_protocol_rollout_config_from_neuron_config(
+                self.config
+            )
+        locally_ready = [LEGACY_PROOF_PROTOCOL_VERSION]
+        if release is not None and policy is not None:
+            locally_ready.append(PROOF_PROTOCOL_V3)
+        selected = select_proof_protocol_version(
+            rollout,
+            locally_supported=tuple(locally_ready),
+            peer_advertised=tuple(
+                int(version)
+                for version in (
+                    getattr(miner, "proof_protocol_versions", ()) or (1,)
+                )
+            ),
+        )
+        if selected == LEGACY_PROOF_PROTOCOL_VERSION:
+            return True
+        if selected != PROOF_PROTOCOL_V3 or release is None or policy is None:
+            return False
+        model_policy = policy.model_policy(miner.model_id)
+        if model_policy is None:
+            return False
+        return bool(
+            model_policy.execution_profile_digest
+            == release.qualified_profile.profile.digest()
+            and str(getattr(miner, "quant", "") or "").strip().lower()
+            in model_policy.allowed_quantizations
+        )
+
+    def _proof_v3_full_pair_barrier(
+        self,
+        test: CanaryTest,
+    ) -> _ProofV3FullPairBarrier:
+        pair_id = str(getattr(test, "full_pair_id", "") or "")
+        hold_seconds = int(
+            getattr(test, "full_pair_hold_seconds", 0) or 0
+        )
+        lock = getattr(self, "_proof_v3_full_pair_barriers_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._proof_v3_full_pair_barriers_lock = lock
+            self._proof_v3_full_pair_barriers = {}
+        with lock:
+            barriers = self._proof_v3_full_pair_barriers
+            barrier = barriers.get(pair_id)
+            if barrier is None:
+                barrier = _ProofV3FullPairBarrier(pair_id, hold_seconds)
+                barriers[pair_id] = barrier
+            elif barrier.hold_seconds != hold_seconds:
+                raise _ProofV3ValidatorConfigurationError(
+                    "proof-v3 full-pair hold deadlines disagree"
+                )
+            return barrier
+
+    def _release_proof_v3_full_pair_barrier(
+        self,
+        test: CanaryTest,
+        barrier: _ProofV3FullPairBarrier,
+    ) -> None:
+        if not barrier.depart(int(test.full_pair_slot)):
+            return
+        lock = self._proof_v3_full_pair_barriers_lock
+        with lock:
+            if self._proof_v3_full_pair_barriers.get(
+                test.full_pair_id
+            ) is barrier:
+                self._proof_v3_full_pair_barriers.pop(
+                    test.full_pair_id,
+                    None,
+                )
+
+    def _claim_proof_v3_pair_failure_attribution(
+        self,
+        test: CanaryTest,
+    ) -> bool:
+        pair_id = str(getattr(test, "full_pair_id", "") or "")
+        if not pair_id:
+            return True
+        lock = getattr(self, "_proof_v3_full_pair_barriers_lock", None)
+        if lock is None:
+            return True
+        with lock:
+            barrier = self._proof_v3_full_pair_barriers.get(pair_id)
+        if barrier is None:
+            return True
+        return barrier.claim_failure_attribution()
+
+    def _run_proof_v3_canary(
+        self,
+        *,
+        client: ValidatorClient,
+        test: CanaryTest,
+        messages: list[dict],
+        qualified_release,
+        prompt_token_ids: Optional[Sequence[int]] = None,
+    ):
+        """Execute one nonce-free light or authorized hard v3 canary."""
+
+        try:
+            if prompt_token_ids is None:
+                prompt_token_ids = _tokenize_proof_v3_chat(
+                    test.model_id,
+                    messages,
+                    enable_thinking=test.enable_thinking,
+                )
+            else:
+                prompt_token_ids = tuple(int(value) for value in prompt_token_ids)
+            miner_hotkey = self._get_miner_ss58(
+                test.miner_address,
+                "hotkey",
+            )
+            if not miner_hotkey:
+                raise RuntimeError(
+                    "proof-v3 miner hotkey identity is unavailable"
+                )
+            from verallm.proof_v3.request import (
+                miner_hotkey_identity_digest_v3,
+                validator_hotkey_identity_digest_v3,
+            )
+
+            validator_identity = validator_hotkey_identity_digest_v3(
+                self._validator_hotkey_ss58
+            )
+            miner_identity = miner_hotkey_identity_digest_v3(miner_hotkey)
+            runtime_policy = _proof_v3_canary_runtime_policy(
+                qualified_release,
+                hard_audit=bool(test.verify_proof),
+            )
+        except Exception as exc:
+            raise _ProofV3ValidatorConfigurationError(
+                "proof-v3 canary preflight failed"
+            ) from exc
+
+        request_kwargs = {
+            "messages": messages,
+            "prompt_token_ids": prompt_token_ids,
+            "qualified_profile": qualified_release.qualified_profile,
+            "validator_identity_digest": validator_identity,
+            "miner_identity_digest": miner_identity,
+            "runtime_policy": runtime_policy,
+            "max_new_tokens": test.max_new_tokens,
+            "enable_thinking": test.enable_thinking,
+            "presence_penalty": float(test.presence_penalty or 0.0),
+            "top_k": int(test.top_k if test.top_k is not None else -1),
+            "top_p": float(test.top_p or 1.0),
+            "min_p": 0.0,
+        }
+        pair_id = str(getattr(test, "full_pair_id", "") or "")
+        barrier = None
+        exchange = None
+        try:
+            if not pair_id:
+                result = client.run_chat_proof_v3(**request_kwargs)
+            else:
+                from verallm.api.proof_v3_validator import ProofV3PeerFailure
+                from verallm.proof_v3.errors import ProofV3UnavailableError
+
+                barrier = self._proof_v3_full_pair_barrier(test)
+                slot = int(getattr(test, "full_pair_slot", -1))
+                barrier.wait_for_inference_turn(slot)
+                exchange = client.run_chat_proof_v3_precommit(
+                    **request_kwargs,
+                    nonce_reveal_hold_budget_ns=(
+                        int(test.full_pair_hold_seconds) * 1_000_000_000
+                    ),
+                    expected_hard_audit=bool(test.verify_proof),
+                )
+                if slot == 0:
+                    # The first frozen record must survive the second full
+                    # inference. This authenticated hold reveals neither the
+                    # local tier decision nor the nonce.
+                    client.hold_chat_proof_v3_precommit(exchange)
+                decision = getattr(exchange, "audit_decision", None)
+                selected_hard = getattr(
+                    decision,
+                    "hard_audit_selected",
+                    None,
+                )
+                if type(selected_hard) is not bool or selected_hard != bool(
+                    test.verify_proof
+                ):
+                    exchange.fail_closed()
+                    raise _ProofV3ValidatorConfigurationError(
+                        "paired full-canary tier conditioning is inconsistent"
+                    )
+                barrier.mark_precommitted(
+                    slot,
+                    hard_audit=selected_hard,
+                    exchange=exchange,
+                )
+                barrier.wait_until_both_precommitted()
+                result = client.finalize_chat_proof_v3(exchange)
+            hard_audit = bool(test.verify_proof)
+            minimum_output = getattr(
+                test,
+                "minimum_observed_output_tokens",
+                0,
+            )
+            if (
+                isinstance(minimum_output, bool)
+                or not isinstance(minimum_output, int)
+                or minimum_output < 0
+                or minimum_output > int(test.max_new_tokens)
+            ):
+                raise _ProofV3ValidatorConfigurationError(
+                    "proof-v3 canary minimum output is malformed"
+                )
+            # Count the exact token-id sequence accumulated by the validator's
+            # SSE exchange. Never use a miner-reported aggregate count.
+            observed_output_tokens = len(result.output_token_ids)
+            if (
+                hard_audit
+                and minimum_output > 0
+                and observed_output_tokens < minimum_output
+            ):
+                from verallm.api.proof_v3_validator import ProofV3PeerFailure
+
+                raise ProofV3PeerFailure(
+                    "proof-v3 hard canary ended before its signed late-decode "
+                    f"position (observed={observed_output_tokens}, "
+                    f"required={minimum_output})"
+                )
+            if hard_audit and (
+                not result.audit_decision.hard_audit_selected
+                or not result.proof_verified
+            ):
+                from verallm.api.proof_v3_validator import ProofV3PeerFailure
+
+                raise ProofV3PeerFailure(
+                    "proof-v3 canary did not complete its mandatory hard audit"
+                )
+            if not hard_audit and (
+                result.audit_decision.hard_audit_selected
+                or result.proof_verified
+                or result.proof_wire_bytes
+            ):
+                raise _ProofV3ValidatorConfigurationError(
+                    "proof-v3 light canary unexpectedly entered the hard path"
+                )
+            if barrier is not None:
+                barrier.mark_completed(slot)
+            return result
+        except Exception as exc:
+            if barrier is not None:
+                if exchange is not None:
+                    exchange.fail_closed()
+                had_precommit = barrier.abort(exc)
+                if (
+                    had_precommit
+                    and not isinstance(
+                        exc,
+                        (
+                            _ProofV3ValidatorConfigurationError,
+                            ProofV3UnavailableError,
+                            ProofV3PeerFailure,
+                        ),
+                    )
+                ):
+                    raise ProofV3PeerFailure(
+                        "paired full canary failed after its first precommit"
+                    ) from exc
+            raise
 
     def _execute_canary_test_once(
         self,
@@ -4219,9 +7591,10 @@ class ValidatorNeuron:
             _httpx.ConnectTimeout,
         )
         verification_config = Config(block_size=256, spot_checks=25)
+        preparation_started = time.monotonic()
 
         try:
-            if not self._canary_epoch_active(epoch_number):
+            if not self._canary_execution_active(test, epoch_number):
                 bt.logging.debug(
                     f"Skipping stale canary before inference for {test.miner_address[:10]} "
                     f"model_index={test.model_index}: test_epoch={epoch_number}, "
@@ -4234,8 +7607,56 @@ class ValidatorNeuron:
                 epoch_number,
                 phase="pre_http",
             ):
-                self._decrement_expected_receipt(epoch_number, key)
                 return
+
+            bt.logging.info(
+                "Canary preparation started for "
+                f"{test.miner_address[:10]} model_index={test.model_index} "
+                f"kind={test.test_type} hard={bool(test.verify_proof)}"
+            )
+
+            prompt = test.prompt
+            prompt_token_ids: Optional[Sequence[int]] = None
+            if int(test.target_prompt_tokens or 0) > 0:
+                def _count_canary_tokens(text: str) -> int:
+                    return len(
+                        _tokenize_proof_v3_chat(
+                            test.model_id,
+                            [{"role": "user", "content": text}],
+                            enable_thinking=test.enable_thinking,
+                        )
+                    )
+
+                prompt, measured_prompt_tokens = materialize_canary_prompt(
+                    test,
+                    token_counter=_count_canary_tokens,
+                )
+                prompt_token_ids = _tokenize_proof_v3_chat(
+                    test.model_id,
+                    [{"role": "user", "content": prompt}],
+                    enable_thinking=test.enable_thinking,
+                )
+                if len(prompt_token_ids) != measured_prompt_tokens:
+                    raise _ProofV3ValidatorConfigurationError(
+                        "validator tokenizer did not retain the canary tokenization"
+                    )
+            bt.logging.info(
+                "Canary prompt prepared for "
+                f"{test.miner_address[:10]} model_index={test.model_index} "
+                f"tokens={len(prompt_token_ids) if prompt_token_ids is not None else 'compat'} "
+                f"elapsed={time.monotonic() - preparation_started:.3f}s"
+            )
+            messages = [{"role": "user", "content": prompt}]
+            proof_v3_release = ValidatorNeuron._proof_v3_release_for_canary(
+                self,
+                test,
+            )
+            bt.logging.info(
+                "Canary transport starting for "
+                f"{test.miner_address[:10]} model_index={test.model_index} "
+                f"protocol={'v3' if proof_v3_release is not None else 'v1'} "
+                f"elapsed={time.monotonic() - preparation_started:.3f}s"
+            )
 
             with ValidatorClient(
                 miner_url=test.miner_endpoint,
@@ -4251,33 +7672,78 @@ class ValidatorNeuron:
                 validator_hotkey_ss58=self._validator_hotkey_ss58,
                 validator_seed=self._validator_private_key,
             ) as client:
-                # Run inference through /chat (same endpoint as organic traffic)
-                do_sample = test.temperature > 0
+                # Hard canaries use the ordinary /chat surface but remain
+                # deterministic so the signed LM-head/token relation is exact.
+                do_sample = False
                 temperature = test.temperature
-                # Sampling proof verification rate for canaries:
-                #   - greedy (temp=0):  100% — existing argmax sampling proof
-                #   - sampled (temp>0): 100% — canonical replay path
-                # Both paths are end-to-end verified at canary time so the
-                # validator catches mode-conditional cheating where a miner
-                # serves honestly for greedy but biases the distribution for
-                # sampled requests.
                 sampling_bps = 10_000
                 enable_thinking = test.enable_thinking
-                messages = [{"role": "user", "content": test.prompt}]
-                full_text, commitment, proof_bundle, nonce, timing = client.run_chat(
-                    messages=messages,
-                    max_new_tokens=test.max_new_tokens,
-                    do_sample=do_sample,
-                    temperature=temperature,
-                    sampling_verification_bps=sampling_bps,
-                    enable_thinking=enable_thinking,
-                    presence_penalty=test.presence_penalty,
-                    top_k=test.top_k,
-                    top_p=test.top_p,
-                    allow_unbound_output_count=test.verify_tee,
+                proof_v3_result = None
+                if proof_v3_release is not None:
+                    proof_v3_result = self._run_proof_v3_canary(
+                        client=client,
+                        test=test,
+                        messages=messages,
+                        qualified_release=proof_v3_release,
+                        prompt_token_ids=prompt_token_ids,
+                    )
+                    full_text = proof_v3_result.text
+                    commitment = None
+                    proof_bundle = None
+                    nonce = None
+                    timing = {
+                        "validator_request_start_ts": (
+                            proof_v3_result.validator_request_start_ts
+                        ),
+                        "validator_request_end_ts": (
+                            proof_v3_result.validator_request_end_ts
+                        ),
+                        "validator_request_ms": (
+                            proof_v3_result.validator_request_ms
+                        ),
+                        "round_trip_ms": proof_v3_result.round_trip_ms,
+                        "ttft_ms": proof_v3_result.ttft_ms,
+                        "inference_ms": proof_v3_result.inference_ms,
+                        "input_tokens": proof_v3_result.input_tokens,
+                        "output_tokens": len(
+                            proof_v3_result.output_token_ids
+                        ),
+                        "commitment_ms": (
+                            proof_v3_result.last_token_to_precommit_ms
+                        ),
+                        "prove_ms": proof_v3_result.nonce_to_proof_ms,
+                        "proof_wire_bytes": proof_v3_result.proof_wire_bytes,
+                    }
+                    canary_commitment_hash = (
+                        proof_v3_result.commitment_envelope_digest
+                    )
+                else:
+                    full_text, commitment, proof_bundle, nonce, timing = client.run_chat(
+                        messages=messages,
+                        max_new_tokens=test.max_new_tokens,
+                        do_sample=do_sample,
+                        temperature=temperature,
+                        sampling_verification_bps=sampling_bps,
+                        enable_thinking=enable_thinking,
+                        presence_penalty=test.presence_penalty,
+                        top_k=test.top_k,
+                        top_p=test.top_p,
+                        allow_unbound_output_count=test.verify_tee,
+                        # Production rollout is direct v1 -> v3. Reaching this
+                        # branch means no qualified v3 route was selected, so
+                        # only bounded legacy compatibility may authorize it.
+                        proof_protocol_version=LEGACY_PROOF_PROTOCOL_VERSION,
+                    )
+                    canary_commitment_hash = commitment.commitment_hash()
+
+                bt.logging.info(
+                    "Canary transport completed for "
+                    f"{test.miner_address[:10]} model_index={test.model_index} "
+                    f"hard={bool(test.verify_proof)} "
+                    f"elapsed={time.monotonic() - preparation_started:.3f}s"
                 )
 
-                if not self._canary_epoch_active(epoch_number):
+                if not self._canary_execution_active(test, epoch_number):
                     bt.logging.debug(
                         f"Dropping stale canary result for {test.miner_address[:10]} "
                         f"model_index={test.model_index}: test_epoch={epoch_number}, "
@@ -4289,7 +7755,46 @@ class ValidatorNeuron:
                 proof_verified = False
                 proof_failure_reason = None
                 verify_timing = {}
-                if test.verify_proof:
+                if proof_v3_result is not None:
+                    proof_verified = bool(
+                        test.verify_proof and proof_v3_result.proof_verified
+                    )
+                    if proof_verified and test.verify_proof:
+                        self._record_hard_audit_pass(
+                            test,
+                            completion_epoch=int(self._current_epoch),
+                        )
+                    elif test.verify_proof:
+                        proof_failure_reason = (
+                            "proof-v3 hard audit did not verify"
+                        )
+                        self._record_hard_audit_failure(
+                            source_epoch=epoch_number,
+                            miner_address=test.miner_address,
+                            model_id=test.model_id,
+                            model_index=test.model_index,
+                            obligation_id=bytes.fromhex(
+                                test.obligation_id
+                            ),
+                            failure_code="post_precommit_failure",
+                        )
+                        self._on_proof_failure(
+                            test.miner_address,
+                            test.model_index,
+                            endpoint=test.miner_endpoint,
+                        )
+                        if self._canary_epoch_active(epoch_number):
+                            self._canary_penalized_keys.add(
+                                self._miner_model_key(
+                                    test.miner_address,
+                                    test.model_index,
+                                )
+                            )
+                    if proof_v3_result.verification_ms is not None:
+                        verify_timing["proof_v3"] = (
+                            proof_v3_result.verification_ms
+                        )
+                elif test.verify_proof:
                     try:
                         # Use epoch-cached ModelSpec (fetched once at epoch start)
                         # instead of client.fetch_model_spec() which makes an RPC
@@ -4310,6 +7815,10 @@ class ValidatorNeuron:
                                 raise RuntimeError("tokenizer drift, validator-side")
                             client.model_spec = cached_spec
                             client._auto_configure_from_spec(cached_spec)
+                            self._attach_verified_proof_v2_manifest(
+                                client,
+                                test.model_id,
+                            )
                         else:
                             # No cached spec — skip proof verification entirely.
                             # NEVER make an RPC call here; it 429s and then gets
@@ -4348,21 +7857,33 @@ class ValidatorNeuron:
                             min_p=float(getattr(test, 'min_p', 0.0) or 0.0),
                             presence_penalty=_expected_pp,
                         )
-                        result, verify_timing = client.verify_proof(
-                            proof_bundle, nonce,
-                            expected_sampling_verification_bps=sampling_bps,
-                            expected_do_sample=do_sample,
-                            expected_temperature=temperature,
-                            enable_thinking=enable_thinking,
-                            expected_input_commitment=expected_ic,
-                            expected_prompt_hash=expected_ph,
-                            expected_sampler_config_hash=_expected_scfg,
-                            # Pass raw sampling params so the canonical
-                            # replay (high_assurance) can use
-                            # them.  Bound separately by sampler_config_hash.
-                            expected_top_k=int(test.top_k or -1),
-                            expected_top_p=float(test.top_p or 1.0),
-                            expected_min_p=float(getattr(test, "min_p", 0.0) or 0.0),
+                        result, verify_timing, policy_decision = verify_with_proof_policy(
+                            proof_bundle,
+                            lambda: client.verify_proof(
+                                proof_bundle, nonce,
+                                expected_sampling_verification_bps=sampling_bps,
+                                expected_do_sample=do_sample,
+                                expected_temperature=temperature,
+                                enable_thinking=enable_thinking,
+                                expected_input_commitment=expected_ic,
+                                expected_prompt_hash=expected_ph,
+                                expected_sampler_config_hash=_expected_scfg,
+                                expected_presence_penalty=_expected_pp,
+                                # Pass raw sampling params so the canonical
+                                # replay (high_assurance) can use them. Bound
+                                # separately by sampler_config_hash.
+                                expected_top_k=int(test.top_k or -1),
+                                expected_top_p=float(test.top_p or 1.0),
+                                expected_min_p=float(
+                                    getattr(test, "min_p", 0.0) or 0.0
+                                ),
+                            ),
+                            legacy_v1_compatibility_active=self._legacy_v1_compatibility_active(
+                                current_epoch=epoch_number,
+                            ),
+                            expected_protocol_version=(
+                                LEGACY_PROOF_PROTOCOL_VERSION
+                            ),
                         )
                         proof_verified = result.passed
                         if not proof_verified:
@@ -4378,11 +7899,22 @@ class ValidatorNeuron:
                                 f"Proof failure | {_uid_str} {test.miner_address[:10]} "
                                 f"| model={test.model_id}: {result.message}",
                             )
+                            if not self._canary_execution_active(
+                                test,
+                                epoch_number,
+                            ):
+                                return
                             # Mid-epoch cutoff: immediately put on probation
                             # and update shared state so proxy stops routing
                             self._on_proof_failure(
                                 test.miner_address, test.model_index,
                                 endpoint=test.miner_endpoint,
+                            )
+                            self._canary_penalized_keys.add(
+                                self._miner_model_key(
+                                    test.miner_address,
+                                    test.model_index,
+                                )
                             )
                     except Exception as e:
                         bt.logging.warning(f"Proof verification skipped (validator-side error, NOT miner fault): {test.miner_address[:10]} — {e}")
@@ -4492,13 +8024,46 @@ class ValidatorNeuron:
                         bt.logging.info(f"TEE attestation verification failed for {test.miner_address[:10]}: {e}")
                         tee_attestation_verified = False
 
-                if not self._canary_epoch_active(epoch_number):
+                if not self._canary_execution_active(test, epoch_number):
                     bt.logging.debug(
                         f"Not pushing stale canary receipt for {test.miner_address[:10]} "
                         f"model_index={test.model_index}: test_epoch={epoch_number}, "
                         f"current_epoch={self._current_epoch}"
                     )
                     return
+                late_completion = not self._canary_epoch_active(
+                    epoch_number,
+                )
+                security_only_receipt = bool(
+                    late_completion and test.verify_proof
+                )
+                if late_completion:
+                    self._complete_cross_epoch_full_success(
+                        test,
+                        epoch_number,
+                    )
+                if security_only_receipt:
+                    self._reconcile_late_hard_probation_pass(
+                        test,
+                        epoch_number,
+                    )
+                    # Verification already completed above. The original
+                    # scoring epoch is immutable. Use the dedicated
+                    # hard-audit route so the receipt promotes the retained
+                    # bundle without entering throughput receipt accounting.
+                    bt.logging.info(
+                        "Proof-v3 hard audit completed after its scoring "
+                        f"boundary for {test.miner_address[:10]} "
+                        f"model_index={test.model_index}; verdict accepted, "
+                        "security-only receipt retained"
+                    )
+                elif late_completion:
+                    bt.logging.info(
+                        "Canary completed after its scoring boundary for "
+                        f"{test.miner_address[:10]} "
+                        f"model_index={test.model_index}; terminal success "
+                        "recorded without credit in a newer epoch"
+                    )
 
                 # Extract metrics from timing
                 ttft_ms = timing.get("ttft_ms", 0.0)
@@ -4511,14 +8076,13 @@ class ValidatorNeuron:
                     else 0.0
                 )
 
-                # On push failure, drop the expected count so integrity isn't penalized.
                 pushed_ok = self._push_receipt_to_miner(
                     miner_address=test.miner_address,
                     miner_endpoint=test.miner_endpoint,
                     model_id=test.model_id,
                     model_index=test.model_index,
                     epoch_number=epoch_number,
-                    commitment_hash=commitment.commitment_hash(),
+                    commitment_hash=canary_commitment_hash,
                     ttft_ms=ttft_ms,
                     tokens_generated=output_tokens,
                     generation_time_ms=inference_ms,
@@ -4531,10 +8095,20 @@ class ValidatorNeuron:
                     timestamp=int(observed_end_ts),
                     observed_start_ts=observed_start_ts,
                     observed_end_ts=observed_end_ts,
+                    canary_obligation_id=bytes.fromhex(test.obligation_id),
+                    canary_kind=(
+                        "full"
+                        if test.test_type == "full_context"
+                        else "low"
+                    ),
+                    canary_target_prompt_tokens=test.target_prompt_tokens,
+                    capture_chain_digest=(
+                        proof_v3_result.capture_chain_digest
+                        if proof_v3_result is not None
+                        else b""
+                    ),
+                    security_only=security_only_receipt,
                 )
-                if not pushed_ok:
-                    _key_pf = (test.miner_address, test.model_index)
-                    self._decrement_expected_receipt(epoch_number, _key_pf)
 
                 _uid_c = self._db.get_uid(test.miner_address)
                 _uid_cs = f"UID {_uid_c}" if _uid_c is not None else "UID ?"
@@ -4570,19 +8144,23 @@ class ValidatorNeuron:
                         inference_ms=inference_ms,
                         tokens_per_sec=tokens_per_sec,
                         prompt_tokens=input_tokens,
-                        proof_verified=1 if proof_verified else (0 if test.verify_proof else None),
+                        proof_verified=(
+                            1
+                            if proof_verified
+                            else (0 if test.verify_proof else None)
+                        ),
                         proof_failure_reason=proof_failure_reason,
                         prove_ms=timing.get("prove_ms"),
                         commitment_ms=timing.get("commitment_ms"),
                         verify_ms=sum(verify_timing.values()) if verify_timing else None,
-                        commitment_hash=commitment.commitment_hash().hex() if commitment else None,
+                        commitment_hash=canary_commitment_hash.hex(),
                         receipt_pushed=1 if pushed_ok else 0,
                     )
                 except Exception as _db_err:
                     bt.logging.debug(f"Failed to log canary result: {_db_err}")
 
         except Exception as e:
-            if not self._canary_epoch_active(epoch_number):
+            if not self._canary_execution_active(test, epoch_number):
                 bt.logging.debug(
                     f"Ignoring stale canary error for {test.miner_address[:10]} "
                     f"model_index={test.model_index}: test_epoch={epoch_number}, "
@@ -4598,6 +8176,94 @@ class ValidatorNeuron:
                 raise
             if _transport_retry_allowed and self._is_http_503(e):
                 raise
+            from verallm.api.proof_v3_validator import ProofV3PeerFailure
+            from verallm.proof_v3.errors import ProofV3UnavailableError
+
+            if isinstance(
+                e,
+                (_ProofV3ValidatorConfigurationError, ProofV3UnavailableError),
+            ):
+                bt.logging.warning(
+                    "Validator-side proof-v3 failure "
+                    f"(NOT attributed to miner {test.miner_address[:10]} "
+                    f"model={test.model_id}): {type(e).__name__}: {e}"
+                )
+                if self._canary_epoch_active(epoch_number):
+                    self._validator_canary_failures.add(
+                        self._miner_model_key(
+                            test.miner_address, test.model_index
+                        )
+                    )
+                return
+            if isinstance(e, ProofV3PeerFailure):
+                if not self._canary_execution_active(test, epoch_number):
+                    return
+                bt.logging.debug(
+                    f"Proof-v3 failure | {test.miner_address[:10]} "
+                    f"| model={test.model_id}: {e}"
+                )
+                if not self._claim_proof_v3_pair_failure_attribution(test):
+                    bt.logging.debug(
+                        "Proof-v3 paired failure already attributed | "
+                        f"{test.miner_address[:10]} | model={test.model_id}"
+                    )
+                    return
+                if bool(test.verify_proof):
+                    self._record_hard_audit_failure(
+                        source_epoch=epoch_number,
+                        miner_address=test.miner_address,
+                        model_id=test.model_id,
+                        model_index=test.model_index,
+                        obligation_id=bytes.fromhex(test.obligation_id),
+                        failure_code="post_precommit_failure",
+                    )
+                self._on_proof_failure(
+                    test.miner_address,
+                    test.model_index,
+                    endpoint=test.miner_endpoint,
+                )
+                if self._canary_epoch_active(epoch_number):
+                    self._canary_penalized_keys.add(
+                        self._miner_model_key(
+                            test.miner_address,
+                            test.model_index,
+                        )
+                    )
+                try:
+                    self._db.log_canary_result(
+                        network=self.config.subtensor_network or "unknown",
+                        chain_id=getattr(self.config, "chain_id", 0),
+                        netuid=self.config.netuid,
+                        epoch_number=epoch_number,
+                        block_number=self._last_known_block or 0,
+                        miner_address=test.miner_address,
+                        miner_uid=self._db.get_uid(test.miner_address),
+                        miner_hotkey_ss58=self._get_miner_ss58(
+                            test.miner_address,
+                            "hotkey",
+                        ),
+                        miner_coldkey_ss58=self._get_miner_ss58(
+                            test.miner_address,
+                            "coldkey",
+                        ),
+                        model_id=test.model_id,
+                        model_index=test.model_index,
+                        endpoint=test.miner_endpoint,
+                        test_type=test.test_type,
+                        test_index=test.test_index,
+                        proof_requested=1,
+                        enable_thinking=1 if test.enable_thinking else 0,
+                        temperature=test.temperature,
+                        max_new_tokens=test.max_new_tokens,
+                        status="proof_failed",
+                        proof_verified=0,
+                        proof_failure_reason=str(e)[:500],
+                    )
+                except Exception as db_error:
+                    bt.logging.debug(
+                        f"Failed to log proof-v3 failure: {db_error}"
+                    )
+                return
             # Validator-side sqlite3 errors must NEVER be attributed to the
             # miner.  A cross-thread Connection race ("bad parameter or
             # other API misuse") inside any of our DB helpers would
@@ -4610,11 +8276,46 @@ class ValidatorNeuron:
                     f"(NOT attributed to miner {test.miner_address[:10]} "
                     f"model={test.model_id}): {type(e).__name__}: {e}"
                 )
+                if self._canary_epoch_active(epoch_number):
+                    self._validator_canary_failures.add(
+                        self._miner_model_key(
+                            test.miner_address, test.model_index
+                        )
+                    )
                 return
             _uid_err = self._db.get_uid(test.miner_address)
             _uid_err_s = f"UID {_uid_err}" if _uid_err is not None else "UID ?"
             _err_msg = str(e).split("\nFor more information")[0]
+            if isinstance(e, _httpx.HTTPStatusError):
+                try:
+                    _peer_error = e.response.json().get("error")
+                except Exception:
+                    _peer_error = None
+                if isinstance(_peer_error, str) and _peer_error.strip():
+                    _peer_error = " ".join(_peer_error.split())[:300]
+                    _err_msg = f"{_err_msg}: {_peer_error}"
             bt.logging.info(f"Canary test error for {_uid_err_s} {test.miner_address[:10]} model={test.model_id}: {_err_msg}")
+
+            # Once a miner-visible request has crossed its source boundary it
+            # is no longer part of that epoch's throughput accounting, but it
+            # still owes a terminal response by the configured request
+            # deadline.  A peer-attributed timeout/error therefore fails
+            # immediately instead of disappearing as validator-neutral work.
+            if not self._canary_epoch_active(epoch_number):
+                if bool(test.verify_proof):
+                    self._record_hard_audit_failure(
+                        source_epoch=epoch_number,
+                        miner_address=test.miner_address,
+                        model_id=test.model_id,
+                        model_index=test.model_index,
+                        obligation_id=bytes.fromhex(test.obligation_id),
+                        failure_code="post_precommit_failure",
+                    )
+                self._on_proof_failure(
+                    test.miner_address,
+                    test.model_index,
+                    endpoint=test.miner_endpoint,
+                )
 
             # Log error to analytics DB
             try:
@@ -4643,60 +8344,83 @@ class ValidatorNeuron:
                 bt.logging.debug(f"Failed to log canary error: {_db_err}")
                 pass  # Non-fatal
 
-            # Track transient error per (miner, model_index) — do NOT
-            # report offline on a single failure.  Decrement expected receipt
-            # count so the receipt integrity check at epoch close tolerates
-            # the missing receipt (same treatment as 503 busy-skips).
-            # Repeated failures (>3 per epoch) are evaluated at epoch close,
-            # with the error timestamps used to find overlapping organic
-            # receipts (same forgiveness mechanism as the 503 busy-skip path).
-            key = self._miner_model_key(test.miner_address, test.model_index)
-            self._canary_errors[key] = self._canary_errors.get(key, 0) + 1
-            self._canary_error_times.setdefault(key, []).append(int(time.time()))
-            self._decrement_expected_receipt(epoch_number, key)
-            if self._canary_errors[key] > 3:
-                bt.logging.info(
-                    f"Miner {test.miner_address[:10]} model_index={test.model_index} "
-                    f"has {self._canary_errors[key]} canary errors (>3) — will evaluate at epoch close"
+            # Track endpoint failures for exact obligation reconciliation at
+            # epoch close. Planned receipt counts are never decremented.
+            if self._canary_epoch_active(epoch_number):
+                key = self._miner_model_key(
+                    test.miner_address,
+                    test.model_index,
+                )
+                self._canary_errors[key] = (
+                    self._canary_errors.get(key, 0) + 1
+                )
+                self._canary_error_times.setdefault(key, []).append(
+                    int(time.time())
                 )
 
-    def _try_close_epoch(self, epoch_number: int):
+    def _try_close_epoch(self, epoch_number: int) -> bool:
         """Attempt epoch close with exponential backoff on failure.
 
         On success, clears pending state and resets backoff.
         On failure (e.g. 429 rate limit), schedules retry with increasing delay
         to avoid hammering the RPC.
         """
-        # Guard: never close the same epoch twice — each re-close blends
-        # another score into the EMA, destroying it.
-        if not hasattr(self, '_last_closed_epoch'):
-            self._last_closed_epoch = -1
-        if epoch_number <= self._last_closed_epoch:
-            self._pending_epoch_close = None
-            return
-
-        now = time.monotonic()
-        if now < self._epoch_close_retry_after:
-            return  # Still in cooldown from a previous failure
+        close_lock = getattr(self, "_epoch_close_lock", None)
+        if close_lock is None:
+            # Compatibility for narrowly constructed test fixtures.  Normal
+            # validator instances create the lock in __init__ before block
+            # subscription starts.
+            close_lock = threading.Lock()
+            self._epoch_close_lock = close_lock
+        if not close_lock.acquire(blocking=False):
+            return False
 
         try:
-            self._closing_inflight_canaries[epoch_number] = dict(
-                self._inflight_canaries.get(epoch_number, {})
-            )
+            # Guard: never close the same epoch twice — each re-close blends
+            # another score into the EMA, destroying it.  This check must be
+            # inside the single-flight section.
+            if not hasattr(self, '_last_closed_epoch'):
+                self._last_closed_epoch = -1
+            if epoch_number <= self._last_closed_epoch:
+                self._pending_epoch_close = None
+                return True
+
+            # The validator must schedule every obligation early enough to finish.
+            # Any queued/in-flight work still present here is therefore local
+            # indeterminacy, never evidence against the miner and never a reason to
+            # delay the next canary epoch.
+            self._seal_canary_epoch_for_close(epoch_number)
+
+            now = time.monotonic()
+            if now < self._epoch_close_retry_after:
+                return False  # Still in cooldown from a previous failure
+
             try:
-                self._close_epoch(epoch_number)
-            finally:
-                self._closing_inflight_canaries.pop(epoch_number, None)
-            self._pending_epoch_close = None
-            self._last_closed_epoch = epoch_number
-            self._epoch_close_backoff = 30.0  # Reset on success
-            # If auto-update was deferred, apply it now (between epochs)
-            if self._auto_updater is not None:
-                self._auto_updater.notify_not_busy()
-        except Exception as e:
-            self._epoch_close_retry_after = now + self._epoch_close_backoff
-            bt.logging.warning(f"Epoch {epoch_number} close failed, retrying in {self._epoch_close_backoff:.0f}s: {e}")
-            self._epoch_close_backoff = min(self._epoch_close_backoff * 2, 300)
+                self._closing_inflight_canaries[epoch_number] = dict(
+                    self._inflight_canaries.get(epoch_number, {})
+                )
+                try:
+                    self._close_epoch(epoch_number)
+                finally:
+                    self._closing_inflight_canaries.pop(epoch_number, None)
+                self._pending_epoch_close = None
+                self._last_closed_epoch = epoch_number
+                self._epoch_close_backoff = 30.0  # Reset on success
+                if getattr(self, "_weight_update_due", False):
+                    self._schedule_weight_update()
+                    self._weight_update_due = False
+                # If auto-update was deferred, apply it now (between epochs)
+                auto_updater = getattr(self, "_auto_updater", None)
+                if auto_updater is not None:
+                    auto_updater.notify_not_busy()
+                return True
+            except Exception as e:
+                self._epoch_close_retry_after = now + self._epoch_close_backoff
+                bt.logging.warning(f"Epoch {epoch_number} close failed, retrying in {self._epoch_close_backoff:.0f}s: {e}")
+                self._epoch_close_backoff = min(self._epoch_close_backoff * 2, 300)
+                return False
+        finally:
+            close_lock.release()
 
     # Epoch duration in seconds — 360 blocks × 12s = 4320s ≈ 72 min.
     # Used by the restart-forgiveness window (2 epochs).
@@ -4859,6 +8583,37 @@ class ValidatorNeuron:
         miner_receipts, all_epoch_receipts = self._collect_epoch_receipts(
             epoch_number, receipt_authority,
         )
+        current_shared_hard_verdicts = (
+            self._verify_shared_hard_bundles_at_close(
+                epoch_number,
+                miner_receipts,
+            )
+        )
+        late_shared_hard_verdicts = (
+            self._verify_late_shared_hard_bundles_at_close(
+                current_epoch=epoch_number,
+                receipt_authority=receipt_authority,
+            )
+        )
+        shared_hard_failure_verdicts = (
+            self._fetch_shared_hard_failure_verdicts(
+                current_epoch=epoch_number,
+            )
+        )
+        self._shared_hard_proof_verdicts = dict(
+            current_shared_hard_verdicts
+        )
+        for key, verdict in late_shared_hard_verdicts.items():
+            # Any independently verified failure dominates a pass; otherwise
+            # the newest unprocessed late pass supplies the current security
+            # verdict without changing the closed epoch's throughput.
+            if verdict is False or key not in self._shared_hard_proof_verdicts:
+                self._shared_hard_proof_verdicts[key] = verdict
+        # Positive owner-signed failure evidence always dominates a retained
+        # pass. The owner refuses to publish both for one obligation; treating
+        # any inconsistency conservatively prevents a downgrade.
+        for key in shared_hard_failure_verdicts:
+            self._shared_hard_proof_verdicts[key] = False
 
         # ── Store all receipts (full network view) ────────────────
         try:
@@ -5058,6 +8813,19 @@ class ValidatorNeuron:
             )
 
             if key in getattr(self, "_receipt_pull_failed_keys", set()):
+                # The peer receipt endpoint is distribution only. Our signed
+                # receipts were persisted before transport and remain
+                # authoritative for our exact canary obligations. Continuing
+                # here prevents a miner from turning a failed receipt GET into
+                # a neutral canary epoch.
+                bt.logging.warning(
+                    f"Peer receipt view unavailable for "
+                    f"{miner.address[:10]} model_index={miner.model_index} "
+                    f"at epoch {epoch_number}; enforcing validator-owned "
+                    "receipts and exact missing obligations"
+                )
+
+            if key in self._validator_canary_failures:
                 gated = self._apply_capacity_audit_model_gate(
                     miner.address,
                     miner.model_index,
@@ -5073,16 +8841,12 @@ class ValidatorNeuron:
                 ) or gated
                 if not gated:
                     bt.logging.warning(
-                        f"Skipping receipt-based score for {miner.address[:10]} "
-                        f"model_index={miner.model_index} at epoch {epoch_number} — "
-                        f"receipt pull failed after retries"
+                        f"Skipping canary score for {miner.address[:10]} "
+                        f"model_index={miner.model_index}: validator-side v3 "
+                        "configuration or storage failure"
                     )
                 continue
 
-            # Skip scoring if no canaries were dispatched AND no busy-skips.
-            # The expected count is decremented on each 503, so expected==0
-            # can mean either "nothing scheduled" or "all canaries got 503".
-            # In the latter case we must still run the busy-skip evaluation.
             busy_skips_this_epoch = self._busy_skips.get(key, 0)
             if expected == 0 and busy_skips_this_epoch == 0:
                 gated = self._apply_capacity_audit_model_gate(
@@ -5102,6 +8866,96 @@ class ValidatorNeuron:
                     bt.logging.info(f"Skipping score for {miner.address[:10]} model_index={miner.model_index} — 0 canaries dispatched")
                 continue
 
+            expected_inventory = dict(
+                self._expected_canary_obligations.get(key, {})
+            )
+            completed_obligations = self._completed_canary_obligations(
+                own_receipts,
+                expected_inventory,
+            )
+            missing_low = {
+                obligation_id
+                for obligation_id, (kind, _target) in expected_inventory.items()
+                if kind == "low" and obligation_id not in completed_obligations
+            }
+            missing_full = {
+                obligation_id
+                for obligation_id, (kind, _target) in expected_inventory.items()
+                if kind == "full" and obligation_id not in completed_obligations
+            }
+            suppress_probation = self._maintenance_grace_active(
+                current_epoch=epoch_number,
+                action="suppress_probation",
+            )
+            prior_full_debt = key in self._full_context_debt
+            pending_full = self._pending_cross_epoch_full_obligations(
+                epoch_number,
+                key,
+            )
+            full_deferred = False
+            if not missing_full and not pending_full:
+                self._full_context_debt.pop(key, None)
+            elif self._may_defer_full_context_obligations(
+                missing_low=missing_low,
+                missing_full=missing_full,
+                prior_full_debt=prior_full_debt,
+                suppress_probation=suppress_probation,
+                busy_evidence_covers=(
+                    self._busy_evidence_covers_full_obligations(
+                        key,
+                        missing_full,
+                        all_receipts,
+                    )
+                ),
+            ):
+                self._full_context_debt[key] = epoch_number
+                full_deferred = True
+                for obligation_id in missing_full:
+                    expected_inventory.pop(obligation_id, None)
+                expected = len(expected_inventory)
+                bt.logging.info(
+                    f"Full-context obligation deferred once for "
+                    f"{miner.address[:10]} model_index={miner.model_index}; "
+                    "authorized validator-observed work overlaps every "
+                    "precommit-busy interval"
+                )
+
+            obligation_failure = bool(
+                missing_low or (missing_full and not full_deferred)
+            )
+            if obligation_failure:
+                hard_ids = getattr(
+                    self,
+                    "_hard_canary_obligation_ids",
+                    set(),
+                )
+                for obligation_id in missing_full:
+                    if obligation_id not in hard_ids:
+                        continue
+                    self._record_hard_audit_failure(
+                        source_epoch=epoch_number,
+                        miner_address=miner.address,
+                        model_id=miner.model_id,
+                        model_index=miner.model_index,
+                        obligation_id=obligation_id,
+                        failure_code="obligation_missing",
+                    )
+            if obligation_failure and not suppress_probation:
+                if key not in self._canary_penalized_keys:
+                    self._on_proof_failure(
+                        miner.address,
+                        miner.model_index,
+                        endpoint=getattr(miner, "endpoint", ""),
+                    )
+                    self._canary_penalized_keys.add(key)
+                bt.logging.info(
+                    f"Canary obligation failure for {miner.address[:10]} "
+                    f"model_index={miner.model_index}: "
+                    f"missing_low={len(missing_low)} "
+                    f"missing_full={len(missing_full)} "
+                    f"prior_full_debt={prior_full_debt}"
+                )
+
             # Count proof verification outcomes from own receipts
             proof_tested = [
                 r for r in own_receipts if r.proof_requested
@@ -5109,6 +8963,11 @@ class ValidatorNeuron:
             proof_failed = [
                 r for r in proof_tested if not r.proof_verified
             ]
+            shared_hard_verdict = self._shared_hard_proof_verdicts.get(key)
+            shared_hard_tests = 1 if shared_hard_verdict is not None else 0
+            shared_hard_failures = (
+                1 if shared_hard_verdict is False else 0
+            )
 
             # TEE attestation outcomes from own receipts
             tee_tested = [r for r in own_receipts if getattr(r, "tee_attestation_verified", None) is not None]
@@ -5122,14 +8981,16 @@ class ValidatorNeuron:
                 hotkey_ss58=getattr(miner, "hotkey_ss58", "") or "",
                 own_receipts=own_receipts,
                 expected_own_receipt_count=expected,
+                expected_canary_obligations=expected_inventory,
                 all_receipts=all_receipts,
-                proof_tests=len(proof_tested),
-                proof_failures=len(proof_failed),
+                proof_tests=len(proof_tested) + shared_hard_tests,
+                proof_failures=len(proof_failed) + shared_hard_failures,
                 tee_tests=len(tee_tested),
                 tee_failures=len(tee_failed),
                 tee_verified=len(tee_tested) > 0 and len(tee_failed) == 0,
                 max_context_len=miner.max_context_len,
                 quant=miner.quant,
+                quant_qualified=self._proof_v3_quant_qualified(miner),
                 busy_skip_count=self._busy_skips.get(key, 0),
             )
 
@@ -5238,182 +9099,28 @@ class ValidatorNeuron:
             had_proof_failure = (
                 outcome.proof_tests > 0 and outcome.proof_failures > 0
             )
-
-            if had_proof_failure:
+            had_proof_failure = had_proof_failure or obligation_failure
+            if had_proof_failure and not suppress_probation:
                 # Enter or reset probation (mid-epoch may have already entered)
-                if self._maintenance_grace_active(
-                    current_epoch=epoch_number,
-                    action="suppress_probation",
-                ):
-                    bt.logging.info(
-                        f"Maintenance grace suppressed probation for {miner.address[:10]} "
-                        f"model_index={miner.model_index}: {self._maintenance_grace_reason()}"
-                    )
-                else:
-                    self._probation_tracker.enter_probation(
-                        key, epoch_number, endpoint=getattr(miner, 'endpoint', ''))
-                    self._db.enter_probation(
-                        miner.address, miner.model_index, epoch_number,
-                        uid=uid if uid is not None else -1,
-                        hotkey_ss58=getattr(miner, "hotkey_ss58", "") or "",
-                    )
+                self._probation_tracker.enter_probation(
+                    key, epoch_number, endpoint=getattr(miner, 'endpoint', ''))
+                self._db.enter_probation(
+                    miner.address, miner.model_index, epoch_number,
+                    uid=uid if uid is not None else -1,
+                    hotkey_ss58=getattr(miner, "hotkey_ss58", "") or "",
+                )
             elif self._probation_tracker.is_on_probation(key):
-                if outcome.proof_tests > 0 and outcome.proof_failures == 0:
+                if self._probation_recovery_epoch_is_clean(
+                    obligation_failure=obligation_failure,
+                    full_deferred=full_deferred,
+                    proof_tests=outcome.proof_tests,
+                    proof_failures=outcome.proof_failures,
+                ):
                     # All proofs passed this epoch — record clean pass
-                    self._probation_tracker.record_pass(key)
-                    self._db.record_pass(miner.address, miner.model_index)
-                elif outcome.proof_tests == 0 and len(own_receipts) == 0:
-                    # No receipts at all (RPC delay lost them) — don't penalize
-                    # the miner for infrastructure issues. Count as neutral pass
-                    # so probation can still clear during RPC outages.
-                    self._probation_tracker.record_pass(key)
-                    self._db.record_pass(miner.address, miner.model_index)
-                    bt.logging.info(f"Probation neutral pass for {miner.address[:10]} model_index={miner.model_index} (0 receipts — RPC delay, not miner fault)")
-
-            # ── Busy-skip evaluation ─────────────────────────────────
-            # If >3 canaries got 503, check for organic receipts within
-            # ±120s of each rejection. ≥3 overlapping → forgiven (busy).
-            # Otherwise → evasion (probation + EMA halve).
-            # Only evaluate when threshold exceeded (≤3 is tolerated).
-            reject_times = self._busy_skip_probations.get(key)
-            if reject_times and busy_skips_this_epoch > 3 and not had_proof_failure:
-                overlap_window = 120  # seconds
-                organic_near_reject = [
-                    r for r in all_receipts
-                    if not r.is_canary
-                    and any(
-                        abs(r.timestamp - rt) <= overlap_window
-                        for rt in reject_times
+                    self._record_probation_recovery_source_pass(
+                        key,
+                        epoch_number,
                     )
-                ]
-                if len(organic_near_reject) >= 3:
-                    # Genuinely busy — forgive the 503s (no new probation).
-                    # Existing probation lifecycle is handled above; don't
-                    # double-count as an extra pass here.
-                    bt.logging.info(f"Busy-skip FORGIVEN for {miner.address[:10]} model_index={miner.model_index} ({len(organic_near_reject)} organic receipts overlapping 503 windows)")
-                elif self._restart_window_grants_pass(key):
-                    # Inside the post-version-bump window — assume this miner
-                    # is reloading vLLM after auto-update.  One-shot per
-                    # miner per bump, see _poll_remote_miner_version.
-                    bt.logging.info(
-                        f"Busy-skip FORGIVEN (restart-window) for {miner.address[:10]} "
-                        f"model_index={miner.model_index} ({len(reject_times)} 503s, "
-                        f"within 2 epochs of miner_version bump)"
-                    )
-                    self._restart_forgiven.add(key)
-                else:
-                    # No evidence of legitimate busyness — treat as evasion
-                    bt.logging.info(f"Busy-skip EVASION for {miner.address[:10]} model_index={miner.model_index} ({len(reject_times)} 503s, only {len(organic_near_reject)} overlapping organic receipts)")
-                    self._on_proof_failure(
-                        miner.address, miner.model_index,
-                        endpoint=getattr(miner, 'endpoint', ''))
-
-            # ── Canary error evaluation ────────────────────────────
-            # Tolerate ≤3 transient errors (network glitches, timeouts).
-            # Mirror the 503 busy-skip forgiveness — if organic traffic was
-            # flowing during the canary failures, the miner was genuinely busy
-            # (full-context canaries can still trip validator-side timeouts on
-            # overloaded GPUs).
-            canary_errors = self._canary_errors.get(key, 0)
-            if canary_errors > 3 and not had_proof_failure:
-                error_times = self._canary_error_times.get(key, [])
-                overlap_window = 120  # seconds — same as 503 busy-skip path
-                organic_near_error = [
-                    r for r in all_receipts
-                    if not r.is_canary
-                    and any(
-                        abs(r.timestamp - et) <= overlap_window
-                        for et in error_times
-                    )
-                ]
-                if len(organic_near_error) >= 3:
-                    bt.logging.info(
-                        f"Canary errors FORGIVEN for {miner.address[:10]} "
-                        f"model_index={miner.model_index} ({canary_errors} errors but "
-                        f"{len(organic_near_error)} organic receipts overlapping ±120s windows)"
-                    )
-                elif self._restart_window_grants_pass(key):
-                    bt.logging.info(
-                        f"Canary errors FORGIVEN (restart-window) for {miner.address[:10]} "
-                        f"model_index={miner.model_index} ({canary_errors} errors, "
-                        f"within 2 epochs of miner_version bump)"
-                    )
-                    self._restart_forgiven.add(key)
-                else:
-                    bt.logging.info(
-                        f"Canary error PENALTY for {miner.address[:10]} "
-                        f"model_index={miner.model_index} ({canary_errors} errors, "
-                        f"only {len(organic_near_error)} overlapping organic — no busy excuse)"
-                    )
-                    self._on_proof_failure(
-                        miner.address, miner.model_index,
-                        endpoint=getattr(miner, 'endpoint', ''))
-
-            # ── Capability presence check ──────────────────────────
-            # Catches the gap where canary_errors didn't trip 3 (e.g. only
-            # 1-2 timed out per epoch but the same full-context kept failing
-            # silently) yet the miner clearly cannot serve full-context.
-            # Two-strike rule: only probate if zero full-context succeeded
-            # in BOTH the previous and current epoch — one validator-side
-            # blip (e.g. RPC slowdown causing FC canary timeouts) must not
-            # cascade-probate the whole network.
-            # Derived from the canary cap so the two can't drift apart again.
-            FC_PROMPT_THRESHOLD = FULL_CONTEXT_TOKEN_CAP // 2
-            fc_succeeded = sum(
-                1 for r in all_receipts
-                if r.is_canary
-                and r.prompt_tokens > FC_PROMPT_THRESHOLD
-                and r.tokens_generated > 0
-                and not (r.proof_requested and not r.proof_verified)
-            )
-            had_strike_last_epoch = key in self._zero_fc_last_epoch
-            suppress_probation = self._maintenance_grace_active(
-                current_epoch=epoch_number,
-                action="suppress_probation",
-            )
-            if (
-                fc_succeeded == 0
-                and not had_proof_failure
-                and not self._probation_tracker.is_on_probation(key)
-            ):
-                organic_count = sum(1 for r in all_receipts if not r.is_canary)
-                if suppress_probation:
-                    bt.logging.info(
-                        f"Maintenance grace suppressed capability failure for {miner.address[:10]} "
-                        f"model_index={miner.model_index}: {self._maintenance_grace_reason()}"
-                    )
-                elif organic_count >= 3:
-                    bt.logging.info(
-                        f"Full-context capability DEFERRED for {miner.address[:10]} "
-                        f"model_index={miner.model_index} ({organic_count} organic "
-                        f"receipts — miner busy with real load)"
-                    )
-                elif self._restart_window_grants_pass(key):
-                    bt.logging.info(
-                        f"Capability FAILURE FORGIVEN (restart-window) for {miner.address[:10]} "
-                        f"model_index={miner.model_index} (within 2 epochs of miner_version bump)"
-                    )
-                    self._restart_forgiven.add(key)
-                elif not had_strike_last_epoch:
-                    bt.logging.info(
-                        f"Capability FAILURE WARNING for {miner.address[:10]} "
-                        f"model_index={miner.model_index}: 0 full-context canaries "
-                        f"this epoch (first strike — will probate if zero again next epoch)"
-                    )
-                else:
-                    bt.logging.info(
-                        f"Capability FAILURE for {miner.address[:10]} "
-                        f"model_index={miner.model_index}: 0 full-context canaries "
-                        f"succeeded across 2 consecutive epochs, no organic excuse"
-                    )
-                    self._on_proof_failure(
-                        miner.address, miner.model_index,
-                        endpoint=getattr(miner, 'endpoint', ''))
-            # Update the two-strike tracker for next epoch's decision.
-            if fc_succeeded == 0 and not suppress_probation:
-                self._zero_fc_last_epoch.add(key)
-            else:
-                self._zero_fc_last_epoch.discard(key)
 
             # Escalation: too long on probation → report offline on-chain
             if self._db.should_escalate(miner.address, miner.model_index, epoch_number):
@@ -5430,15 +9137,28 @@ class ValidatorNeuron:
         _discovered_keys = {
             (m.address.lower(), m.model_index) for m in self._epoch_miners
         }
-        # Prune the two-strike tracker to currently-active miners so
-        # entries for deregistered miners don't accumulate forever.
-        # Keys in _zero_fc_last_epoch are stored with the original-case
-        # address (matching ``key = (miner.address, miner.model_index)``
-        # used in the capability check above), so case-fold for comparison.
-        self._zero_fc_last_epoch = {
-            k for k in self._zero_fc_last_epoch
-            if (k[0].lower(), k[1]) in _discovered_keys
+        self._full_context_debt = {
+            key: debt_epoch
+            for key, debt_epoch in self._full_context_debt.items()
+            if key in _discovered_keys
         }
+        self._save_full_context_debt()
+        try:
+            self._db.gc_local_service_receipts(
+                max(0, int(epoch_number) - 3)
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Validator-local receipt GC failed: {exc}"
+            )
+        try:
+            self._db.gc_proof_v3_hard_failures(
+                max(0, int(epoch_number) - 3)
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Proof-v3 hard failure GC failed: {exc}"
+            )
         _zeroed = 0
         for _uid, _mstate in self.scorer.states.items():
             for _midx, _entry in _mstate.entries.items():
@@ -5499,6 +9219,17 @@ class ValidatorNeuron:
             bt.logging.info("")
         self._epoch_score_rows = []
 
+        try:
+            self._finalize_owner_verdict_snapshot(
+                epoch_number=epoch_number,
+                miner_receipts=miner_receipts,
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                "Verdict snapshot publication failed locally (NOT attributed "
+                f"to any miner): {type(exc).__name__}: {exc}"
+            )
+
         # ── Write shared state for proxy (BEFORE on-chain posts) ──
         # Shared state must be written even if on-chain calls fail (429).
         self._write_shared_state()
@@ -5556,6 +9287,1025 @@ class ValidatorNeuron:
         elapsed = time.monotonic() - t0
         bt.logging.info(f"Epoch {epoch_number} closed in {elapsed:.1f}s")
 
+    def _shared_hard_prefetch_result(
+        self,
+        *,
+        epoch_number: int,
+        miner: ActiveMiner,
+        receipt: ServiceReceipt,
+    ) -> Optional[Tuple[str, str]]:
+        from neurons.proof_v3_shared_hard import (
+            shared_hard_receipt_cache_key_v3,
+        )
+
+        lock = getattr(self, "_shared_hard_prefetch_lock", None)
+        if lock is None:
+            return None
+        try:
+            receipt_key = shared_hard_receipt_cache_key_v3(receipt)
+        except ValueError:
+            return None
+        cache_key = (
+            int(epoch_number),
+            miner.address.lower(),
+            int(miner.model_index),
+            receipt_key,
+        )
+        with lock:
+            return getattr(
+                self,
+                "_shared_hard_prefetch_results",
+                {},
+            ).get(cache_key)
+
+    def _store_shared_hard_prefetch_result(
+        self,
+        *,
+        epoch_number: int,
+        miner: ActiveMiner,
+        receipt: ServiceReceipt,
+        status: str,
+        detail: str,
+    ) -> None:
+        from neurons.proof_v3_shared_hard import (
+            shared_hard_receipt_cache_key_v3,
+        )
+
+        if status not in ("pass", "peer"):
+            return
+        try:
+            receipt_key = shared_hard_receipt_cache_key_v3(receipt)
+        except ValueError:
+            return
+        cache_key = (
+            int(epoch_number),
+            miner.address.lower(),
+            int(miner.model_index),
+            receipt_key,
+        )
+        with self._shared_hard_prefetch_lock:
+            existing = self._shared_hard_prefetch_results.get(cache_key)
+            value = (status, str(detail or ""))
+            if existing is not None and existing != value:
+                # A deterministic replay cannot legitimately change verdict.
+                self._shared_hard_prefetch_results[cache_key] = (
+                    "peer",
+                    "retained hard bundle changed across fetches",
+                )
+            else:
+                self._shared_hard_prefetch_results[cache_key] = value
+
+    def _prefetch_shared_hard_bundle(
+        self,
+        *,
+        epoch_number: int,
+        miner: ActiveMiner,
+        owner_ss58: str,
+        inflight_key: Tuple[int, str, int, str],
+    ) -> None:
+        """Best-effort early replay; only epoch-close receipts authorize use."""
+
+        from neurons.proof_v3_shared_hard import (
+            SharedHardBundlePeerFailure,
+            SharedHardBundleUnavailable,
+            verify_indexed_shared_hard_bundle_v3,
+        )
+        from verallm.chain.wallet import ss58_decode
+
+        try:
+            release = getattr(self, "_proof_v3_releases", {}).get(
+                miner.model_id
+            )
+            policy = getattr(self, "_proof_v3_canary_policy", None)
+            model_policy = (
+                policy.model_policy(miner.model_id)
+                if policy is not None
+                else None
+            )
+            miner_hotkey = str(
+                getattr(miner, "hotkey_ss58", "") or ""
+            )
+            if (
+                release is None
+                or model_policy is None
+                or not miner_hotkey
+                or model_policy.execution_profile_digest
+                != release.qualified_profile.profile.digest()
+                or str(miner.quant or "").strip().lower()
+                not in model_policy.allowed_quantizations
+            ):
+                return
+            owner_key = ss58_decode(owner_ss58)
+            with ValidatorClient(
+                miner_url=miner.endpoint,
+                config=Config(block_size=256, spot_checks=25),
+                timeout=5.0,
+                verify_tls=False,
+                validator_hotkey_ss58=self._validator_hotkey_ss58,
+                validator_seed=self._validator_private_key,
+            ) as client:
+                index = client.fetch_proof_v3_hard_bundle_index(
+                    epoch_number
+                )
+                candidates: list[ServiceReceipt] = []
+                for entry in index["bundles"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    receipt_data = entry.get("receipt")
+                    if not isinstance(receipt_data, dict):
+                        continue
+                    try:
+                        receipt = receipt_from_dict(receipt_data)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (
+                        receipt.epoch_number == epoch_number
+                        and receipt.validator_hotkey == owner_key
+                        and receipt.is_canary is True
+                        and receipt.proof_requested is True
+                        and receipt.miner_address.lower()
+                        == miner.address.lower()
+                        and receipt.model_id == miner.model_id
+                        and receipt.model_index == miner.model_index
+                    ):
+                        candidates.append(receipt)
+                for receipt in candidates:
+                    try:
+                        verify_indexed_shared_hard_bundle_v3(
+                            client=client,
+                            index=index,
+                            receipt=receipt,
+                            qualified_release=release,
+                            hard_auditor_hotkey_ss58=owner_ss58,
+                            miner_hotkey_ss58=miner_hotkey,
+                            expected_epoch_number=epoch_number,
+                            expected_miner_address=miner.address,
+                            expected_model_id=miner.model_id,
+                            expected_model_index=miner.model_index,
+                        )
+                    except SharedHardBundleUnavailable:
+                        continue
+                    except SharedHardBundlePeerFailure as exc:
+                        self._store_shared_hard_prefetch_result(
+                            epoch_number=epoch_number,
+                            miner=miner,
+                            receipt=receipt,
+                            status="peer",
+                            detail=str(exc),
+                        )
+                    except (TypeError, ValueError) as exc:
+                        self._store_shared_hard_prefetch_result(
+                            epoch_number=epoch_number,
+                            miner=miner,
+                            receipt=receipt,
+                            status="peer",
+                            detail=f"{type(exc).__name__}: {exc}",
+                        )
+                    else:
+                        self._store_shared_hard_prefetch_result(
+                            epoch_number=epoch_number,
+                            miner=miner,
+                            receipt=receipt,
+                            status="pass",
+                            detail="",
+                        )
+        except httpx.HTTPError:
+            # The index may not exist yet or the endpoint may be momentarily
+            # unavailable. Epoch-close reconciliation remains authoritative.
+            pass
+        except Exception as exc:
+            bt.logging.debug(
+                "Shared proof-v3 hard prefetch skipped locally for "
+                f"{miner.address[:10]} model_index={miner.model_index}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        finally:
+            with self._shared_hard_prefetch_lock:
+                self._shared_hard_prefetch_inflight.discard(inflight_key)
+
+    def _fetch_owner_verdict_snapshot(
+        self,
+        *,
+        current_epoch: int,
+        at_close: bool,
+    ):
+        """Fetch one complete owner decision set or leave the epoch neutral."""
+
+        from neurons.verdict_follower import VerdictSnapshotUnavailable
+
+        follower = self._verdict_snapshot_follower
+        if at_close:
+            # A stopped feed at close is neutral even when a prefetch wave
+            # previously succeeded. Keep the anti-replay floor separately.
+            follower.clear_current()
+        owner_url = str(
+            getattr(self, "_owner_verdict_url_latched", "") or ""
+        ).strip()
+        owner_ss58 = str(
+            getattr(
+                self.config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
+        )
+        # Owner and follower validators observe the same chain boundary and
+        # normally begin closing at the same time.  Receipt reconciliation and
+        # signing can keep the owner's current-epoch snapshot unavailable for
+        # several seconds, so a sub-second retry window systematically races
+        # the owner.  Keep this bounded: an unavailable owner remains neutral,
+        # but a healthy owner gets enough time to finish an ordinary close.
+        attempts = 8 if at_close else 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                if not owner_url:
+                    raise VerdictSnapshotUnavailable(
+                        "--owner-verdict-url is not configured"
+                    )
+                snapshot = follower.fetch(
+                    owner_url,
+                    expected_owner_hotkey_ss58=owner_ss58,
+                    metagraph=getattr(self, "_metagraph", None),
+                    closing_epoch=int(current_epoch),
+                    epoch_seconds=(
+                        max(1, int(self.config.epoch_blocks)) * 12.0
+                    ),
+                    timeout=max(
+                        1.0,
+                        float(
+                            getattr(
+                                self.config,
+                                "subnet_config_timeout_seconds",
+                                5.0,
+                            )
+                            or 5.0
+                        ),
+                    ),
+                )
+                if (
+                    at_close
+                    and int(snapshot.epoch_number) != int(current_epoch)
+                ):
+                    follower.clear_current()
+                    raise VerdictSnapshotUnavailable(
+                        "owner feed has not finalized the closing epoch"
+                    )
+                bt.logging.info(
+                    "Owner verdict snapshot accepted: "
+                    f"fetched_at={int(time.time())} "
+                    f"snapshot_epoch={int(snapshot.epoch_number)} "
+                    "owner_signature_verified=true "
+                    f"entries={len(snapshot.entries)}"
+                )
+                return snapshot
+            except VerdictSnapshotUnavailable as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(min(1.0, 0.25 * (1 << attempt)))
+        if at_close:
+            follower.clear_current()
+            bt.logging.warning(
+                "Owner verdict snapshot unavailable or invalid; hard and "
+                "capacity decisions are neutral for this close. Check "
+                "--owner-verdict-url and owner reachability, or switch to "
+                "--proof-v3-verdict-source=verify. "
+                f"Reason: {last_error}"
+            )
+        else:
+            bt.logging.debug(
+                "Owner verdict snapshot prefetch skipped: "
+                f"{last_error}"
+            )
+        return None
+
+    def _follower_verdict_entry(
+        self,
+        address: str,
+        model_index: int,
+    ):
+        accepted = self._verdict_snapshot_follower.current
+        if accepted is None:
+            return None
+        key = self._miner_model_key(address, model_index)
+        miner = next(
+            (
+                value
+                for value in self._epoch_miners
+                if self._miner_model_key(
+                    value.address,
+                    value.model_index,
+                )
+                == key
+            ),
+            None,
+        )
+        if miner is None:
+            return None
+        for entry in accepted.snapshot.entries:
+            if entry.key != key:
+                continue
+            if (
+                entry.miner_hotkey_ss58
+                != str(getattr(miner, "hotkey_ss58", "") or "")
+                or entry.model_id != str(miner.model_id)
+            ):
+                return None
+            return entry
+        return None
+
+    def _follower_hard_verdicts_at_close(
+        self,
+        epoch_number: int,
+    ) -> Dict[Tuple[str, int], bool]:
+        snapshot = self._fetch_owner_verdict_snapshot(
+            current_epoch=epoch_number,
+            at_close=True,
+        )
+        if snapshot is None:
+            return {}
+        verdicts: Dict[Tuple[str, int], bool] = {}
+        for miner in self._epoch_miners:
+            entry = self._follower_verdict_entry(
+                miner.address,
+                miner.model_index,
+            )
+            if entry is None or entry.hard_verdict == -1:
+                continue
+            verdicts[
+                self._miner_model_key(
+                    miner.address,
+                    miner.model_index,
+                )
+            ] = entry.hard_verdict == 1
+        bt.logging.info(
+            "Follower owner verdict apply: "
+            f"pass={sum(value is True for value in verdicts.values())} "
+            f"failure={sum(value is False for value in verdicts.values())} "
+            f"neutral={len(self._epoch_miners) - len(verdicts)}"
+        )
+        return verdicts
+
+    def _follower_capacity_gate_reason(
+        self,
+        address: str,
+        model_index: int,
+    ) -> str:
+        entry = self._follower_verdict_entry(address, model_index)
+        if entry is not None and entry.capacity_gated:
+            return "capacity-audit owner feed gate"
+        return ""
+
+    def _maybe_schedule_shared_hard_prefetch(
+        self,
+        *,
+        block_number: int,
+        blocks_into_epoch: int,
+    ) -> None:
+        """Spread two best-effort external replay waves across the epoch."""
+
+        if not self._proof_v3_allowed():
+            return
+        owner_ss58 = str(
+            getattr(
+                self.config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
+        )
+        if (
+            not getattr(
+                self.config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+            or not owner_ss58
+            or owner_ss58 == self._validator_hotkey_ss58
+            or not self._epoch_miners
+        ):
+            return
+        epoch_blocks = max(1, int(self.config.epoch_blocks))
+        wave_offsets = {
+            max(1, epoch_blocks // 2),
+            max(1, (3 * epoch_blocks) // 4),
+        }
+        offset = int(blocks_into_epoch)
+        if offset not in wave_offsets:
+            return
+        epoch_number = int(block_number) // epoch_blocks
+        wave_key = (epoch_number, offset)
+        with self._shared_hard_prefetch_lock:
+            if wave_key in self._shared_hard_prefetch_waves:
+                return
+            self._shared_hard_prefetch_waves.add(wave_key)
+
+        if self._proof_v3_follower_mode_active():
+            self._shared_hard_prefetch_executor.submit(
+                self._fetch_owner_verdict_snapshot,
+                current_epoch=epoch_number,
+                at_close=False,
+            )
+            bt.logging.info(
+                f"Owner verdict snapshot prefetch wave {offset}/{epoch_blocks}"
+            )
+            return
+
+        epoch_seed, real_epoch_seed = self._get_chain_block_hash(
+            epoch_number * epoch_blocks
+        )
+        if not real_epoch_seed:
+            return
+        from neurons.proof_v3_shared_hard import (
+            deterministic_shared_hard_order_v3,
+        )
+
+        endpoint_keys = tuple(
+            (
+                miner.address.lower(),
+                int(miner.model_index),
+                miner.endpoint.rstrip("/"),
+            )
+            for miner in self._epoch_miners
+        )
+        try:
+            ordered = deterministic_shared_hard_order_v3(
+                epoch_number=epoch_number,
+                epoch_seed=epoch_seed,
+                endpoint_keys=endpoint_keys,
+            )
+        except ValueError as exc:
+            bt.logging.warning(
+                "Shared proof-v3 hard prefetch ordering failed locally: "
+                f"{exc}"
+            )
+            return
+        miners = {
+            (
+                miner.address.lower(),
+                int(miner.model_index),
+                miner.endpoint.rstrip("/"),
+            ): miner
+            for miner in self._epoch_miners
+        }
+        submitted = 0
+        for endpoint_key in ordered:
+            miner = miners[endpoint_key]
+            with self._shared_hard_prefetch_lock:
+                already_cached = any(
+                    key[:3]
+                    == (
+                        epoch_number,
+                        miner.address.lower(),
+                        int(miner.model_index),
+                    )
+                    for key in self._shared_hard_prefetch_results
+                )
+                if already_cached or endpoint_key in (
+                    key[1:] for key in self._shared_hard_prefetch_inflight
+                ):
+                    continue
+                inflight_key = (epoch_number, *endpoint_key)
+                self._shared_hard_prefetch_inflight.add(inflight_key)
+            self._shared_hard_prefetch_executor.submit(
+                self._prefetch_shared_hard_bundle,
+                epoch_number=epoch_number,
+                miner=miner,
+                owner_ss58=owner_ss58,
+                inflight_key=inflight_key,
+            )
+            submitted += 1
+        if submitted:
+            bt.logging.info(
+                f"Shared proof-v3 hard prefetch wave {offset}/{epoch_blocks}: "
+                f"scheduled={submitted}"
+            )
+
+    def _verify_shared_hard_bundles_at_close(
+        self,
+        epoch_number: int,
+        miner_receipts: Dict[str, List[ServiceReceipt]],
+    ) -> Dict[Tuple[str, int], bool]:
+        """Replay the configured hard auditor's receipt-matched proof once."""
+
+        if not self._proof_v3_allowed():
+            return {}
+        owner_ss58 = str(
+            getattr(
+                self.config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
+        )
+        if (
+            not getattr(
+                self.config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+            or not owner_ss58
+            or owner_ss58 == self._validator_hotkey_ss58
+        ):
+            return {}
+        if self._proof_v3_follower_mode_active():
+            return self._follower_hard_verdicts_at_close(epoch_number)
+
+        from neurons.proof_v3_shared_hard import (
+            SharedHardBundlePeerFailure,
+            SharedHardBundleUnavailable,
+            deterministic_shared_hard_order_v3,
+            verify_indexed_shared_hard_bundle_v3,
+        )
+        from verallm.chain.wallet import ss58_decode
+
+        try:
+            owner_key = ss58_decode(owner_ss58)
+        except Exception as exc:
+            bt.logging.warning(
+                "Shared proof-v3 hard verification is locally unavailable: "
+                f"configured hard-auditor identity is malformed: {exc}"
+            )
+            return {}
+
+        work: Dict[
+            Tuple[str, int, str],
+            tuple[ActiveMiner, tuple[ServiceReceipt, ...]],
+        ] = {}
+        for miner in self._epoch_miners:
+            receipts = tuple(
+                receipt
+                for receipt in miner_receipts.get(miner.address, ())
+                if (
+                    receipt.model_id == miner.model_id
+                    and receipt.model_index == miner.model_index
+                    and receipt.validator_hotkey == owner_key
+                    and receipt.is_canary
+                    and receipt.proof_requested
+                )
+            )
+            if receipts:
+                work[
+                    (
+                        miner.address.lower(),
+                        int(miner.model_index),
+                        miner.endpoint.rstrip("/"),
+                    )
+                ] = (miner, receipts)
+        if not work:
+            return {}
+
+        epoch_seed, real_epoch_seed = self._get_chain_block_hash(
+            int(epoch_number) * int(self.config.epoch_blocks)
+        )
+        if not real_epoch_seed:
+            for miner, _receipts in work.values():
+                self._validator_canary_failures.add(
+                    self._miner_model_key(
+                        miner.address,
+                        miner.model_index,
+                    )
+                )
+            bt.logging.warning(
+                "Shared proof-v3 hard verification is locally unavailable: "
+                "the epoch-start chain hash could not be authenticated"
+            )
+            return {}
+        try:
+            ordered = deterministic_shared_hard_order_v3(
+                epoch_number=epoch_number,
+                epoch_seed=epoch_seed,
+                endpoint_keys=tuple(work),
+            )
+        except ValueError as exc:
+            bt.logging.warning(
+                "Shared proof-v3 hard verification ordering failed locally: "
+                f"{exc}"
+            )
+            return {}
+
+        def verify_one(
+            item: tuple[ActiveMiner, tuple[ServiceReceipt, ...]],
+        ) -> tuple[str, str]:
+            miner, receipts = item
+            release = getattr(self, "_proof_v3_releases", {}).get(
+                miner.model_id
+            )
+            policy = getattr(self, "_proof_v3_canary_policy", None)
+            model_policy = (
+                policy.model_policy(miner.model_id)
+                if policy is not None
+                else None
+            )
+            miner_hotkey = str(
+                getattr(miner, "hotkey_ss58", "") or ""
+            )
+            if (
+                release is None
+                or model_policy is None
+                or not miner_hotkey
+                or model_policy.execution_profile_digest
+                != release.qualified_profile.profile.digest()
+                or str(miner.quant or "").strip().lower()
+                not in model_policy.allowed_quantizations
+            ):
+                return "local", "qualified release or endpoint identity unavailable"
+            if any(receipt.proof_verified is not True for receipt in receipts):
+                return "peer", "hard-auditor receipt records proof failure"
+
+            pending: list[ServiceReceipt] = []
+            for receipt in receipts:
+                cached = self._shared_hard_prefetch_result(
+                    epoch_number=epoch_number,
+                    miner=miner,
+                    receipt=receipt,
+                )
+                if cached is None:
+                    pending.append(receipt)
+                elif cached[0] == "peer":
+                    return "peer", cached[1]
+            if not pending:
+                return "pass", ""
+
+            retry_failure: Exception | None = None
+            for attempt in range(3):
+                try:
+                    with ValidatorClient(
+                        miner_url=miner.endpoint,
+                        config=Config(block_size=256, spot_checks=25),
+                        timeout=max(
+                            10.0,
+                            float(self.config.epoch_receipt_pull_timeout),
+                        ),
+                        verify_tls=False,
+                        validator_hotkey_ss58=self._validator_hotkey_ss58,
+                        validator_seed=self._validator_private_key,
+                    ) as client:
+                        index = client.fetch_proof_v3_hard_bundle_index(
+                            epoch_number
+                        )
+                        for receipt in pending:
+                            verify_indexed_shared_hard_bundle_v3(
+                                client=client,
+                                index=index,
+                                receipt=receipt,
+                                qualified_release=release,
+                                hard_auditor_hotkey_ss58=owner_ss58,
+                                miner_hotkey_ss58=miner_hotkey,
+                                expected_epoch_number=epoch_number,
+                                expected_miner_address=miner.address,
+                                expected_model_id=miner.model_id,
+                                expected_model_index=miner.model_index,
+                            )
+                            self._store_shared_hard_prefetch_result(
+                                epoch_number=epoch_number,
+                                miner=miner,
+                                receipt=receipt,
+                                status="pass",
+                                detail="",
+                            )
+                    return "pass", ""
+                except (SharedHardBundleUnavailable, httpx.HTTPError) as exc:
+                    retry_failure = exc
+                    if attempt < 2:
+                        time.sleep(0.25 * (1 << attempt))
+                    continue
+                except SharedHardBundlePeerFailure as exc:
+                    return "peer", str(exc)
+                except (TypeError, ValueError) as exc:
+                    return "peer", f"{type(exc).__name__}: {exc}"
+                except Exception as exc:
+                    return "local", f"{type(exc).__name__}: {exc}"
+            assert retry_failure is not None
+            # The endpoint returned this signed receipt during the same close
+            # pass, so persistent absence after prefetch and bounded retries
+            # is a peer retention failure rather than a validator timeout.
+            return (
+                "peer",
+                f"{type(retry_failure).__name__}: {retry_failure}",
+            )
+
+        verdicts: Dict[Tuple[str, int], bool] = {}
+        local_failures = 0
+        peer_failures = 0
+        workers = max(
+            1,
+            min(
+                8,
+                int(
+                    getattr(
+                        self.config,
+                        "capacity_audit_proof_verify_workers",
+                        4,
+                    )
+                    or 4
+                ),
+                len(ordered),
+            ),
+        )
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="proof-v3-shared-hard",
+        ) as executor:
+            futures = {
+                executor.submit(verify_one, work[endpoint_key]): endpoint_key
+                for endpoint_key in ordered
+            }
+            for future in futures:
+                endpoint_key = futures[future]
+                miner, endpoint_receipts = work[endpoint_key]
+                key = self._miner_model_key(
+                    miner.address,
+                    miner.model_index,
+                )
+                try:
+                    status, detail = future.result()
+                except Exception as exc:
+                    status, detail = (
+                        "local",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                if status == "pass":
+                    verdicts[key] = True
+                    for receipt in endpoint_receipts:
+                        self._mark_shared_hard_receipt_processed(receipt)
+                elif status == "peer":
+                    verdicts[key] = False
+                    peer_failures += 1
+                    for receipt in endpoint_receipts:
+                        self._mark_shared_hard_receipt_processed(receipt)
+                    bt.logging.info(
+                        "Shared proof-v3 hard failure for "
+                        f"{miner.address[:10]} model_index={miner.model_index}: "
+                        f"{detail}"
+                    )
+                else:
+                    local_failures += 1
+                    self._validator_canary_failures.add(key)
+                    bt.logging.warning(
+                        "Shared proof-v3 hard verification failed locally "
+                        f"(NOT attributed to miner {miner.address[:10]} "
+                        f"model_index={miner.model_index}): {detail}"
+                    )
+                bt.logging.info(
+                    "Shared proof-v3 hard replay verdict: "
+                    f"address={miner.address.lower()} "
+                    f"model_index={miner.model_index} verdict={status}"
+                )
+        bt.logging.info(
+            f"Shared proof-v3 hard replay: pass="
+            f"{sum(value is True for value in verdicts.values())} "
+            f"peer_failure={peer_failures} local_failure={local_failures} "
+            f"neutral={len(self._epoch_miners) - len(work)}"
+        )
+        return verdicts
+
+    def _verify_late_shared_hard_bundles_at_close(
+        self,
+        *,
+        current_epoch: int,
+        receipt_authority: ValidatorAuthority | None,
+    ) -> Dict[Tuple[str, int], bool]:
+        """Consume unprocessed owner bundles from retained prior epochs.
+
+        Late hard proofs are promoted through a security-only endpoint and do
+        not enter the already-closed throughput receipt set. Followers still
+        authenticate the embedded owner receipt against the current metagraph
+        and independently verify the retained proof during its three-epoch
+        retention window.
+        """
+
+        if self._proof_v3_follower_mode_active():
+            return {}
+        if not self._proof_v3_allowed() or receipt_authority is None:
+            return {}
+        owner_ss58 = str(
+            getattr(
+                self.config,
+                "proof_v3_hard_auditor_hotkey_ss58",
+                "",
+            )
+            or ""
+        )
+        if (
+            not getattr(
+                self.config,
+                "proof_v3_hard_auditor_policy_enabled",
+                False,
+            )
+            or not owner_ss58
+            or owner_ss58 == self._validator_hotkey_ss58
+        ):
+            return {}
+
+        from neurons.proof_v3_shared_hard import (
+            SharedHardBundlePeerFailure,
+            SharedHardBundleUnavailable,
+            shared_hard_receipt_cache_key_v3,
+            verify_indexed_shared_hard_bundle_v3,
+        )
+        from verallm.chain.wallet import ss58_decode
+
+        try:
+            owner_key = ss58_decode(owner_ss58)
+        except Exception as exc:
+            bt.logging.warning(
+                "Late shared proof-v3 replay is locally unavailable: "
+                f"configured hard-auditor identity is malformed: {exc}"
+            )
+            return {}
+
+        first_epoch = max(0, int(current_epoch) - 3)
+        source_epochs = range(first_epoch, int(current_epoch))
+        receipt_window = max(
+            4_500.0,
+            4.0 * float(max(1, int(self.config.epoch_blocks))) * 12.0,
+        )
+        verdicts: Dict[Tuple[str, int], bool] = {}
+        local_failures = 0
+        for miner in self._epoch_miners:
+            release = getattr(self, "_proof_v3_releases", {}).get(
+                miner.model_id
+            )
+            policy = getattr(self, "_proof_v3_canary_policy", None)
+            model_policy = (
+                policy.model_policy(miner.model_id)
+                if policy is not None
+                else None
+            )
+            miner_hotkey = str(
+                getattr(miner, "hotkey_ss58", "") or ""
+            )
+            if (
+                release is None
+                or model_policy is None
+                or not miner_hotkey
+                or model_policy.execution_profile_digest
+                != release.qualified_profile.profile.digest()
+                or str(miner.quant or "").strip().lower()
+                not in model_policy.allowed_quantizations
+            ):
+                continue
+            endpoint_key = self._miner_model_key(
+                miner.address,
+                miner.model_index,
+            )
+            try:
+                with ValidatorClient(
+                    miner_url=miner.endpoint,
+                    config=Config(block_size=256, spot_checks=25),
+                    timeout=max(
+                        10.0,
+                        float(self.config.epoch_receipt_pull_timeout),
+                    ),
+                    verify_tls=False,
+                    validator_hotkey_ss58=self._validator_hotkey_ss58,
+                    validator_seed=self._validator_private_key,
+                ) as client:
+                    for source_epoch in source_epochs:
+                        index = client.fetch_proof_v3_hard_bundle_index(
+                            source_epoch
+                        )
+                        entries = index.get("bundles")
+                        if not isinstance(entries, list):
+                            raise SharedHardBundlePeerFailure(
+                                "shared hard proof index is malformed"
+                            )
+                        for entry in entries:
+                            if not isinstance(entry, dict):
+                                continue
+                            raw_receipt = entry.get("receipt")
+                            if not isinstance(raw_receipt, dict):
+                                continue
+                            try:
+                                receipt = receipt_from_dict(raw_receipt)
+                            except (KeyError, TypeError, ValueError):
+                                continue
+                            if (
+                                receipt.epoch_number != source_epoch
+                                or receipt.validator_hotkey != owner_key
+                                or receipt.miner_address.lower()
+                                != miner.address.lower()
+                                or receipt.model_id != miner.model_id
+                                or receipt.model_index != miner.model_index
+                                or receipt.is_canary is not True
+                                or receipt.proof_requested is not True
+                            ):
+                                continue
+                            if not verify_service_receipt(
+                                receipt,
+                                source_epoch,
+                                authority=receipt_authority,
+                                receipt_window_sec=receipt_window,
+                            ):
+                                continue
+                            receipt_key = shared_hard_receipt_cache_key_v3(
+                                receipt
+                            )
+                            if (
+                                receipt_key
+                                in self._shared_hard_processed_receipts
+                            ):
+                                continue
+                            if receipt.proof_verified is not True:
+                                verdicts[endpoint_key] = False
+                                self._mark_shared_hard_receipt_processed(
+                                    receipt
+                                )
+                                continue
+                            try:
+                                verify_indexed_shared_hard_bundle_v3(
+                                    client=client,
+                                    index=index,
+                                    receipt=receipt,
+                                    qualified_release=release,
+                                    hard_auditor_hotkey_ss58=owner_ss58,
+                                    miner_hotkey_ss58=miner_hotkey,
+                                    expected_epoch_number=source_epoch,
+                                    expected_miner_address=miner.address,
+                                    expected_model_id=miner.model_id,
+                                    expected_model_index=miner.model_index,
+                                )
+                            except SharedHardBundleUnavailable:
+                                # Promotion may still be racing a completed
+                                # proof. Leave it unprocessed for the next
+                                # bounded polling wave.
+                                continue
+                            except SharedHardBundlePeerFailure as exc:
+                                verdicts[endpoint_key] = False
+                                self._mark_shared_hard_receipt_processed(
+                                    receipt
+                                )
+                                bt.logging.info(
+                                    "Late shared proof-v3 hard failure for "
+                                    f"{miner.address[:10]} "
+                                    f"model_index={miner.model_index}: {exc}"
+                                )
+                            else:
+                                if endpoint_key not in verdicts:
+                                    verdicts[endpoint_key] = True
+                                self._mark_shared_hard_receipt_processed(
+                                    receipt
+                                )
+            except httpx.HTTPError:
+                local_failures += 1
+            except SharedHardBundlePeerFailure as exc:
+                verdicts[endpoint_key] = False
+                bt.logging.info(
+                    "Late shared proof-v3 index failure for "
+                    f"{miner.address[:10]} model_index={miner.model_index}: "
+                    f"{exc}"
+                )
+            except Exception as exc:
+                local_failures += 1
+                bt.logging.warning(
+                    "Late shared proof-v3 replay failed locally "
+                    f"(NOT attributed to miner {miner.address[:10]} "
+                    f"model_index={miner.model_index}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        if verdicts or local_failures:
+            bt.logging.info(
+                "Late shared proof-v3 replay: "
+                f"pass={sum(value is True for value in verdicts.values())} "
+                f"peer_failure="
+                f"{sum(value is False for value in verdicts.values())} "
+                f"local_failure={local_failures}"
+            )
+        return verdicts
+
+    def _load_local_epoch_receipts(
+        self,
+        epoch_number: int,
+        receipt_authority: ValidatorAuthority | None,
+    ) -> List[ServiceReceipt]:
+        """Load and verify receipts signed and persisted by this validator."""
+
+        receipt_dicts = self._db.get_local_service_receipts(epoch_number)
+        receipts: List[ServiceReceipt] = []
+        for value in receipt_dicts:
+            try:
+                receipt = receipt_from_dict(value)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise _ProofV3ValidatorConfigurationError(
+                    "validator-local service receipt is malformed"
+                ) from exc
+            if receipt.validator_hotkey != self._validator_hotkey_bytes:
+                raise _ProofV3ValidatorConfigurationError(
+                    "validator-local service receipt has the wrong signer"
+                )
+            if not verify_service_receipt(
+                receipt,
+                epoch_number,
+                authority=receipt_authority,
+                receipt_window_sec=4 * self._EPOCH_DURATION_SEC,
+            ):
+                raise _ProofV3ValidatorConfigurationError(
+                    "validator-local service receipt authentication failed"
+                )
+            receipts.append(receipt)
+        return receipts
+
     def _collect_epoch_receipts(
         self,
         epoch_number: int,
@@ -5565,6 +10315,22 @@ class ValidatorNeuron:
         miner_receipts: Dict[str, List[ServiceReceipt]] = {}
         all_epoch_receipts: List[ServiceReceipt] = []
         pull_failed_keys: Set[Tuple[str, int]] = set()
+
+        local_receipts = self._load_local_epoch_receipts(
+            epoch_number,
+            receipt_authority,
+        )
+        seen_sigs_by_addr: Dict[str, set[bytes]] = {}
+        for receipt in local_receipts:
+            address_key = receipt.miner_address.lower()
+            seen_sigs_by_addr.setdefault(address_key, set()).add(
+                receipt.validator_signature
+            )
+            miner_receipts.setdefault(receipt.miner_address, []).append(
+                receipt
+            )
+            all_epoch_receipts.append(receipt)
+
         if not self._epoch_miners:
             self._receipt_pull_failed_keys = pull_failed_keys
             return miner_receipts, all_epoch_receipts
@@ -5602,7 +10368,6 @@ class ValidatorNeuron:
             # the same receipt buffer. Filter by validator_signature so each
             # signed receipt counts once across all pulls for the same address.
             # Multi-server legit operators see no filtering (signatures differ).
-            seen_sigs_by_addr: Dict[str, set] = {}
             cross_pull_dups = 0
             try:
                 for fut in as_completed(receipt_futures, timeout=_rp_timeout):
@@ -5798,8 +10563,13 @@ class ValidatorNeuron:
         timestamp: Optional[int] = None,
         observed_start_ts: Optional[float] = None,
         observed_end_ts: Optional[float] = None,
+        capture_chain_digest: bytes = b"",
+        canary_obligation_id: bytes = b"",
+        canary_kind: str = "",
+        canary_target_prompt_tokens: int = 0,
+        security_only: bool = False,
     ) -> bool:
-        """Push signed receipt. Returns True on 200; retries transient transport/5xx."""
+        """Push a signed scoring or late security-only receipt."""
         receipt = create_receipt(
             miner_address=miner_address,
             model_id=model_id,
@@ -5820,15 +10590,41 @@ class ValidatorNeuron:
             timestamp=timestamp,
             observed_start_ts=observed_start_ts,
             observed_end_ts=observed_end_ts,
+            capture_chain_digest=capture_chain_digest,
+            canary_obligation_id=canary_obligation_id,
+            canary_kind=canary_kind,
+            canary_target_prompt_tokens=canary_target_prompt_tokens,
         )
 
-        url = f"{miner_endpoint.rstrip('/')}/epoch/receipt"
+        receipt_path = (
+            "/proof/v3/audit-receipt"
+            if security_only
+            else "/epoch/receipt"
+        )
+        url = f"{miner_endpoint.rstrip('/')}{receipt_path}"
         import json as _json
         import time as _time
         from neurons.request_signing import sign_request as _sign
-        receipt_body = _json.dumps(receipt_to_dict(receipt)).encode("utf-8")
+        receipt_dict = receipt_to_dict(receipt)
+        try:
+            self._db.store_local_service_receipt(receipt_dict)
+        except Exception as exc:
+            # Local persistence is part of exact obligation accounting. Peer
+            # transport may still succeed, but an active epoch with no local
+            # authoritative copy is a validator fault and must never be
+            # attributed to the miner at close.
+            if self._canary_epoch_active(epoch_number):
+                self._validator_canary_failures.add(
+                    self._miner_model_key(miner_address, model_index)
+                )
+            bt.logging.warning(
+                "Validator-local signed receipt persistence failed "
+                f"(NOT attributed to miner {miner_address[:10]} "
+                f"model_index={model_index}): {exc}"
+            )
+        receipt_body = _json.dumps(receipt_dict).encode("utf-8")
         auth_headers = _sign(
-            method="POST", path="/epoch/receipt", body=receipt_body,
+            method="POST", path=receipt_path, body=receipt_body,
             hotkey_ss58=self._validator_hotkey_ss58,
             hotkey_seed=self._validator_private_key,
         )
@@ -5922,8 +10718,12 @@ class ValidatorNeuron:
                 f"Tokenizer hash verified for {model_id}: {local[:8].hex()}"
             )
 
-    def _on_proof_failure(self, miner_address: str, model_index: int,
-                          endpoint: str = ""):
+    def _on_proof_failure(
+        self,
+        miner_address: str,
+        model_index: int,
+        endpoint: str = "",
+    ):
         """Mid-epoch cutoff: immediately put miner on probation and notify proxy.
 
         Called as soon as a proof verification fails (not waiting for epoch close).
@@ -6081,6 +10881,21 @@ class ValidatorNeuron:
             if resp.status_code != 200:
                 return "unavailable"
             data = resp.json()
+            versions = data.get("proof_protocol_versions")
+            miner.proof_protocol_versions = (
+                sorted(
+                    {
+                        version
+                        for version in versions
+                        if (
+                            type(version) is int
+                            and version in SUPPORTED_PROOF_PROTOCOL_VERSIONS
+                        )
+                    }
+                )
+                if isinstance(versions, list)
+                else []
+            )
             if "hardware" not in data:
                 return "missing"
             valid, hw = _normalize_health_hardware(data.get("hardware"))
@@ -6686,6 +11501,154 @@ class ValidatorNeuron:
             }
         return result
 
+    def _finalize_owner_verdict_snapshot(
+        self,
+        *,
+        epoch_number: int,
+        miner_receipts: Dict[str, List[ServiceReceipt]],
+    ) -> bool:
+        """Sign and persist the owner's complete current decision set."""
+
+        if not _proof_v3_hard_auditor_active(
+            self.config,
+            getattr(self, "_validator_hotkey_ss58", ""),
+        ):
+            return False
+        from neurons.verdict_records import (
+            VerdictSnapshotEntryV1,
+            VerdictSnapshotV1,
+            canonical_verdict_entries_v1,
+            sign_verdict_snapshot_v1,
+            verify_verdict_snapshot_v1,
+        )
+
+        existing_hex = str(getattr(self, "_verdict_snapshot_hex", "") or "")
+        if existing_hex:
+            try:
+                existing = VerdictSnapshotV1.from_bytes(
+                    bytes.fromhex(existing_hex)
+                )
+                if (
+                    existing.epoch_number == int(epoch_number)
+                    and verify_verdict_snapshot_v1(
+                        existing,
+                        expected_auditor_hotkey_ss58=(
+                            self._validator_hotkey_ss58
+                        ),
+                    )
+                ):
+                    # Finalized epoch bytes are immutable and survive restart.
+                    return True
+            except Exception:
+                pass
+
+        published_failures: set[Tuple[str, int]] = set()
+        try:
+            for failure in self._db.get_proof_v3_hard_failures(
+                int(epoch_number),
+                int(epoch_number),
+            ):
+                published_failures.add(
+                    self._miner_model_key(
+                        str(failure.get("miner_address") or ""),
+                        int(failure.get("model_index", -1)),
+                    )
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "owner hard-failure state is unavailable"
+            ) from exc
+
+        entries: list[VerdictSnapshotEntryV1] = []
+        for miner in self._epoch_miners:
+            key = self._miner_model_key(
+                miner.address,
+                miner.model_index,
+            )
+            own_hard_receipts = [
+                receipt
+                for receipt in miner_receipts.get(miner.address, ())
+                if (
+                    receipt.epoch_number == int(epoch_number)
+                    and receipt.model_id == miner.model_id
+                    and receipt.model_index == miner.model_index
+                    and receipt.validator_hotkey
+                    == self._validator_hotkey_bytes
+                    and receipt.is_canary
+                    and receipt.proof_requested
+                )
+            ]
+            if key in published_failures:
+                hard_verdict = 0
+            elif own_hard_receipts:
+                hard_verdict = int(
+                    all(
+                        receipt.proof_verified is True
+                        for receipt in own_hard_receipts
+                    )
+                )
+            else:
+                hard_verdict = -1
+
+            uid = self._resolve_uid(miner.address)
+            capacity_gated = bool(
+                self._capacity_audit_score_gate_reason(
+                    miner.address,
+                    miner.model_index,
+                    epoch_number,
+                    uid=uid,
+                )
+                or self._capacity_audit_uid_score_gate_reason(
+                    uid,
+                    epoch_number,
+                )
+            )
+            entries.append(
+                VerdictSnapshotEntryV1(
+                    miner_address=str(miner.address).lower(),
+                    model_index=int(miner.model_index),
+                    miner_hotkey_ss58=str(
+                        getattr(miner, "hotkey_ss58", "") or ""
+                    ),
+                    model_id=str(miner.model_id),
+                    hard_verdict=hard_verdict,
+                    hard_source_epoch=(
+                        int(epoch_number) if hard_verdict != -1 else -1
+                    ),
+                    capacity_gated=capacity_gated,
+                    probation=self._probation_tracker.is_on_probation(key),
+                )
+            )
+        snapshot = sign_verdict_snapshot_v1(
+            VerdictSnapshotV1(
+                auditor_hotkey=bytes(self._validator_hotkey_bytes),
+                epoch_number=int(epoch_number),
+                generated_at=int(time.time()),
+                entries=canonical_verdict_entries_v1(entries),
+            ),
+            self._validator_private_key,
+        )
+        encoded = snapshot.to_bytes().hex()
+        self._db.set_meta("gleipnir_verdict_snapshot_v1", encoded)
+        history = dict(getattr(self, "_verdict_snapshot_history", {}) or {})
+        history[int(epoch_number)] = encoded
+        history = dict(sorted(history.items())[-4:])
+        self._db.set_meta(
+            "gleipnir_verdict_snapshots_v1",
+            json.dumps(
+                {str(epoch): value for epoch, value in history.items()},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        self._verdict_snapshot_history = history
+        self._verdict_snapshot_hex = encoded
+        bt.logging.info(
+            f"VerdictSnapshotV1 finalized: epoch={epoch_number} "
+            f"entries={len(snapshot.entries)} bytes={len(snapshot.to_bytes())}"
+        )
+        return True
+
     def _schedule_miner_debug_refresh(
         self,
         *,
@@ -6790,6 +11753,39 @@ class ValidatorNeuron:
             if str(a or "").strip()
         }
         shared.stale_miner_addresses = sorted(stale_addresses)
+        try:
+            shared.proof_v3_hard_failures = (
+                self._db.get_proof_v3_hard_failures(
+                    max(0, int(self._current_epoch) - 3),
+                    int(self._current_epoch),
+                )
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                f"Failed to export proof-v3 hard outcomes: {exc}"
+            )
+            shared.proof_v3_hard_failures = []
+        shared.verdict_snapshot = (
+            str(getattr(self, "_verdict_snapshot_hex", "") or "")
+            if _proof_v3_hard_auditor_active(
+                self.config,
+                getattr(self, "_validator_hotkey_ss58", ""),
+            )
+            else ""
+        )
+        shared.verdict_snapshots = (
+            {
+                str(epoch): str(snapshot)
+                for epoch, snapshot in (
+                    getattr(self, "_verdict_snapshot_history", {}) or {}
+                ).items()
+            }
+            if _proof_v3_hard_auditor_active(
+                self.config,
+                getattr(self, "_validator_hotkey_ss58", ""),
+            )
+            else {}
+        )
         # Build ss58_map with UIDs so the proxy can resolve UIDs for
         # miners not in miner_endpoints (e.g. inactive/unreachable).
         uid_map_all = self._db.get_all_uids()
@@ -7081,10 +12077,35 @@ class ValidatorNeuron:
             number = header.get("number")
             if number is not None:
                 try:
-                    return int(number)
+                    return int(number, 0) if isinstance(number, str) else int(number)
                 except (TypeError, ValueError):
                     return None
         return None
+
+    def _observe_live_capacity_audit_head(self) -> tuple[int, bool]:
+        """Read a validator-owned best-head observation directly from RPC.
+
+        Capacity proof v2 uses the future ``B_proof`` block as public
+        randomness.  A final transcript is usable only when the validator has
+        received it while its live node is still below that height.  The raw
+        RPC read avoids treating a delayed local block-processing callback as
+        evidence that the challenge was not yet observable.
+        """
+        known_head = max(0, int(getattr(self, "_last_known_block", 0) or 0))
+        target = getattr(self, "_subtensor", None)
+        substrate = getattr(target, "substrate", None)
+        if substrate is None:
+            return known_head, False
+        try:
+            response = substrate.rpc_request("chain_getHeader", [])
+            header = response.get("result") if isinstance(response, dict) else response
+            live_head = self._block_number_from_header(header)
+        except Exception as exc:
+            bt.logging.debug(f"Capacity audit live head observation failed: {exc}")
+            return known_head, False
+        if live_head is None or int(live_head) <= 0:
+            return known_head, False
+        return max(known_head, int(live_head)), True
 
     @staticmethod
     def _close_subtensor(subtensor_obj) -> None:
@@ -7233,6 +12254,37 @@ class ValidatorNeuron:
             current_hash_real=current_hash_real,
         )
 
+    def _process_current_head_subscription_header(
+        self,
+        block_header: object,
+        last_block: int,
+        rpc_subtensor: object,
+    ) -> int:
+        """Process one streamed header without re-entering its RPC socket.
+
+        ``substrate-interface`` invokes subscription callbacks on the same
+        websocket reader that owns the subscription. Issuing another RPC on
+        that connection from inside the callback deadlocks the reader. A
+        dedicated non-subscription Subtensor connection resolves the block
+        hash and any catch-up blocks without contending with the validator's
+        other background RPC work.
+        """
+
+        block_number = self._block_number_from_header(block_header)
+        if block_number is None:
+            return last_block
+        block_hash, block_hash_real = self._get_chain_block_hash(
+            block_number,
+            rpc_subtensor,
+        )
+        return self._process_current_head_block_range(
+            last_block,
+            block_number,
+            rpc_subtensor,
+            current_hash=block_hash,
+            current_hash_real=block_hash_real,
+        )
+
     def _run_with_streaming(self):
         """Use current-head streaming as primary path with polling catch-up."""
         import bittensor as bt
@@ -7242,10 +12294,12 @@ class ValidatorNeuron:
         fallback_poll_s = self._block_stream_fallback_poll_s()
         while self._running:
             fresh_sub = None
+            rpc_sub = None
             try:
                 bt.logging.info("Creating fresh Subtensor connection for current-head block stream...")
                 SubtensorCls = getattr(bt, "Subtensor", None) or getattr(bt, "subtensor")
                 fresh_sub = SubtensorCls(network=self.config.subtensor_network)
+                rpc_sub = SubtensorCls(network=self.config.subtensor_network)
                 substrate = getattr(fresh_sub, "substrate", None)
                 subscribe = getattr(substrate, "subscribe_block_headers", None)
                 if subscribe is None:
@@ -7269,25 +12323,18 @@ class ValidatorNeuron:
                 def callback(block_header):
                     if not self._running or stop_event.is_set():
                         raise StopIteration("Validator shutting down")
-                    block_number = self._block_number_from_header(block_header)
-                    if block_number is None:
-                        return None
                     with process_lock:
                         with lock:
                             state.last_header_at = time.monotonic()
                             state.active = True
                             base_block = int(state.last_block)
                         try:
-                            block_hash, block_hash_real = self._get_chain_block_hash(
-                                block_number,
-                                fresh_sub,
-                            )
-                            new_last = self._process_current_head_block_range(
-                                base_block,
-                                block_number,
-                                fresh_sub,
-                                current_hash=block_hash,
-                                current_hash_real=block_hash_real,
+                            new_last = (
+                                self._process_current_head_subscription_header(
+                                    block_header,
+                                    base_block,
+                                    rpc_sub,
+                                )
                             )
                         finally:
                             with lock:
@@ -7355,9 +12402,11 @@ class ValidatorNeuron:
                         bt.logging.warning(f"Current-head block stream ended: {error}")
                         break
                     reference_at = last_header_at or started_at
-                    if not active and now - reference_at > watchdog_s:
+                    if now - reference_at > watchdog_s:
                         bt.logging.warning(
-                            f"Current-head block stream stale for {now - reference_at:.1f}s; "
+                            "Current-head block stream "
+                            + ("callback stalled" if active else "stale")
+                            + f" for {now - reference_at:.1f}s; "
                             "reconnecting after polling catch-up"
                         )
                         break
@@ -7366,6 +12415,8 @@ class ValidatorNeuron:
                 last_block = int(getattr(state, "last_block", last_block) or last_block)
                 self._close_subtensor(fresh_sub)
                 fresh_sub = None
+                self._close_subtensor(rpc_sub)
+                rpc_sub = None
                 if self._running:
                     last_block = self._poll_current_head_catch_up(last_block)
             except Exception as exc:
@@ -7375,6 +12426,8 @@ class ValidatorNeuron:
             finally:
                 if fresh_sub is not None:
                     self._close_subtensor(fresh_sub)
+                if rpc_sub is not None:
+                    self._close_subtensor(rpc_sub)
 
     def _run_with_polling(self):
         """Fallback: poll for new blocks periodically."""
@@ -7412,8 +12465,10 @@ class ValidatorNeuron:
         self._control_executor.shutdown(wait=False)
         self._capacity_audit_executor.shutdown(wait=False)
         self._capacity_audit_discovery_executor.shutdown(wait=False)
+        self._capacity_audit_receipt_executor.shutdown(wait=False)
         self._miner_debug_executor.shutdown(wait=False)
         self._capacity_audit_proof_executor.shutdown(wait=False)
+        self._shared_hard_prefetch_executor.shutdown(wait=False)
 
 
 def parse_args():
@@ -7423,6 +12478,88 @@ def parse_args():
     parser.add_argument("--netuid", type=int, required=True)
     parser.add_argument("--chain-config", default=None,
                         help="Path to chain config JSON. If omitted, derived from --subtensor-network.")
+    parser.add_argument(
+        "--proof-v2-manifest",
+        action="append",
+        default=None,
+        help=(
+            "Path to a signed proof-v2 manifest document. Repeat once per "
+            "registered model. Defaults to VERATHOS_PROOF_V2_MANIFESTS "
+            "split by the platform path separator."
+        ),
+    )
+    parser.add_argument(
+        "--proof-v2-artifact-base-url",
+        action="append",
+        default=None,
+        help=(
+            "HTTPS base URL for content-addressed proof-v2 artifacts. "
+            "Repeat to configure fallback mirrors; defaults to "
+            "VERATHOS_PROOF_V2_ARTIFACT_BASE_URLS (comma-separated)."
+        ),
+    )
+    parser.add_argument(
+        "--proof-v2-artifact-cache-dir",
+        default=None,
+        help=(
+            "Local proof-v2 artifact cache directory; defaults to "
+            "VERATHOS_PROOF_V2_ARTIFACT_CACHE_DIR or VERALLM_DATA_DIR."
+        ),
+    )
+    parser.add_argument(
+        "--proof-v3-release",
+        action="append",
+        default=None,
+        help=(
+            "Path to a proof-v3 release descriptor. Repeat once per "
+            "qualified model. Defaults to VERATHOS_PROOF_V3_RELEASES split "
+            "by the platform path separator."
+        ),
+    )
+    parser.add_argument(
+        "--proof-v3-artifact-base-url",
+        action="append",
+        default=None,
+        help=(
+            "HTTPS base URL for content-addressed proof-v3 releases. "
+            "Repeat for mirrors; defaults to "
+            "VERATHOS_PROOF_V3_ARTIFACT_BASE_URLS."
+        ),
+    )
+    parser.add_argument(
+        "--proof-v3-artifact-cache-dir",
+        default=None,
+        help=(
+            "Local proof-v3 release cache; defaults to "
+            "VERATHOS_PROOF_V3_ARTIFACT_CACHE_DIR or VERALLM_DATA_DIR."
+        ),
+    )
+    parser.add_argument(
+        "--proof-v3-canary-policy",
+        default=None,
+        help=(
+            "Path to the authority-signed proof-v3 canary policy. Defaults "
+            "to VERATHOS_PROOF_V3_CANARY_POLICY."
+        ),
+    )
+    parser.add_argument(
+        "--proof-v3-verdict-source",
+        choices=("verify", "follower"),
+        default=None,
+        help=(
+            "Source for hard/capacity decisions. follower is the default; "
+            "owner and independent-verifier deployments explicitly select "
+            "verify."
+        ),
+    )
+    parser.add_argument(
+        "--owner-verdict-url",
+        default=None,
+        help=(
+            "Owner proxy base URL for follower mode. Defaults are selected "
+            "by network; this flag is an explicit override."
+        ),
+    )
     parser.add_argument("--subtensor-network", default="test",
                         help="Bittensor network (test or finney). Selects chain config (contracts) and default RPC URL.")
     parser.add_argument("--subtensor-chain-endpoint", default=None,
@@ -7543,6 +12680,12 @@ def main():
     extra_kwargs = {}
     if args.ema_alpha is not None:
         extra_kwargs["ema_alpha"] = args.ema_alpha
+    if args.proof_v3_verdict_source is not None:
+        extra_kwargs["proof_v3_verdict_source"] = (
+            args.proof_v3_verdict_source
+        )
+    if args.owner_verdict_url is not None:
+        extra_kwargs["owner_verdict_url"] = args.owner_verdict_url
     if args.capacity_audit:
         extra_kwargs["capacity_audit_enabled"] = True
     if args.capacity_audit_mode is not None:
@@ -7643,6 +12786,55 @@ def main():
 
     config.allow_mock_tee = getattr(args, "allow_mock_tee", False)
     config.no_evm = getattr(args, "no_evm", False)
+    config.proof_v2_manifest_paths = _resolve_proof_v2_manifest_paths(
+        args.proof_v2_manifest,
+        chain_id=config.chain_id,
+        netuid=config.netuid,
+    )
+    from verallm.proof_v2.artifact_store import (
+        configured_proof_v2_artifact_base_urls,
+    )
+
+    config.proof_v2_artifact_base_urls = (
+        configured_proof_v2_artifact_base_urls(
+            args.proof_v2_artifact_base_url,
+            default_values=getattr(
+                chain_config,
+                "proof_v2_artifact_base_urls",
+                (),
+            ),
+        )
+    )
+    config.proof_v2_artifact_cache_dir = (
+        args.proof_v2_artifact_cache_dir
+        or getattr(chain_config, "proof_v2_artifact_cache_dir", "")
+        or None
+    )
+    config.proof_v3_release_paths = _resolve_proof_v3_release_paths(
+        args.proof_v3_release,
+    )
+    from verallm.proof_v3.artifact_store import (
+        configured_proof_v3_artifact_base_urls,
+    )
+
+    config.proof_v3_artifact_base_urls = (
+        configured_proof_v3_artifact_base_urls(
+            args.proof_v3_artifact_base_url,
+            default_values=getattr(
+                chain_config,
+                "proof_v3_artifact_base_urls",
+                (),
+            ),
+        )
+    )
+    config.proof_v3_artifact_cache_dir = (
+        args.proof_v3_artifact_cache_dir
+        or getattr(chain_config, "proof_v3_artifact_cache_dir", "")
+        or None
+    )
+    config.proof_v3_canary_policy_path = _resolve_proof_v3_canary_policy_path(
+        args.proof_v3_canary_policy,
+    )
     neuron = ValidatorNeuron(config)
     if args.analytics:
         bt.logging.info("Analytics database enabled (--analytics)")

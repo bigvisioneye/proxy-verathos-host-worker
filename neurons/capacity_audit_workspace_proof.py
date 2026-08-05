@@ -9,6 +9,8 @@ import struct
 from dataclasses import asdict
 from typing import Any, Iterable, Mapping, Sequence
 
+import numpy as np
+
 from neurons.capacity_audit import (
     canonical_json,
     derive_sampled_pass_index,
@@ -24,6 +26,7 @@ WORKSPACE_COMPACT_PROOF_FORMAT = "fixed_workspace_compact_gemm_v1"
 WORKSPACE_SEED_PREFIX = b"VERATHOS_FIXED_WORKSPACE_V1"
 WORKSPACE_PASS_ROOT_PREFIX = b"VERATHOS_FIXED_WORKSPACE_PASS_ROOT_V1"
 WORKSPACE_TRANSCRIPT_PREFIX = b"VERATHOS_FIXED_WORKSPACE_TRANSCRIPT_V1"
+WORKSPACE_TRANSCRIPT_V2_PREFIX = b"VERATHOS_FIXED_WORKSPACE_TRANSCRIPT_V2"
 WORKSPACE_PROOF_ROUND_PREFIX = b"VERATHOS_FIXED_WORKSPACE_PROOF_ROUND_V1"
 WORKSPACE_PROOF_BLOCK_PREFIX = b"VERATHOS_FIXED_WORKSPACE_PROOF_BLOCK_V1"
 WORKSPACE_Q_BLOCK_TAG = b"VERATHOS_Q_BLOCK_V1"
@@ -161,24 +164,28 @@ def workspace_i8_value_after_mix(
         raise ValueError("unsupported_memory_mix_rounds")
 
     idx = int(row) * int(matrix_dim) + int(col)
-    ai = _u8_from_i8(workspace_i8_value(
-        workspace_seed=workspace_seed,
-        pass_index=pass_index,
-        round_index=round_index,
-        matrix_id=0,
-        row=idx // int(matrix_dim),
-        col=idx % int(matrix_dim),
-        matrix_dim=matrix_dim,
-    ))
-    bi = _u8_from_i8(workspace_i8_value(
-        workspace_seed=workspace_seed,
-        pass_index=pass_index,
-        round_index=round_index,
-        matrix_id=1,
-        row=idx // int(matrix_dim),
-        col=idx % int(matrix_dim),
-        matrix_dim=matrix_dim,
-    ))
+    ai = _u8_from_i8(
+        workspace_i8_value(
+            workspace_seed=workspace_seed,
+            pass_index=pass_index,
+            round_index=round_index,
+            matrix_id=0,
+            row=idx // int(matrix_dim),
+            col=idx % int(matrix_dim),
+            matrix_dim=matrix_dim,
+        )
+    )
+    bi = _u8_from_i8(
+        workspace_i8_value(
+            workspace_seed=workspace_seed,
+            pass_index=pass_index,
+            round_index=round_index,
+            matrix_id=1,
+            row=idx // int(matrix_dim),
+            col=idx % int(matrix_dim),
+            matrix_dim=matrix_dim,
+        )
+    )
 
     for mix_index in range(int(memory_mix_rounds)):
         basis = int(workspace_seed) & _MASK64
@@ -191,6 +198,65 @@ def workspace_i8_value_after_mix(
         bi ^= rb & 0xFF
 
     return _i8_from_u8(ai if int(matrix_id) == 0 else bi)
+
+
+def workspace_i8_values_after_mix(
+    *,
+    workspace_seed: int,
+    pass_index: int,
+    round_index: int,
+    matrix_id: int,
+    element_indices: Any,
+    memory_mix_rounds: int,
+) -> np.ndarray:
+    """Vectorized form of :func:`workspace_i8_value_after_mix`.
+
+    The CUDA workspace uses independent SplitMix64 state per matrix element.
+    Recomputing a proof band one Python integer at a time is needlessly costly
+    at production matrix sizes, while NumPy's unsigned operations preserve the
+    kernel's exact modulo-2^64 semantics.
+    """
+
+    matrix_id = int(matrix_id)
+    if matrix_id not in (0, 1):
+        raise ValueError("unsupported_workspace_matrix_id")
+    memory_mix_rounds = int(memory_mix_rounds)
+    if memory_mix_rounds < 0:
+        raise ValueError("unsupported_memory_mix_rounds")
+
+    indices = np.asarray(element_indices, dtype=np.uint64)
+    seed = np.uint64(int(workspace_seed) & _MASK64)
+    pass_term = np.uint64((int(pass_index) * _PASS_MIX) & _MASK64)
+    round_term = np.uint64((int(round_index) * _ROUND_MIX) & _MASK64)
+    base = seed ^ pass_term ^ round_term
+
+    def splitmix64(values: np.ndarray) -> np.ndarray:
+        values = values + np.uint64(0x9E3779B97F4A7C15)
+        values = (values ^ (values >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        values = (values ^ (values >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        return values ^ (values >> np.uint64(31))
+
+    with np.errstate(over="ignore"):
+        a_values = (
+            splitmix64(base ^ indices ^ np.uint64(_A_MIX)) & np.uint64(0xFF)
+        ).astype(np.uint8)
+        b_values = (
+            splitmix64(base ^ indices ^ np.uint64(_B_MIX)) & np.uint64(0xFF)
+        ).astype(np.uint8)
+
+        for mix_index in range(memory_mix_rounds):
+            mix_basis = base ^ np.uint64((mix_index * _MIX_ROUND_MIX) & _MASK64)
+            a_random = splitmix64(
+                mix_basis ^ (indices << np.uint64(1)) ^ np.uint64(_MIX_A_OFFSET)
+            )
+            b_random = splitmix64(
+                mix_basis ^ (indices << np.uint64(2)) ^ np.uint64(_MIX_B_OFFSET)
+            )
+            a_values ^= (a_random & np.uint64(0xFF)).astype(np.uint8)
+            b_values ^= (b_random & np.uint64(0xFF)).astype(np.uint8)
+
+    selected = a_values if matrix_id == 0 else b_values
+    return np.ascontiguousarray(selected.astype(np.int16) - 128).astype(np.int8)
 
 
 def transition_basis(
@@ -263,8 +329,14 @@ def transition_expected_values(
     out_b = _u8_from_i8(bi)
     for lane, aj, bk in sources:
         lane_basis = (basis ^ ((int(lane) + 1) * 0xD6E8FEB86659FD93)) & _MASK64
-        ma = _splitmix64(lane_basis ^ ((idx << 1) & _MASK64) ^ _TRANSITION_A_OFFSET) & 0xFF
-        mb = _splitmix64(lane_basis ^ ((idx << 2) & _MASK64) ^ _TRANSITION_B_OFFSET) & 0xFF
+        ma = (
+            _splitmix64(lane_basis ^ ((idx << 1) & _MASK64) ^ _TRANSITION_A_OFFSET)
+            & 0xFF
+        )
+        mb = (
+            _splitmix64(lane_basis ^ ((idx << 2) & _MASK64) ^ _TRANSITION_B_OFFSET)
+            & 0xFF
+        )
         out_a = (out_a + (_u8_from_i8(bk) ^ ma)) & 0xFF
         out_b = (out_b + (_u8_from_i8(aj) ^ mb)) & 0xFF
     return _i8_from_u8(out_a), _i8_from_u8(out_b)
@@ -287,7 +359,9 @@ def derive_transition_element_index(
         return 0
     digest = _sha256(
         WORKSPACE_TRANSITION_PROOF_TAG,
-        bytes.fromhex(str(challenge_seed_hex or "").removeprefix("0x")) if challenge_seed_hex else b"",
+        bytes.fromhex(str(challenge_seed_hex or "").removeprefix("0x"))
+        if challenge_seed_hex
+        else b"",
         bytes.fromhex(str(before_root_hex).removeprefix("0x")),
         bytes.fromhex(str(after_root_hex).removeprefix("0x")),
         str(lease_id).encode(),
@@ -378,6 +452,41 @@ def workspace_transcript_root(pass_entries: Sequence[Mapping[str, Any]]) -> str:
     return h.hexdigest()
 
 
+def workspace_transcript_root_v2(
+    pass_entries: Sequence[Mapping[str, Any]],
+    state_pass_entries: Sequence[Mapping[str, Any]],
+) -> str:
+    """Commit every Q root and transition-state root before the B challenge."""
+
+    h = hashlib.sha256()
+    h.update(WORKSPACE_TRANSCRIPT_V2_PREFIX)
+    h.update(_u64(len(pass_entries)))
+    for entry in pass_entries:
+        pass_index = int(entry.get("pass_index", 0))
+        pass_root = str(entry.get("pass_root") or "")
+        round_roots = entry.get("round_roots") or []
+        h.update(_u64(pass_index))
+        h.update(bytes.fromhex(pass_root.removeprefix("0x")))
+        h.update(_u64(len(round_roots)))
+        for round_index, root_hex in enumerate(round_roots):
+            h.update(_u64(round_index))
+            h.update(bytes.fromhex(str(root_hex).removeprefix("0x")))
+
+    h.update(_u64(len(state_pass_entries)))
+    for entry in state_pass_entries:
+        pass_index = int(entry.get("pass_index", 0))
+        round_state_roots = entry.get("round_state_roots") or []
+        h.update(_u64(pass_index))
+        h.update(_u64(len(round_state_roots)))
+        for round_index, state_roots in enumerate(round_state_roots):
+            h.update(_u64(round_index))
+            h.update(_u64(len(state_roots)))
+            for mix_index, root_hex in enumerate(state_roots):
+                h.update(_u64(mix_index))
+                h.update(bytes.fromhex(str(root_hex).removeprefix("0x")))
+    return h.hexdigest()
+
+
 def derive_sampled_round_index(
     transcript_hex: str,
     lease_id: str,
@@ -433,7 +542,9 @@ def derive_challenge_block_index(
         return 0
     digest = _sha256(
         WORKSPACE_PROOF_BLOCK_PREFIX,
-        bytes.fromhex(str(challenge_seed_hex or "").removeprefix("0x")) if challenge_seed_hex else b"",
+        bytes.fromhex(str(challenge_seed_hex or "").removeprefix("0x"))
+        if challenge_seed_hex
+        else b"",
         bytes.fromhex(str(round_root_hex).removeprefix("0x")),
         str(lease_id).encode(),
         _u64(int(gpu_index)),
@@ -502,7 +613,9 @@ def workspace_state_block_hash_i8(
     try:
         import numpy as np
 
-        if isinstance(a_block_rows, np.ndarray) and isinstance(b_block_rows, np.ndarray):
+        if isinstance(a_block_rows, np.ndarray) and isinstance(
+            b_block_rows, np.ndarray
+        ):
             a_arr = a_block_rows
             b_arr = b_block_rows
             if a_arr.ndim != 2 or b_arr.ndim != 2 or a_arr.shape != b_arr.shape:
@@ -512,8 +625,8 @@ def workspace_state_block_hash_i8(
         else:
             a_arr, b_arr = _state_block_arrays_i8(a_block_rows, b_block_rows)
         packed = np.empty((a_arr.shape[0] * 2, a_arr.shape[1]), dtype=np.uint8)
-        packed[0::2, :] = (a_arr & 0xFF).astype(np.uint8, copy=False)
-        packed[1::2, :] = (b_arr & 0xFF).astype(np.uint8, copy=False)
+        packed[0::2, :] = a_arr.astype(np.uint8, copy=False)
+        packed[1::2, :] = b_arr.astype(np.uint8, copy=False)
         h.update(packed.tobytes(order="C"))
     except ImportError:
         if len(a_block_rows) != len(b_block_rows):
@@ -603,13 +716,15 @@ class WorkspaceMerkleTree:
             raise ValueError("invalid flat workspace Merkle tree length")
         obj = cls.__new__(cls)
         obj.num_leaves = int(num_leaves)
-        obj._nodes = [flat_tree[i * 32:(i + 1) * 32] for i in range(node_count)]
+        obj._nodes = [flat_tree[i * 32 : (i + 1) * 32] for i in range(node_count)]
         obj._offsets = _level_offsets(num_leaves)
         obj._offsets.append(node_count)
         return obj
 
     @classmethod
-    def from_matrix_i32(cls, matrix: Sequence[Sequence[int]], block_size: int) -> "WorkspaceMerkleTree":
+    def from_matrix_i32(
+        cls, matrix: Sequence[Sequence[int]], block_size: int
+    ) -> "WorkspaceMerkleTree":
         n = len(matrix)
         if n <= 0 or any(len(row) != n for row in matrix):
             raise ValueError("matrix must be non-empty and square")
@@ -620,8 +735,8 @@ class WorkspaceMerkleTree:
         for bi in range(blocks_per_row):
             for bj in range(blocks_per_row):
                 rows = [
-                    row[bj * block_size:(bj + 1) * block_size]
-                    for row in matrix[bi * block_size:(bi + 1) * block_size]
+                    row[bj * block_size : (bj + 1) * block_size]
+                    for row in matrix[bi * block_size : (bi + 1) * block_size]
                 ]
                 leaves.append(workspace_q_block_hash_i32(rows))
         return cls(leaves)
@@ -681,14 +796,16 @@ class WorkspaceStateMerkleTree:
         self._offsets.append(len(self._nodes))
 
     @classmethod
-    def from_flat_tree(cls, flat_tree: bytes, num_leaves: int) -> "WorkspaceStateMerkleTree":
+    def from_flat_tree(
+        cls, flat_tree: bytes, num_leaves: int
+    ) -> "WorkspaceStateMerkleTree":
         node_count = len(flat_tree) // 32
         expected = sum(_level_sizes(num_leaves))
         if len(flat_tree) % 32 != 0 or node_count != expected:
             raise ValueError("invalid flat workspace state Merkle tree length")
         obj = cls.__new__(cls)
         obj.num_leaves = int(num_leaves)
-        obj._nodes = [flat_tree[i * 32:(i + 1) * 32] for i in range(node_count)]
+        obj._nodes = [flat_tree[i * 32 : (i + 1) * 32] for i in range(node_count)]
         obj._offsets = _level_offsets(num_leaves)
         obj._offsets.append(node_count)
         return obj
@@ -703,7 +820,9 @@ class WorkspaceStateMerkleTree:
         n = len(a_matrix)
         if n <= 0 or len(b_matrix) != n:
             raise ValueError("state matrices must be non-empty and same-sized")
-        if any(len(row) != n for row in a_matrix) or any(len(row) != n for row in b_matrix):
+        if any(len(row) != n for row in a_matrix) or any(
+            len(row) != n for row in b_matrix
+        ):
             raise ValueError("state matrices must be square")
         if n % int(block_size) != 0:
             raise ValueError("state matrix dimension must be divisible by block_size")
@@ -712,12 +831,12 @@ class WorkspaceStateMerkleTree:
         for bi in range(blocks_per_row):
             for bj in range(blocks_per_row):
                 a_rows = [
-                    row[bj * block_size:(bj + 1) * block_size]
-                    for row in a_matrix[bi * block_size:(bi + 1) * block_size]
+                    row[bj * block_size : (bj + 1) * block_size]
+                    for row in a_matrix[bi * block_size : (bi + 1) * block_size]
                 ]
                 b_rows = [
-                    row[bj * block_size:(bj + 1) * block_size]
-                    for row in b_matrix[bi * block_size:(bi + 1) * block_size]
+                    row[bj * block_size : (bj + 1) * block_size]
+                    for row in b_matrix[bi * block_size : (bi + 1) * block_size]
                 ]
                 leaves.append(workspace_state_block_hash_i8(a_rows, b_rows))
         return cls(leaves)
@@ -753,7 +872,9 @@ def verify_workspace_merkle_path(root: bytes, leaf_hash: bytes, path: Any) -> bo
     current = bytes(leaf_hash)
     siblings = getattr(path, "siblings", path)
     for sibling, is_left in siblings:
-        sibling_b = bytes.fromhex(sibling) if isinstance(sibling, str) else bytes(sibling)
+        sibling_b = (
+            bytes.fromhex(sibling) if isinstance(sibling, str) else bytes(sibling)
+        )
         if bool(is_left):
             current = workspace_merkle_parent(sibling_b, current)
         else:
@@ -761,11 +882,15 @@ def verify_workspace_merkle_path(root: bytes, leaf_hash: bytes, path: Any) -> bo
     return current == bytes(root)
 
 
-def verify_workspace_state_merkle_path(root: bytes, leaf_hash: bytes, path: Any) -> bool:
+def verify_workspace_state_merkle_path(
+    root: bytes, leaf_hash: bytes, path: Any
+) -> bool:
     current = bytes(leaf_hash)
     siblings = getattr(path, "siblings", path)
     for sibling, is_left in siblings:
-        sibling_b = bytes.fromhex(sibling) if isinstance(sibling, str) else bytes(sibling)
+        sibling_b = (
+            bytes.fromhex(sibling) if isinstance(sibling, str) else bytes(sibling)
+        )
         if bool(is_left):
             current = workspace_state_merkle_parent(sibling_b, current)
         else:
@@ -777,8 +902,7 @@ def serialize_merkle_path(path: Any) -> dict[str, Any]:
     return {
         "leaf_index": int(path.leaf_index),
         "siblings": [
-            [bytes(sibling).hex(), bool(is_left)]
-            for sibling, is_left in path.siblings
+            [bytes(sibling).hex(), bool(is_left)] for sibling, is_left in path.siblings
         ],
     }
 
@@ -795,7 +919,9 @@ def deserialize_merkle_path(data: Mapping[str, Any]):
     )
 
 
-def serialize_gemm_block_proof(proof: Any, *, q_block_i32: Sequence[Sequence[int]]) -> dict[str, Any]:
+def serialize_gemm_block_proof(
+    proof: Any, *, q_block_i32: Sequence[Sequence[int]]
+) -> dict[str, Any]:
     sp = proof.sumcheck_proof
     return {
         "bi": int(proof.bi),
@@ -836,11 +962,19 @@ def deserialize_gemm_block_proof(data: Mapping[str, Any]):
             final_B=int(proof_data.get("final_B", 0)),
         ),
         spot_X=[
-            SpotCheck(row=int(s.get("row", 0)), col=int(s.get("col", 0)), value=int(s.get("value", 0)))
+            SpotCheck(
+                row=int(s.get("row", 0)),
+                col=int(s.get("col", 0)),
+                value=int(s.get("value", 0)),
+            )
             for s in data.get("spot_A", [])
         ],
         spot_W=[
-            SpotCheck(row=int(s.get("row", 0)), col=int(s.get("col", 0)), value=int(s.get("value", 0)))
+            SpotCheck(
+                row=int(s.get("row", 0)),
+                col=int(s.get("col", 0)),
+                value=int(s.get("value", 0)),
+            )
             for s in data.get("spot_B", [])
         ],
         m_bits=int(data.get("m_bits", 0)),
@@ -849,7 +983,9 @@ def deserialize_gemm_block_proof(data: Mapping[str, Any]):
     )
 
 
-def _field_matrix_from_i32_block(block: Sequence[Sequence[int]], padded_rows: int, padded_cols: int) -> list[list[int]]:
+def _field_matrix_from_i32_block(
+    block: Sequence[Sequence[int]], padded_rows: int, padded_cols: int
+) -> list[list[int]]:
     from zkllm.crypto.field import mod_p
 
     rows = len(block)
@@ -863,7 +999,9 @@ def _field_matrix_from_i32_block(block: Sequence[Sequence[int]], padded_rows: in
     ]
 
 
-def _evaluate_q_block_claim(block: Sequence[Sequence[int]], r_i: Sequence[int], r_j: Sequence[int]) -> int:
+def _evaluate_q_block_claim(
+    block: Sequence[Sequence[int]], r_i: Sequence[int], r_j: Sequence[int]
+) -> int:
     try:
         import numpy as np
         from zkllm.crypto.field import P
@@ -879,7 +1017,9 @@ def _evaluate_q_block_claim(block: Sequence[Sequence[int]], r_i: Sequence[int], 
         rows, cols = matrix.shape
         eq_row = build_eq_table_vec(list(r_i))[:rows]
         eq_col = build_eq_table_vec(list(r_j))[:cols]
-        tmp = mersenne_sum_axis0_fast(mul_f_vec_mersenne(matrix, eq_row[:, np.newaxis]))[:cols]
+        tmp = mersenne_sum_axis0_fast(
+            mul_f_vec_mersenne(matrix, eq_row[:, np.newaxis])
+        )[:cols]
         return int(mersenne_vec_sum(mul_f_vec_mersenne(tmp, eq_col)))
     except Exception:
         from zkllm.crypto.mle import build_mle_from_matrix
@@ -905,11 +1045,22 @@ def verify_workspace_gemm_block_proof(
     memory_mix_rounds: int = 0,
     state_root_hex: str = "",
     state_spot_openings: Sequence[Mapping[str, Any]] | None = None,
+    expected_block_index: int | None = None,
 ) -> tuple[bool, str]:
     """Verify the sampled block proof against the committed workspace round root."""
     from zkllm.crypto.field import mod_p
     from zkllm.crypto.sumcheck import sumcheck_verify
     from zkllm.crypto.transcript import Transcript
+
+    if (
+        int(matrix_dim) <= 1
+        or int(block_size) <= 1
+        or int(matrix_dim) % int(block_size) != 0
+        or int(block_size) & (int(block_size) - 1)
+        or int(spot_checks) <= 0
+        or int(spot_checks) > 4096
+    ):
+        return False, "invalid_gemm_proof_parameters"
 
     q_block = block_proof_data.get("q_block_i32")
     if not isinstance(q_block, list) or not q_block:
@@ -919,16 +1070,49 @@ def verify_workspace_gemm_block_proof(
     if len(q_block) != int(block_size) or len(q_block[0]) != int(block_size):
         return False, "q_block_size_mismatch"
 
-    block_proof = deserialize_gemm_block_proof(block_proof_data)
+    try:
+        block_proof = deserialize_gemm_block_proof(block_proof_data)
+    except Exception:
+        return False, "invalid_gemm_block_proof"
     blocks_per_row = int(matrix_dim) // int(block_size)
+    if (
+        int(block_proof.bi) < 0
+        or int(block_proof.bi) >= blocks_per_row
+        or int(block_proof.bj) < 0
+        or int(block_proof.bj) >= blocks_per_row
+    ):
+        return False, "gemm_block_coordinates_out_of_range"
     expected_leaf_index = int(block_proof.bi) * blocks_per_row + int(block_proof.bj)
+    if expected_block_index is not None and expected_leaf_index != int(
+        expected_block_index
+    ):
+        return False, "gemm_block_index_mismatch"
     if int(block_proof.merkle_path.leaf_index) != expected_leaf_index:
         return False, "merkle_leaf_index_mismatch"
 
-    leaf_hash = workspace_q_block_hash_i32(q_block)
+    expected_block_bits = int(block_size).bit_length() - 1
+    expected_inner_bits = (int(matrix_dim) - 1).bit_length()
+    if (
+        int(block_proof.m_bits) != expected_block_bits
+        or int(block_proof.n_bits) != expected_block_bits
+        or int(block_proof.k_bits) != expected_inner_bits
+        or len(block_proof.sumcheck_proof.rounds) != expected_inner_bits
+        or expected_inner_bits <= 0
+    ):
+        return False, "gemm_dimension_or_round_count_mismatch"
+
+    try:
+        leaf_hash = workspace_q_block_hash_i32(q_block)
+    except Exception:
+        return False, "invalid_q_block_values"
     if leaf_hash != block_proof.leaf_hash:
         return False, "q_block_leaf_hash_mismatch"
-    round_root = bytes.fromhex(str(round_root_hex).removeprefix("0x"))
+    try:
+        round_root = bytes.fromhex(str(round_root_hex).removeprefix("0x"))
+    except ValueError:
+        return False, "invalid_round_root"
+    if len(round_root) != 32:
+        return False, "invalid_round_root"
     if not verify_workspace_merkle_path(round_root, leaf_hash, block_proof.merkle_path):
         return False, "q_block_merkle_path_invalid"
 
@@ -946,11 +1130,15 @@ def verify_workspace_gemm_block_proof(
     if int(block_proof.sumcheck_proof.claimed_sum) != expected_claim:
         return False, "q_block_claim_mismatch"
 
-    ok, _final_claim, _challenges = sumcheck_verify(block_proof.sumcheck_proof, transcript)
+    ok, _final_claim, _challenges = sumcheck_verify(
+        block_proof.sumcheck_proof, transcript
+    )
     if not ok:
         return False, "sumcheck_invalid"
 
-    if len(block_proof.spot_X) != int(spot_checks) or len(block_proof.spot_W) != int(spot_checks):
+    if len(block_proof.spot_X) != int(spot_checks) or len(block_proof.spot_W) != int(
+        spot_checks
+    ):
         return False, "spot_count_mismatch"
     state_blocks: dict[int, tuple[list[list[int]], list[list[int]]]] = {}
     if state_root_hex:
@@ -965,7 +1153,9 @@ def verify_workspace_gemm_block_proof(
                 return False, reason
             state_blocks[block_index] = (a_rows, b_rows)
 
-    def expected_state_value(matrix_id: int, row: int, col: int) -> tuple[bool, int | str]:
+    def expected_state_value(
+        matrix_id: int, row: int, col: int
+    ) -> tuple[bool, int | str]:
         block_index = _state_block_index_for_element(
             int(row) * int(matrix_dim) + int(col),
             matrix_dim,
@@ -985,8 +1175,12 @@ def verify_workspace_gemm_block_proof(
     row_start = int(block_proof.bi) * int(block_size)
     col_start = int(block_proof.bj) * int(block_size)
     for idx in range(int(spot_checks)):
-        expected_x_row = row_start + int(transcript.squeeze(b"spot_X:row:" + str(idx).encode()) % int(block_size))
-        expected_x_col = int(transcript.squeeze(b"spot_X:col:" + str(idx).encode()) % int(matrix_dim))
+        expected_x_row = row_start + int(
+            transcript.squeeze(b"spot_X:row:" + str(idx).encode()) % int(block_size)
+        )
+        expected_x_col = int(
+            transcript.squeeze(b"spot_X:col:" + str(idx).encode()) % int(matrix_dim)
+        )
         spot_x = block_proof.spot_X[idx]
         if int(spot_x.row) != expected_x_row or int(spot_x.col) != expected_x_col:
             return False, "spot_a_position_mismatch"
@@ -1013,8 +1207,12 @@ def verify_workspace_gemm_block_proof(
             return False, "spot_a_value_mismatch"
 
     for idx in range(int(spot_checks)):
-        expected_w_row = int(transcript.squeeze(b"spot_W:row:" + str(idx).encode()) % int(matrix_dim))
-        expected_w_col = col_start + int(transcript.squeeze(b"spot_W:col:" + str(idx).encode()) % int(block_size))
+        expected_w_row = int(
+            transcript.squeeze(b"spot_W:row:" + str(idx).encode()) % int(matrix_dim)
+        )
+        expected_w_col = col_start + int(
+            transcript.squeeze(b"spot_W:col:" + str(idx).encode()) % int(block_size)
+        )
         spot_w = block_proof.spot_W[idx]
         if int(spot_w.row) != expected_w_row or int(spot_w.col) != expected_w_col:
             return False, "spot_b_position_mismatch"
@@ -1043,7 +1241,9 @@ def verify_workspace_gemm_block_proof(
     return True, ""
 
 
-def _state_block_index_for_element(element_index: int, matrix_dim: int, block_size: int) -> int:
+def _state_block_index_for_element(
+    element_index: int, matrix_dim: int, block_size: int
+) -> int:
     row = int(element_index) // int(matrix_dim)
     col = int(element_index) % int(matrix_dim)
     blocks_per_row = int(matrix_dim) // int(block_size)
@@ -1119,7 +1319,11 @@ def verify_workspace_transition_opening(
     intentionally samples one element and its required source blocks; production
     payload wiring decides how many such openings to request.
     """
-    if int(matrix_dim) <= 0 or int(block_size) <= 0 or int(matrix_dim) % int(block_size) != 0:
+    if (
+        int(matrix_dim) <= 0
+        or int(block_size) <= 0
+        or int(matrix_dim) % int(block_size) != 0
+    ):
         return False, "invalid_transition_parameters"
     expected_idx = derive_transition_element_index(
         before_root_hex=before_root_hex,
@@ -1220,7 +1424,9 @@ def verify_workspace_transition_opening(
                 col=int(element) % int(matrix_dim),
                 matrix_dim=int(matrix_dim),
             )
-            actual = _state_block_value(rows, int(element), int(matrix_dim), int(block_size))
+            actual = _state_block_value(
+                rows, int(element), int(matrix_dim), int(block_size)
+            )
             if int(actual) != int(expected):
                 return False, "transition_initial_state_value_mismatch"
     source_values = []
@@ -1229,11 +1435,13 @@ def verify_workspace_transition_opening(
         k_block = _state_block_index_for_element(k, matrix_dim, block_size)
         before_j_a, _before_j_b = before_blocks[j_block]
         _before_k_a, before_k_b = before_blocks[k_block]
-        source_values.append((
-            lane,
-            _state_block_value(before_j_a, j, matrix_dim, block_size),
-            _state_block_value(before_k_b, k, matrix_dim, block_size),
-        ))
+        source_values.append(
+            (
+                lane,
+                _state_block_value(before_j_a, j, matrix_dim, block_size),
+                _state_block_value(before_k_b, k, matrix_dim, block_size),
+            )
+        )
     expected_a, expected_b = transition_expected_values(
         workspace_seed=int(workspace_seed),
         pass_index=int(pass_index),
@@ -1251,7 +1459,7 @@ def verify_workspace_transition_opening(
     return True, ""
 
 
-def verify_workspace_proof_payload(
+def _verify_workspace_proof_payload_strict(
     *,
     proof: Mapping[str, Any],
     expected_transcript_root: str,
@@ -1262,9 +1470,17 @@ def verify_workspace_proof_payload(
     proof_seed_hex: str,
     pass_count: int,
     proof_challenge_seed_hex: str = "",
+    expected_spot_checks: int | None = None,
+    proof_protocol_version: int = 1,
 ) -> tuple[bool, str]:
+    if type(proof_protocol_version) is not int or proof_protocol_version not in (1, 2):
+        return False, "unsupported_workspace_proof_protocol_version"
     proof_format = str(proof.get("format") or "")
-    if proof_format not in {WORKSPACE_PROOF_FORMAT, WORKSPACE_MIXED_PROOF_FORMAT, WORKSPACE_TRANSITION_PROOF_FORMAT}:
+    if proof_format not in {
+        WORKSPACE_PROOF_FORMAT,
+        WORKSPACE_MIXED_PROOF_FORMAT,
+        WORKSPACE_TRANSITION_PROOF_FORMAT,
+    }:
         return False, "unsupported_proof_payload_format"
     try:
         matrix_dim = int(proof.get("matrix_dim"))
@@ -1277,8 +1493,26 @@ def verify_workspace_proof_payload(
         transition_fanout = int(proof.get("transition_fanout", 1))
     except Exception:
         return False, "invalid_workspace_proof_parameters"
-    if matrix_dim <= 0 or block_size <= 0 or rounds <= 0 or matrix_dim % block_size != 0:
+    if (
+        matrix_dim <= 1
+        or block_size <= 1
+        or rounds <= 0
+        or spot_checks <= 0
+        or spot_checks > 4096
+        or pass_count <= 0
+        or matrix_dim % block_size != 0
+        or block_size & (block_size - 1)
+    ):
         return False, "invalid_workspace_proof_parameters"
+    if expected_spot_checks is not None:
+        if (
+            type(expected_spot_checks) is not int
+            or expected_spot_checks <= 0
+            or expected_spot_checks > 4096
+        ):
+            return False, "invalid_expected_spot_check_count"
+        if spot_checks != expected_spot_checks:
+            return False, "spot_check_count_does_not_match_scheduled_workload"
     if memory_mix_rounds < 0 or transition_mix_rounds < 0 or transition_fanout <= 0:
         return False, "invalid_workspace_proof_parameters"
     if proof_format == WORKSPACE_MIXED_PROOF_FORMAT and memory_mix_rounds <= 0:
@@ -1299,22 +1533,30 @@ def verify_workspace_proof_payload(
         round_roots = entry.get("round_roots")
         if not isinstance(round_roots, list) or len(round_roots) != rounds:
             return False, "round_root_chain_length_mismatch"
-        if pass_root_from_round_roots(idx, round_roots) != str(entry.get("pass_root") or ""):
+        if pass_root_from_round_roots(idx, round_roots) != str(
+            entry.get("pass_root") or ""
+        ):
             return False, "pass_root_mismatch"
 
-    if workspace_transcript_root(root_chain) != str(expected_transcript_root):
+    if proof_protocol_version == 1 and workspace_transcript_root(root_chain) != str(
+        expected_transcript_root
+    ):
         return False, "transcript_root_mismatch"
     if str(root_chain[0].get("pass_root")) != str(expected_pass0_root):
         return False, "pass0_root_mismatch"
     if str(root_chain[-1].get("pass_root")) != str(expected_final_root):
         return False, "final_root_mismatch"
 
-    expected_seed = workspace_seed_for(lease_id, int(gpu_index), str(proof_seed_hex or ""))
+    expected_seed = workspace_seed_for(
+        lease_id, int(gpu_index), str(proof_seed_hex or "")
+    )
     if int(workspace_seed) != int(expected_seed):
         return False, "workspace_seed_mismatch"
     challenge_seed = str(proof_challenge_seed_hex or expected_transcript_root)
     proof_challenge_seed = str(proof.get("proof_challenge_seed") or "")
-    if proof_challenge_seed_hex and proof_challenge_seed != str(proof_challenge_seed_hex):
+    if proof_challenge_seed_hex and proof_challenge_seed != str(
+        proof_challenge_seed_hex
+    ):
         return False, "proof_challenge_seed_mismatch"
 
     sampled = proof.get("sampled")
@@ -1353,7 +1595,9 @@ def verify_workspace_proof_payload(
     sampled_transition_after_root = ""
     sampled_gemm_state_root = ""
     if proof_format == WORKSPACE_TRANSITION_PROOF_FORMAT:
-        if not isinstance(state_root_chain, list) or len(state_root_chain) != int(pass_count):
+        if not isinstance(state_root_chain, list) or len(state_root_chain) != int(
+            pass_count
+        ):
             return False, "state_root_chain_length_mismatch"
         for idx, entry in enumerate(state_root_chain):
             if int(entry.get("pass_index", -1)) != idx:
@@ -1362,7 +1606,10 @@ def verify_workspace_proof_payload(
             if not isinstance(state_rounds, list) or len(state_rounds) != rounds:
                 return False, "state_round_root_chain_length_mismatch"
             for state_roots in state_rounds:
-                if not isinstance(state_roots, list) or len(state_roots) != transition_mix_rounds + 1:
+                if (
+                    not isinstance(state_roots, list)
+                    or len(state_roots) != transition_mix_rounds + 1
+                ):
                     return False, "state_mix_root_chain_length_mismatch"
         sampled_transition_mix = derive_sampled_transition_mix_index(
             challenge_seed,
@@ -1372,10 +1619,26 @@ def verify_workspace_proof_payload(
             round_index,
             transition_mix_rounds,
         )
-        sampled_state_roots = state_root_chain[pass_index]["round_state_roots"][round_index]
-        sampled_transition_before_root = str(sampled_state_roots[sampled_transition_mix])
-        sampled_transition_after_root = str(sampled_state_roots[sampled_transition_mix + 1])
+        sampled_state_roots = state_root_chain[pass_index]["round_state_roots"][
+            round_index
+        ]
+        sampled_transition_before_root = str(
+            sampled_state_roots[sampled_transition_mix]
+        )
+        sampled_transition_after_root = str(
+            sampled_state_roots[sampled_transition_mix + 1]
+        )
         sampled_gemm_state_root = str(sampled_state_roots[-1])
+    elif proof_protocol_version == 2 and state_root_chain not in (None, []):
+        return False, "unexpected_state_root_chain"
+    if proof_protocol_version == 2:
+        committed_state_roots = (
+            state_root_chain if isinstance(state_root_chain, list) else []
+        )
+        if workspace_transcript_root_v2(root_chain, committed_state_roots) != str(
+            expected_transcript_root
+        ):
+            return False, "transcript_root_mismatch"
     blocks_per_row = matrix_dim // block_size
     expected_block = derive_challenge_block_index(
         round_root_hex=round_root,
@@ -1401,6 +1664,7 @@ def verify_workspace_proof_payload(
         memory_mix_rounds=memory_mix_rounds,
         state_root_hex=sampled_gemm_state_root,
         state_spot_openings=proof.get("gemm_state_openings") or [],
+        expected_block_index=block_index,
     )
     if not ok:
         return False, reason
@@ -1422,9 +1686,15 @@ def verify_workspace_proof_payload(
             or transition_mix != sampled_transition_mix
         ):
             return False, "sampled_transition_index_mismatch"
-        if str(sampled_transition.get("before_root") or "") != sampled_transition_before_root:
+        if (
+            str(sampled_transition.get("before_root") or "")
+            != sampled_transition_before_root
+        ):
             return False, "sampled_transition_before_root_mismatch"
-        if str(sampled_transition.get("after_root") or "") != sampled_transition_after_root:
+        if (
+            str(sampled_transition.get("after_root") or "")
+            != sampled_transition_after_root
+        ):
             return False, "sampled_transition_after_root_mismatch"
         ok, reason = verify_workspace_transition_opening(
             opening=sampled_transition.get("opening") or {},
@@ -1444,6 +1714,48 @@ def verify_workspace_proof_payload(
         if not ok:
             return False, reason
     return True, ""
+
+
+def verify_workspace_proof_payload(
+    *,
+    proof: Mapping[str, Any],
+    expected_transcript_root: str,
+    expected_pass0_root: str,
+    expected_final_root: str,
+    lease_id: str,
+    gpu_index: int,
+    proof_seed_hex: str,
+    pass_count: int,
+    proof_challenge_seed_hex: str = "",
+    expected_spot_checks: int | None = None,
+    proof_protocol_version: int = 1,
+) -> tuple[bool, str]:
+    """Verify a workspace payload and classify malformed data as invalid."""
+
+    try:
+        return _verify_workspace_proof_payload_strict(
+            proof=proof,
+            expected_transcript_root=expected_transcript_root,
+            expected_pass0_root=expected_pass0_root,
+            expected_final_root=expected_final_root,
+            lease_id=lease_id,
+            gpu_index=gpu_index,
+            proof_seed_hex=proof_seed_hex,
+            pass_count=pass_count,
+            proof_challenge_seed_hex=proof_challenge_seed_hex,
+            expected_spot_checks=expected_spot_checks,
+            proof_protocol_version=proof_protocol_version,
+        )
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        OverflowError,
+        TypeError,
+        ValueError,
+        struct.error,
+    ):
+        return False, "malformed_workspace_proof"
 
 
 def verify_workspace_compact_proof_payload(
@@ -1473,7 +1785,16 @@ def verify_workspace_compact_proof_payload(
         workspace_seed = int(proof.get("workspace_seed"))
     except Exception:
         return False, "invalid_workspace_proof_parameters"
-    if matrix_dim <= 0 or block_size <= 0 or rounds <= 0 or matrix_dim % block_size != 0:
+    if (
+        matrix_dim <= 1
+        or block_size <= 1
+        or rounds <= 0
+        or spot_checks <= 0
+        or spot_checks > 4096
+        or pass_count <= 0
+        or matrix_dim % block_size != 0
+        or block_size & (block_size - 1)
+    ):
         return False, "invalid_workspace_proof_parameters"
 
     root_chain = proof.get("root_chain")
@@ -1494,7 +1815,9 @@ def verify_workspace_compact_proof_payload(
     if root_words_digest(root_chain[-1]) != str(expected_final_root):
         return False, "final_root_mismatch"
 
-    expected_seed = workspace_seed_for(lease_id, int(gpu_index), str(proof_seed_hex or ""))
+    expected_seed = workspace_seed_for(
+        lease_id, int(gpu_index), str(proof_seed_hex or "")
+    )
     if int(workspace_seed) != int(expected_seed):
         return False, "workspace_seed_mismatch"
 
@@ -1553,5 +1876,6 @@ def verify_workspace_compact_proof_payload(
         matrix_dim=matrix_dim,
         block_size=block_size,
         spot_checks=spot_checks,
+        expected_block_index=block_index,
     )
     return (True, "") if ok else (False, reason)

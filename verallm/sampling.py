@@ -396,7 +396,7 @@ def derive_token_seed(batch_seed: bytes, step: int) -> bytes:
 # guaranteeing the same sorted order even when fp32 values are tied.
 # ---------------------------------------------------------------------------
 
-CANONICAL_TOP_K = 1024
+CANONICAL_TOP_K = 4096
 
 
 def extract_top_k_sorted(

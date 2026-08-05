@@ -58,6 +58,67 @@ def _buffer_copy_kernel(
     tl.store(dst_ptr + offsets, vals, mask=mask)
 
 
+@triton.jit
+def _buffer_gather_rows_kernel(
+    src_ptr,
+    dst_ptr,
+    row_indices_ptr,
+    src_rows,
+    dst_rows,
+    width,
+    src_stride_row,
+    src_stride_col,
+    dst_stride_row,
+    dst_stride_col,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    dst_row = offsets // width
+    column = offsets - dst_row * width
+    row_in_range = dst_row < dst_rows
+    src_row = tl.load(row_indices_ptr + dst_row, mask=row_in_range, other=-1)
+    valid = row_in_range & (src_row >= 0) & (src_row < src_rows)
+    values = tl.load(
+        src_ptr + src_row * src_stride_row + column * src_stride_col,
+        mask=valid,
+        other=0.0,
+    )
+    tl.store(
+        dst_ptr + dst_row * dst_stride_row + column * dst_stride_col,
+        values,
+        mask=valid,
+    )
+
+
+@triton.jit
+def _buffer_copy_rows_padded_kernel(
+    src_ptr,
+    dst_ptr,
+    rows,
+    width,
+    src_stride_row,
+    src_stride_col,
+    dst_stride_row,
+    dst_stride_col,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    total = rows * width
+    row = offsets // width
+    column = offsets - row * width
+    valid = offsets < total
+    values = tl.load(
+        src_ptr + row * src_stride_row + column * src_stride_col,
+        mask=valid,
+        other=0.0,
+    )
+    tl.store(
+        dst_ptr + row * dst_stride_row + column * dst_stride_col,
+        values,
+        mask=valid,
+    )
+
+
 @torch.library.custom_op("verallm::buffer_copy", mutates_args=("dst",))
 def buffer_copy(dst: torch.Tensor, src: torch.Tensor, n_tokens: int) -> None:
     """Static-grid Triton copy: dst[:n_tokens] = src[:n_tokens].
@@ -80,6 +141,365 @@ def _buffer_copy_fake(
     return None
 
 
+@torch.library.custom_op("verallm::buffer_gather_rows", mutates_args=("dst",))
+def buffer_gather_rows(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> None:
+    """Gather one source row per scheduler slot into a fixed capture buffer."""
+
+    if dst.ndim != 2 or src.ndim != 2:
+        raise ValueError("capture row gather requires two-dimensional tensors")
+    if dst.shape[1] != src.shape[1]:
+        raise ValueError("capture row gather width mismatch")
+    if row_indices.ndim != 1 or row_indices.shape[0] != dst.shape[0]:
+        raise ValueError("capture row gather index shape mismatch")
+    if row_indices.dtype != torch.int64:
+        raise ValueError("capture row gather indices must be int64")
+    # Gather indices are compacted at the beginning of the destination and
+    # there cannot be more selected rows than scheduler source rows.  Decode
+    # graphs commonly have 1-8 source rows while the bounded replay staging
+    # buffer reserves 128 rows.  Sizing the grid from the full destination
+    # made every projection scan all 128 slots on every generated token.
+    active_rows = min(src.shape[0], dst.shape[0])
+    block_size = 1024
+    active_elements = active_rows * dst.shape[1]
+    grid = ((active_elements + block_size - 1) // block_size,)
+    _buffer_gather_rows_kernel[grid](
+        src,
+        dst,
+        row_indices,
+        src.shape[0],
+        active_rows,
+        src.shape[1],
+        src.stride(0),
+        src.stride(1),
+        dst.stride(0),
+        dst.stride(1),
+        BLOCK_SIZE=block_size,
+    )
+
+
+@torch.library.register_fake("verallm::buffer_gather_rows")
+def _buffer_gather_rows_fake(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "verallm::activation_row_roots",
+    mutates_args=("dst",),
+)
+def activation_row_roots(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    lane_bytes: int,
+) -> None:
+    """Write exact canonical execution-anchor roots for native runtime rows."""
+
+    if (
+        dst.ndim != 2
+        or dst.dtype != torch.uint8
+        or dst.shape[1] != 32
+        or src.ndim != 2
+        or dst.shape[0] < src.shape[0]
+        or not dst.is_cuda
+        or not src.is_cuda
+        or dst.device != src.device
+        or src.stride(1) != 1
+        or src.stride(0) < src.shape[1]
+        or lane_bytes not in (256, 2048)
+    ):
+        raise ValueError("runtime activation row-root geometry is malformed")
+    from zkllm.cuda import zkllm_native
+
+    fn = getattr(
+        zkllm_native,
+        "cuda_blake3_runtime_row_roots_into",
+        None,
+    )
+    if fn is None:
+        raise RuntimeError(
+            "native runtime activation row reducer is unavailable"
+        )
+    fn(dst, src, lane_bytes, src.device.index or 0)
+
+
+@torch.library.register_fake("verallm::activation_row_roots")
+def _activation_row_roots_fake(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    lane_bytes: int,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "verallm::activation_row_roots_or_stage",
+    mutates_args=("dst", "staging"),
+)
+def activation_row_roots_or_stage(
+    dst: torch.Tensor,
+    staging: torch.Tensor,
+    src: torch.Tensor,
+    lane_bytes: int,
+) -> None:
+    """Stage bounded decode rows or directly hash a larger prefill batch."""
+
+    if (
+        dst.ndim != 2
+        or dst.dtype != torch.uint8
+        or dst.shape[1] != 32
+        or staging.ndim != 2
+        or src.ndim != 2
+        or staging.dtype != src.dtype
+        or staging.shape[1] < src.shape[1]
+        or not dst.is_cuda
+        or not staging.is_cuda
+        or not src.is_cuda
+        or dst.device != src.device
+        or staging.device != src.device
+        or src.stride(1) != 1
+        or staging.stride(1) != 1
+        or lane_bytes != 2048
+    ):
+        raise ValueError("staged runtime activation geometry is malformed")
+    if src.shape[0] <= staging.shape[0]:
+        block_size = 1024
+        total = src.shape[0] * src.shape[1]
+        grid = ((total + block_size - 1) // block_size,)
+        _buffer_copy_rows_padded_kernel[grid](
+            src,
+            staging,
+            src.shape[0],
+            src.shape[1],
+            src.stride(0),
+            src.stride(1),
+            staging.stride(0),
+            staging.stride(1),
+            BLOCK_SIZE=block_size,
+        )
+        return
+    activation_row_roots(dst, src, lane_bytes)
+
+
+@torch.library.register_fake("verallm::activation_row_roots_or_stage")
+def _activation_row_roots_or_stage_fake(
+    dst: torch.Tensor,
+    staging: torch.Tensor,
+    src: torch.Tensor,
+    lane_bytes: int,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "verallm::activation_row_roots_or_stage_retain",
+    mutates_args=(
+        "dst",
+        "staging",
+        "retained_values",
+        "retained_hashes",
+    ),
+)
+def activation_row_roots_or_stage_retain(
+    dst: torch.Tensor,
+    staging: torch.Tensor,
+    retained_values: torch.Tensor,
+    retained_hashes: torch.Tensor,
+    retention_slots: torch.Tensor,
+    src: torch.Tensor,
+    retention_stage: int,
+    lane_bytes: int,
+) -> None:
+    """Stage small rows or hash and retain one selected large stage."""
+
+    if (
+        dst.ndim != 2
+        or dst.dtype != torch.uint8
+        or dst.shape[1] != 32
+        or staging.ndim != 2
+        or src.ndim != 2
+        or staging.dtype != src.dtype
+        or staging.shape[1] < src.shape[1]
+        or retained_values.ndim != 4
+        or retained_values.dtype != torch.uint8
+        or retained_values.shape[3] != 2048
+        or retained_hashes.ndim != 4
+        or retained_hashes.dtype != torch.uint8
+        or retained_hashes.shape[:3] != retained_values.shape[:3]
+        or retained_hashes.shape[3] != 32
+        or retention_slots.ndim != 1
+        or retention_slots.dtype != torch.int32
+        or retention_stage < 0
+        or retention_stage >= retention_slots.shape[0]
+        or not all(
+            tensor.is_cuda
+            for tensor in (
+                dst,
+                staging,
+                retained_values,
+                retained_hashes,
+                retention_slots,
+                src,
+            )
+        )
+        or any(
+            tensor.device != src.device
+            for tensor in (
+                dst,
+                staging,
+                retained_values,
+                retained_hashes,
+                retention_slots,
+            )
+        )
+        or src.stride(1) != 1
+        or staging.stride(1) != 1
+        or lane_bytes != 2048
+    ):
+        raise ValueError("retained runtime activation geometry is malformed")
+    if src.shape[0] <= staging.shape[0]:
+        block_size = 1024
+        total = src.shape[0] * src.shape[1]
+        grid = ((total + block_size - 1) // block_size,)
+        _buffer_copy_rows_padded_kernel[grid](
+            src,
+            staging,
+            src.shape[0],
+            src.shape[1],
+            src.stride(0),
+            src.stride(1),
+            staging.stride(0),
+            staging.stride(1),
+            BLOCK_SIZE=block_size,
+        )
+        return
+    from zkllm.cuda import zkllm_native
+
+    fn = getattr(
+        zkllm_native,
+        "cuda_blake3_runtime_row_roots_retain_into",
+        None,
+    )
+    if fn is None:
+        raise RuntimeError(
+            "native retained runtime activation reducer is unavailable"
+        )
+    fn(
+        dst,
+        src,
+        retained_values,
+        retained_hashes,
+        retention_slots,
+        retention_stage,
+        lane_bytes,
+        src.device.index or 0,
+    )
+
+
+@torch.library.register_fake(
+    "verallm::activation_row_roots_or_stage_retain"
+)
+def _activation_row_roots_or_stage_retain_fake(
+    dst: torch.Tensor,
+    staging: torch.Tensor,
+    retained_values: torch.Tensor,
+    retained_hashes: torch.Tensor,
+    retention_slots: torch.Tensor,
+    src: torch.Tensor,
+    retention_stage: int,
+    lane_bytes: int,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "verallm::activation_staged_row_roots",
+    mutates_args=("dst", "scratch"),
+)
+def activation_staged_row_roots(
+    dst: torch.Tensor,
+    scratch: torch.Tensor,
+    staging: torch.Tensor,
+    row_widths: torch.Tensor,
+    reference: torch.Tensor,
+) -> None:
+    """Finalize all staged decode roots in one native batch."""
+
+    if (
+        dst.ndim != 3
+        or dst.dtype != torch.uint8
+        or dst.shape[2] != 32
+        or scratch.ndim != 4
+        or scratch.dtype != torch.uint8
+        or scratch.shape[3] != 32
+        or staging.ndim != 3
+        or reference.ndim != 2
+        or row_widths.ndim != 1
+        or row_widths.dtype != torch.int32
+        or dst.shape[0] != staging.shape[0]
+        or scratch.shape[0] != staging.shape[0]
+        or scratch.shape[1] != staging.shape[1]
+        or row_widths.shape[0] != staging.shape[0]
+        or not all(
+            tensor.is_cuda
+            for tensor in (
+                dst,
+                scratch,
+                staging,
+                row_widths,
+                reference,
+            )
+        )
+        or any(
+            tensor.device != staging.device
+            for tensor in (
+                dst,
+                scratch,
+                row_widths,
+                reference,
+            )
+        )
+    ):
+        raise ValueError("staged runtime root batch is malformed")
+    row_count = reference.shape[0]
+    if row_count > staging.shape[1]:
+        return
+    from zkllm.cuda import zkllm_native
+
+    fn = getattr(
+        zkllm_native,
+        "cuda_blake3_runtime_staged_row_roots_into",
+        None,
+    )
+    if fn is None:
+        raise RuntimeError("native staged runtime root reducer is unavailable")
+    fn(
+        dst,
+        scratch,
+        staging,
+        row_widths,
+        row_count,
+        staging.device.index or 0,
+    )
+
+
+@torch.library.register_fake("verallm::activation_staged_row_roots")
+def _activation_staged_row_roots_fake(
+    dst: torch.Tensor,
+    scratch: torch.Tensor,
+    staging: torch.Tensor,
+    row_widths: torch.Tensor,
+    reference: torch.Tensor,
+) -> None:
+    return None
+
+
 # -- Custom op registration (graph split point) ------------------------------
 
 @torch.library.custom_op("verallm::capture", mutates_args=("x",))
@@ -89,27 +509,25 @@ def capture(x: torch.Tensor, layer_idx: int, tensor_kind: int) -> torch.Tensor:
     Runs in eager mode at the split.  Delegates to the active
     RequestActivationTracker for per-request row slicing.
 
-    Returns x.clone() to provide a distinct output tensor.  The return
-    value is used by MoE call-sites (router_logits capture) so the op
-    is not dead-code-eliminated.  For dense gate_proj capture where the
-    return is discarded, x still has downstream users (self.original(x))
-    so DCE does not apply.
+    Returns a zero-sized sequencing token rather than cloning the complete
+    activation.  The operation's mutation annotation keeps the split/capture
+    side effect live; all call sites deliberately discard the token.  Runtime
+    values that a proof needs are copied by ``capture_at_split`` with the
+    request's bounded retention policy.
 
     Args:
         x: activation tensor [batch_tokens, hidden_dim]
         layer_idx: transformer layer index
-        tensor_kind: 0 = mlp_gate_input, 1 = router_logits, 2 = mlp_gate_output
+        tensor_kind: verifier-owned witness kind.  The canonical mapping lives
+            in ``RequestActivationTracker._KIND_TO_SUFFIX``.
     """
     tracker = _active_tracker
     if tracker is not None:
-        # capture_at_split returns the cloned snapshot — reuse it as our
-        # output to avoid a redundant second x.clone().
         return tracker.capture_at_split(x, layer_idx, tensor_kind)
-    return x.clone()
+    return x.new_empty((0,))
 
 
 @torch.library.register_fake("verallm::capture")
 def _capture_fake(x: torch.Tensor, layer_idx: int, tensor_kind: int) -> torch.Tensor:
-    """Shape inference for torch.compile: output shape == input shape.
-    """
-    return x.clone()
+    """Shape inference for the zero-sized capture sequencing token."""
+    return x.new_empty((0,))

@@ -47,18 +47,28 @@ class ModelRegistryClient:
         if cached is not None:
             return cached
 
+        oc = self.get_on_chain_model_spec(model_id)
+        if oc is None:
+            return None
+        spec = on_chain_to_model_spec(oc)
+        self._cache.set(cache_key, spec)
+        return spec
+
+    def get_on_chain_model_spec(self, model_id: str) -> Optional[OnChainModelSpec]:
+        """Fetch the exact on-chain struct without a lossy type conversion."""
+
+        cache_key = f"on_chain_spec:{self._config.netuid}:{model_id}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
         raw = self._provider.call_with_retry(
             lambda: self._contract.functions.getModelSpec(
                 self._config.netuid, model_id
             ).call()
         )
-
-        # Empty model_id means not registered
         if not raw[0]:
             return None
-
-        oc = _parse_model_spec(raw)
-        spec = on_chain_to_model_spec(oc)
+        spec = _parse_model_spec(raw)
         self._cache.set(cache_key, spec)
         return spec
 
@@ -85,6 +95,12 @@ class ModelRegistryClient:
             ).call()
         )
 
+    def get_manifest_authority(self):
+        """Read the current static proof manifest signer set and threshold."""
+        from verallm.chain.manifest_authority import resolve_manifest_authority
+
+        return resolve_manifest_authority(self)
+
     # ── Paid writes ──────────────────────────────────────────────
 
     def register_model(
@@ -103,6 +119,9 @@ class ModelRegistryClient:
 
         # Invalidate cache
         self._cache.invalidate(f"spec:{self._config.netuid}:{spec.model_id}")
+        self._cache.invalidate(
+            f"on_chain_spec:{self._config.netuid}:{spec.model_id}"
+        )
         self._cache.invalidate(f"model_list:{self._config.netuid}")
 
         logger.info("Registered model %s on-chain: %s", spec.model_id, tx_hash)
@@ -116,6 +135,7 @@ class ModelRegistryClient:
         )
 
         self._cache.invalidate(f"spec:{self._config.netuid}:{model_id}")
+        self._cache.invalidate(f"on_chain_spec:{self._config.netuid}:{model_id}")
         self._cache.invalidate(f"model_list:{self._config.netuid}")
 
         logger.info("Removed model %s from chain: %s", model_id, tx_hash)

@@ -25,7 +25,6 @@ from zkllm.types import (  # noqa: F401
     VerificationResult,
 )
 
-
 @dataclass
 class NonLinearWitness:
     """Witness for non-linear operation (for recomputation)."""
@@ -91,6 +90,9 @@ class InferenceCommitment:
     # SHA256(sampling_seed) — committed before challenge, opened on audit
     # for canonical sampler replay when do_sample=True.
     sampling_seed_commitment: bytes = b""
+    # Canonical proof-v2 metadata. This contains the authenticated manifest
+    # digest and the complete pre-challenge X commitment set.
+    proof_v2_commitment: bytes = b""
     timestamp: float = field(default_factory=time.time)
 
     @classmethod
@@ -160,6 +162,10 @@ class InferenceCommitment:
         if self.sampling_seed_commitment:
             parts.append(b"SAMPLING_SEED_V1")
             parts.append(self.sampling_seed_commitment)
+        if self.proof_v2_commitment:
+            parts.append(b"PROOF_V2_COMMITMENT")
+            parts.append(struct.pack("<I", len(self.proof_v2_commitment)))
+            parts.append(self.proof_v2_commitment)
         return b"".join(parts)
 
     @staticmethod
@@ -252,6 +258,16 @@ class ChallengeSet:
     layer_challenges: List[LayerChallenge]
     sampling_challenge: Optional[SamplingChallenge] = None
     embedding_challenge: Optional[EmbeddingChallenge] = None
+    # Exact proof-v2 challenges derived from request context and the complete
+    # pre-challenge X commitment envelope. Legacy v1 leaves this empty and
+    # continues to use layer_challenges.
+    proof_v2_challenges: Tuple[object, ...] = field(default_factory=tuple)
+    # Domain-separated state used for v2 operation/block selection and the
+    # parent context of every v2 block statement.
+    proof_v2_transcript_state: bytes = b""
+    # Derived only after nonce reveal. A hard audit opens every registered
+    # projection in each selected layer and carries the LM-head/token audit.
+    proof_v2_hard_audit: bool = False
 
     @property
     def layer_indices(self) -> List[int]:
@@ -277,12 +293,19 @@ class InferenceProofBundle:
     # Populated by the miner for challenged MoE layers.  The verifier checks
     # SHA256("MOE_LAYER_V2" || router_root || roots...) == on-chain layer root.
     expert_roots: Dict[int, List[bytes]] = field(default_factory=dict)
+    # Full prompt token ids. Protocol v2 hashes these back to the committed
+    # input and uses the final id as the causal decode-trace boundary.
+    input_token_ids: List[int] = field(default_factory=list)
     # Generated output token ids (required to bind served output to commitment).
     output_token_ids: List[int] = field(default_factory=list)
     # Optional decode-integrity proofs for challenged output positions.
     sampling_proofs: List["SamplingProof"] = field(default_factory=list)
     # Embedding input binding proof.
     embedding_proof: Optional["EmbeddingProof"] = None
+    # Explicit wire protocol. Omitted legacy payloads deserialize as v1.
+    proof_protocol_version: int = 1
+    # Canonical single-message v2 proof payload. Empty for legacy v1.
+    proof_v2_payload: bytes = b""
 
     @classmethod
     def empty(cls) -> "InferenceProofBundle":
@@ -416,21 +439,8 @@ class ModelSpec:
 class InferenceRequest:
     """Request from validator to miner.
 
-    The validator_nonce is critical for security: it's random bytes generated
-    by the validator and sent WITH the request, BEFORE the miner runs inference.
-
-    The beacon is derived as: SHA256(commitment_hash || validator_nonce)
-
-    This prevents the miner from grinding through commitment variations to find
-    favorable challenges, because:
-    1. The nonce is fixed before inference starts
-    2. The commitment depends on actual activations (miner can't predict it)
-    3. Both values are needed to compute the beacon
-
-    The miner cannot:
-    - Change the nonce (validator controls it)
-    - Predict the commitment before running inference
-    - Grind for favorable beacons (would need to re-run inference each attempt)
+    The validator nonce is generated per request and binds the returned
+    commitment and proof transcript to that request.
     """
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     prompt: str = ""
@@ -585,6 +595,12 @@ class SamplingProof:
     fp16_logits_merkle_path: Optional[MerklePath] = None
     # Opened sampling seed for do_sample=True canonical replay.
     sampling_seed: Optional[bytes] = None
+    # Specialized authenticated LM-head PCS envelope for the hardened v2 tier.
+    # Exactly one challenged decode row carries the commitment envelope. The
+    # LM-head blocks are folded into InferenceProofBundle.proof_v2_payload;
+    # the legacy separate payload field must remain empty.
+    lm_head_proof_v2_commitment: bytes = b""
+    lm_head_proof_v2_payload: bytes = b""
 
 
 @dataclass
@@ -628,6 +644,9 @@ class EmbeddingProof:
     input_token_ids: List[int]  # Full input token ID sequence
     row_openings: List[EmbeddingRowOpening]  # weight Merkle proofs
     output_openings: List[EmbeddingOutputOpening] = field(default_factory=list)  # output binding proofs
+    # Protocol-v2 openings for generated-token input embeddings. Here
+    # token_position is the decode trace index, not a prompt position.
+    decode_row_openings: List[EmbeddingRowOpening] = field(default_factory=list)
 
 
 @dataclass

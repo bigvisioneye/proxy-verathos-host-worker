@@ -362,6 +362,37 @@ python -m neurons.validator \
     --subtensor-network finney
 ```
 
+Ordinary validators default to follower mode: they run their own light
+canaries and consume the designated owner's signed hard/capacity verdict
+snapshot from the network-scoped feed. Testnet uses
+`https://verathos.ai/gleipnir/testnet/v1/verdicts/current`; mainnet uses
+`https://api.verathos.ai/v1/verdicts/current`. The designated owner must
+explicitly enable local verification:
+
+```bash
+export VERATHOS_PROOF_V3_VERDICT_SOURCE=verify
+python -m neurons.validator ...
+```
+
+An independent validator that re-verifies retained hard bundles also sets
+`VERATHOS_PROOF_V3_VERDICT_SOURCE=verify`. Only the validator whose hotkey
+matches the subnet-configured hard auditor schedules hard audits; other verify
+validators fetch the retained bundle directly from the miner. An owner left
+on the follower default fails startup.
+
+Runtime subnet policy is network-scoped. Testnet miners and validators use
+`https://verathos.ai/gleipnir/testnet/subnet-config.json`; mainnet continues
+to use `https://api.verathos.ai/v1/subnet-config`. An explicit
+`VERATHOS_SUBNET_CONFIG_URL` remains available for private/local networks.
+`VERATHOS_OWNER_VERDICT_URL` similarly overrides verdict-feed discovery for
+private/local deployments.
+
+On validators with more than eight CPU cores, set
+`VERATHOS_PCS_V2_THREADS=16` or `32` before starting the validator to enlarge
+the native proof-verification worker pool. Keep the value at or below the
+cores available to the validator process; the default is capped at eight and
+is appropriate for smaller hosts.
+
 **With a local subtensor:**
 ```bash
 python -m neurons.validator \
@@ -374,7 +405,7 @@ python -m neurons.validator \
 **What the validator does each epoch (~72 min):**
 1. Discovers active miners from MinerRegistry
 2. Schedules canary tests (indistinguishable from real traffic)
-3. Verifies cryptographic proofs for each test
+3. Verifies each test at the proof tier selected by the signed policy
 4. Scores miners on throughput, latency, and model utility (parameters, context length, quantization)
 5. Sets weights on Bittensor
 
@@ -396,7 +427,7 @@ The validator checks the git remote every 30 minutes. If a new validator version
 |----------|-------------|
 | GPU | None |
 | RAM | 16 GB+ (tokenizers loaded for proof verification) |
-| CPU | 4+ cores, 2.0 GHz+ (proof verification takes ~4ms) |
+| CPU | Modern multi-core CPU; hard-proof verification is profile-dependent |
 | Storage | 50 GB+ SSD |
 | Network | 100 Mbps up/down (HTTP to miners + WebSocket to Substrate) |
 
@@ -515,9 +546,34 @@ The `chain_config.json` specifies the chain ID and contract addresses. The RPC U
   "payment_gateway_address": "0x...",
   "validator_registry_address": "0x...",
   "checkpoint_registry_address": "0x...",
+  "proof_v3_artifact_base_urls": [
+    "https://verathos.ai/gleipnir/mainnet/"
+  ],
   "mock": false
 }
 ```
+
+When configured, miners and validators download authenticated proof artifacts
+automatically:
+
+- Validators cache only the signed manifest for each registered model.
+- Miners cache the signed manifest and weight-commitment catalog for the model
+  they serve.
+- Every download is size- and SHA-256-checked. Manifests are then verified
+  against the current on-chain `ModelSpec` and manifest authority.
+- Cached artifacts remain usable if the artifact host is temporarily
+  unavailable.
+
+The first URL is the primary store. Additional URLs are read-only mirrors.
+Operators normally use the URLs shipped in the official chain config.
+
+Proof-v3 releases use the same authenticated, content-addressed resolution
+model. The bundled mainnet and testnet configs use separate index roots:
+`https://verathos.ai/gleipnir/mainnet/` and
+`https://verathos.ai/gleipnir/testnet/`. Each index is bound to its chain ID,
+netuid and ModelRegistry address, and every signed artifact is checked against
+that network's current `ModelRegistry.owner()`. A testnet artifact therefore
+cannot be admitted on mainnet.
 
 The official config files are included in the repository:
 - `chain_config.json`: mainnet (Subnet 96, chain ID 964)

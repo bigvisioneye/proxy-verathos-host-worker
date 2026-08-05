@@ -47,6 +47,13 @@ class ChainConfig:
     checkpoint_registry_address: str = ""
     subnet_config_address: str = ""
 
+    # Public content-addressed proof-v2 artifact stores. The release chain
+    # configs may provide a primary URL followed by read-only mirrors.
+    proof_v2_artifact_base_urls: tuple[str, ...] = ()
+    proof_v2_artifact_cache_dir: str = ""
+    proof_v3_artifact_base_urls: tuple[str, ...] = ()
+    proof_v3_artifact_cache_dir: str = ""
+
     # EVM private key for signing transactions (hex string, no 0x prefix)
     evm_private_key: str = ""
 
@@ -62,6 +69,40 @@ class ChainConfig:
     mock: bool = False
 
     def __post_init__(self):
+        if isinstance(self.proof_v2_artifact_base_urls, str):
+            raise ValueError(
+                "proof_v2_artifact_base_urls must be a list of URLs"
+            )
+        try:
+            artifact_urls = tuple(self.proof_v2_artifact_base_urls)
+        except TypeError as exc:
+            raise ValueError(
+                "proof_v2_artifact_base_urls must be a list of URLs"
+            ) from exc
+        if any(not isinstance(item, str) or not item for item in artifact_urls):
+            raise ValueError(
+                "proof_v2_artifact_base_urls must contain non-empty URLs"
+            )
+        self.proof_v2_artifact_base_urls = artifact_urls
+        if not isinstance(self.proof_v2_artifact_cache_dir, str):
+            raise ValueError("proof_v2_artifact_cache_dir must be a string")
+        if isinstance(self.proof_v3_artifact_base_urls, str):
+            raise ValueError(
+                "proof_v3_artifact_base_urls must be a list of URLs"
+            )
+        try:
+            proof_v3_urls = tuple(self.proof_v3_artifact_base_urls)
+        except TypeError as exc:
+            raise ValueError(
+                "proof_v3_artifact_base_urls must be a list of URLs"
+            ) from exc
+        if any(not isinstance(item, str) or not item for item in proof_v3_urls):
+            raise ValueError(
+                "proof_v3_artifact_base_urls must contain non-empty URLs"
+            )
+        self.proof_v3_artifact_base_urls = proof_v3_urls
+        if not isinstance(self.proof_v3_artifact_cache_dir, str):
+            raise ValueError("proof_v3_artifact_cache_dir must be a string")
         _validate_address(self.model_registry_address, "model_registry_address")
         _validate_address(self.miner_registry_address, "miner_registry_address")
         _validate_address(self.payment_gateway_address, "payment_gateway_address")

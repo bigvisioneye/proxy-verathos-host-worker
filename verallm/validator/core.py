@@ -25,6 +25,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 
+from verallm.api.proof_protocol import LEGACY_PROOF_PROTOCOL_VERSION
 from verallm.config import Config, get_config
 from verallm.challenge.beacon import (
     derive_beacon_from_nonce,
@@ -40,7 +41,6 @@ from verallm.introspection import (
 )
 from verallm.moe import (
     MoEConfig,
-    MoEVerifier,
     derive_moe_challenges,
 )
 from verallm.moe.router_commitment import (
@@ -97,7 +97,6 @@ class Validator:
         # MoE configuration (None for dense models)
         self.moe_config = moe_config
         self.is_moe = moe_config is not None and moe_config.is_moe
-        self._moe_verifier: Optional[MoEVerifier] = None
 
     # ------------------------------------------------------------------
     # Model introspection delegates
@@ -582,8 +581,22 @@ class Validator:
         """
         from verallm.crypto.field import mod_p
 
-        verifier = GEMMVerifier(self.config)
         timing_details = {}
+        protocol_version = getattr(
+            proof_bundle,
+            "proof_protocol_version",
+            LEGACY_PROOF_PROTOCOL_VERSION,
+        )
+        if (
+            type(protocol_version) is not int
+            or protocol_version != LEGACY_PROOF_PROTOCOL_VERSION
+        ):
+            return VerificationResult.failure(
+                "Standalone Validator supports only legacy proof protocol v1; "
+                "use ValidatorClient for proof protocol v2"
+            ), timing_details
+
+        verifier = GEMMVerifier(self.config)
         commitment = proof_bundle.commitment
 
         # Verify committed decode-mode fields match validator expectations.

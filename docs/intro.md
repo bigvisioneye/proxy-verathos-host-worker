@@ -1,20 +1,30 @@
 # What is Verathos?
 
-**Verathos is a verified AI compute network on [Bittensor](https://bittensor.com) (Subnet 96).** Any tensor operation in any inference or training step can be cryptographically proven (via ZK-inspired **sumcheck-based verification** over Merkle-committed weights, anchored on-chain) and validators verify proofs on CPU in milliseconds. Any computer in the world can compete to serve or train models. The best are rewarded. The dishonest are caught. The entire process is transparent, verifiable, and permissionless.
+**Verathos is an AI compute network on [Bittensor](https://bittensor.com)
+(Subnet 96).** Gleipnir proof protocol v3 combines nonce-free light response
+commitments with unpredictable hard execution audits. Validators check signed
+model profiles and selected execution relations on CPU without loading model
+weights.
 
 ## What We Verify
 
-### Verified Inference: Live
+### Probabilistic verified inference: Gleipnir v3
 
-A proof plugin integrates directly into production vLLM serving, as simple as it can get, as complex as necessary. It captures the minimal information needed during CUDA graph execution to generate cryptographic proofs without disrupting the serving pipeline. Miners serve models at full speed while **sumcheck proofs** are generated in parallel for k random layers per request. There is no challenge-response round trip: the challenge is derived deterministically during inference via Fiat-Shamir, bound to the output commitment. Overhead is minimal, single-digit percentages depending on concurrent batch load.
+A graph-integrated capture plugin prepares authenticated execution roots without
+delaying token streaming. Every ordinary response is bound to a light
+commitment. On an unpredictable canary, the validator reveals its nonce only
+after that commitment is frozen and the miner proves the derived execution
+relations.
 
 ```mermaid
 flowchart LR
     A["Prompt"] --> B["Inference"]
-    B --> C["Fiat-Shamir\nchallenge"]
-    C --> D["Prove k\nlayers"]
-    D --> E["Verify vs\non-chain roots"]
-    E --> F["Verified\nresponse"]
+    B --> C["Freeze all-layer\ncommitment"]
+    C --> D{"Hidden hard\ndecision"}
+    D -->|light| E["Validate request/output\ncommitment"]
+    D -->|hard| G["Reveal nonce +\nprove selected trace"]
+    G --> E["Verify vs chain spec\n+ signed profile"]
+    E --> F["Audited\nresponse"]
 
     style A fill:#3b82f6,color:#fff
     style B fill:#3b82f6,color:#fff
@@ -36,14 +46,20 @@ The same proof system extends to training. The training prover verifies the forw
 
 | Claim | How it's verified |
 |-------|-------------------|
-| **Correct model weights** | Merkle root of quantized weights stored on-chain. Proof checks layer outputs against committed weights. Wrong model = caught on any challenged layer. |
-| **Correct computation** | Sumcheck protocol: prover and verifier agree on the GEMM result via an interactive protocol (made non-interactive with Fiat-Shamir). |
-| **Output integrity** | SHA-256 commitment over full output, bound to the proof via Fiat-Shamir. Tampering invalidates the proof. |
-| **Probabilistic coverage** | k random layers challenged per request. Substituting even 1 layer is caught with probability k/N per query, approaching 100% over multiple queries. |
+| **Light response binding** | The prompt, sampler, observed output and frozen runtime roots are bound to one canonical v3 envelope. |
+| **Authenticated selected weights** | Hard openings bind selected operations to authority-signed artifacts matching the live on-chain ModelSpec. |
+| **Sound selected computation** | The compact-v9 hard proof verifies the nonce-selected registered relations and connected terminal path. |
+| **Probabilistic coverage** | Secret-seeded hard canaries sample execution under a signed policy; hot-capacity auditing supplies a complementary resource check. |
+
+Gleipnir is not a full transformer SNARK. A light response is a commitment
+success, not a hard execution proof. Hard proofs open selected registered
+relations rather than every operation. The production claim is probabilistic
+economic integrity across repeated hidden audits, not deterministic proof of
+every operation on every request.
 
 ### TEE Verification (complementary, not yet enabled on mainnet)
 
-Verathos also supports hardware-based verification via Trusted Execution Environments (Intel TDX, AMD SEV-SNP, NVIDIA Confidential Computing). TEE attestation proves a miner is running unmodified code inside a hardware-isolated enclave, and enables end-to-end encryption so the miner operator cannot read user prompts. Code integrity is enforced via on-chain measurement allowlists (MRTD verification). TEE and cryptographic proofs are complementary: TEE adds privacy, cryptographic proofs keep the network permissionless and hardware-agnostic. Miners can run either or both. See [Inference Protocol: TEE Verification](inference_protocol.md#tee-verification-trusted-execution-environments) for details.
+Verathos also supports hardware-based verification via Trusted Execution Environments (Intel TDX, AMD SEV-SNP, NVIDIA Confidential Computing). TEE attestation proves a miner is running approved code inside a hardware-isolated enclave and can enable end-to-end encrypted prompts. See the [User Guide](user_guide.md#tee-inference-trusted-execution-environments) for details.
 
 ## Architecture
 
@@ -51,15 +67,17 @@ Verathos has three roles on the Bittensor network:
 
 | Role | What it does |
 |------|--------------|
-| **Miner** | Serves models with cryptographic proofs for every inference step. Can register multiple model endpoints per hotkey on Bittensor EVM (no UID pressure, scores accumulate). |
-| **Validator** | Tests miners with canary requests, verifies proofs. Scores inference on model utility (parameters, context length, quantization), throughput, and time-to-first-token. Proof failure = instant score zero. Sets weights on Bittensor. |
+| **Miner** | Serves models with probabilistic cryptographic audits. Can register multiple model endpoints per hotkey on Bittensor EVM (no UID pressure, scores accumulate). |
+| **Validator** | Tests miners with canary requests and verifies proofs. Scores inference on model utility (parameters, context length, quantization), throughput, and time-to-first-token. Outside maintenance suppression, proof failure follows the configured failure/probation path. Sets weights on Bittensor. |
 | **Gateway** | User-facing API gateway (OpenAI-compatible). Routes requests to miners weighted by score. Handles payments. |
 
 On-chain smart contracts on Bittensor EVM handle model registration, miner endpoints, payment deposits, and validator discovery. See [Bittensor Integration](bittensor_integration.md) for architecture details and [Economic Model](economic_model.md) for contract mechanics.
 
 ## OpenAI-Compatible API
 
-Drop-in replacement for any OpenAI SDK. Point your `base_url` at Verathos and every response is cryptographically verified.
+Drop-in replacement for any OpenAI SDK. Point your `base_url` at Verathos;
+ordinary responses use the normal OpenAI shape and expose protocol metadata
+when requested.
 
 ```python
 from openai import OpenAI
@@ -76,7 +94,10 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-Every response includes `proof_verified: true` and verification timing. Set `model` to `"auto"` and the gateway picks the best available node across all models via score-weighted routing.
+Ordinary v3 responses report an accepted light proof rather than fabricating
+a hard-audit verdict. A legacy v1 compatibility response remains v1, and a
+maintenance-suppressed failure remains a recorded failure. Set `model` to
+`"auto"` and the gateway picks an eligible node using score-weighted routing.
 
 ## Integrations
 
@@ -104,7 +125,9 @@ See [Integrations](integrations.md) for setup instructions and code examples.
 | Large | $0.35 | $0.65 | Llama-3.3-70B, Qwen3.5-122B-A10B |
 | XL | $0.50 | $1.20 | Qwen3-235B-A22B, DeepSeek-V3, GPT-oss-120B, MiniMax-M2.5, Kimi-K2 |
 
-Every response is verified, and verification cost is included in the price.
+Proof-bound responses carry their verification status, and verification cost is
+included in the price. During a configured maintenance window, a response may
+be explicitly unverified; maintenance does not turn it into a valid proof.
 
 ### Payment methods
 
@@ -120,6 +143,6 @@ Every response is verified, and verification cost is included in the price.
 - **[Setup Guide](setup.md)**: Run a miner or validator
 - **[API Reference](api.md)**: Full HTTP API reference
 - **[Bittensor Integration](bittensor_integration.md)**: Epoch testing, scoring, architecture
-- **[Inference Protocol](inference_protocol.md)**: Deep dive into sumcheck-based verification
+- **[Inference Protocol](inference_protocol.md)**: Light proofs and unpredictable hard audits
 - **[Active Research](research.md)**: Intelligent routing, verified training, and long-term vision
 - **[Economic Model](economic_model.md)**: Tokenomics, alpha staking, pricing details

@@ -50,6 +50,7 @@ zkllm/cuda/*.so
 zkllm/cuda/*.so.*
 zkllm/cuda/*.o
 zkllm/cuda/build/
+zkllm/pcs_native/target/
 
 # Environment files (contain secrets/paths)
 .env

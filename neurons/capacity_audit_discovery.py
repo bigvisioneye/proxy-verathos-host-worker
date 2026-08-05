@@ -315,6 +315,28 @@ class CapacityAuditEndpointResolver:
             if item.endpoint and not self._is_quarantined(item.endpoint, now)
         )
 
+    def current_urls_nonblocking(self) -> tuple[str, ...]:
+        """Return the usable cached snapshot and refresh only in background."""
+
+        now = time.time()
+        cached = tuple(
+            item.endpoint
+            for item in self._endpoints
+            if item.endpoint and not self._is_quarantined(item.endpoint, now)
+        )
+        if self.manual_urls and not cached:
+            cached = tuple(
+                endpoint
+                for endpoint in self.manual_urls
+                if not self._is_quarantined(endpoint, now)
+            )
+        if (
+            (not cached or now - self._cache_updated_at >= self.cache_ttl_s)
+            and now >= self._next_refresh_after
+        ):
+            self._request_background_refresh()
+        return cached
+
     def _request_background_refresh(self) -> None:
         """Refresh stale chain discovery without blocking artifact publication."""
         with self._background_refresh_lock:

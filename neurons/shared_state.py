@@ -91,6 +91,15 @@ class ValidatorSharedState:
     # Stale EVM addresses excluded by validator UID ownership checks. Proxy
     # must not route or display these addresses.
     stale_miner_addresses: List[str] = field(default_factory=list)
+    # Owner-signed hard-audit failures, retained independently of miners so
+    # follower validators can consume no-show and invalid-proof outcomes.
+    proof_v3_hard_failures: List[dict] = field(default_factory=list)
+    # Exact canonical bytes of the owner's latest signed verdict snapshot,
+    # hex-encoded for JSON transport. The proxy serves this string verbatim.
+    verdict_snapshot: str = ""
+    # Bounded immutable snapshots keyed by exact epoch. Followers use this
+    # history at close so advancing the latest pointer cannot race their fetch.
+    verdict_snapshots: Dict[str, str] = field(default_factory=dict)
     updated_at: float = 0.0
 
 
@@ -131,6 +140,12 @@ def write_shared_state(
         "ss58_map": state.ss58_map,
         "blacklisted_addresses": list(state.blacklisted_addresses),
         "stale_miner_addresses": list(state.stale_miner_addresses),
+        "proof_v3_hard_failures": list(state.proof_v3_hard_failures),
+        "verdict_snapshot": str(state.verdict_snapshot or ""),
+        "verdict_snapshots": {
+            str(epoch): str(snapshot)
+            for epoch, snapshot in state.verdict_snapshots.items()
+        },
         "updated_at": time.time(),
     }
     tmp_path = path + ".tmp"
@@ -193,6 +208,29 @@ def read_shared_state(
             ss58_map=data.get("ss58_map", {}),
             blacklisted_addresses=data.get("blacklisted_addresses", []),
             stale_miner_addresses=data.get("stale_miner_addresses", []),
+            proof_v3_hard_failures=[
+                value
+                for value in data.get("proof_v3_hard_failures", [])
+                if isinstance(value, dict)
+            ][:16_384],
+            verdict_snapshot=(
+                str(data.get("verdict_snapshot") or "")
+                if len(str(data.get("verdict_snapshot") or ""))
+                <= 64 * 1024 * 1024
+                else ""
+            ),
+            verdict_snapshots={
+                str(epoch): str(snapshot)
+                for epoch, snapshot in (
+                    data.get("verdict_snapshots", {})
+                    if isinstance(data.get("verdict_snapshots", {}), dict)
+                    else {}
+                ).items()
+                if (
+                    str(epoch).isdigit()
+                    and len(str(snapshot)) <= 64 * 1024 * 1024
+                )
+            },
             updated_at=data.get("updated_at", 0.0),
         )
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):

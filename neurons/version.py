@@ -78,7 +78,7 @@ def _decode(version: int) -> tuple[int, int, int]:
 
 MINER_MAJOR = 0
 MINER_MINOR = 1
-MINER_PATCH = 0
+MINER_PATCH = 1
 
 miner_version: int = _encode(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
@@ -92,7 +92,7 @@ miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 
 VALIDATOR_MAJOR = 0
 VALIDATOR_MINOR = 1
-VALIDATOR_PATCH = 25
+VALIDATOR_PATCH = 26
 
 validator_version: int = _encode(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)
 validator_version_str: str = _version_str(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)

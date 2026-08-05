@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from neurons.receipts import ServiceReceipt
+from verallm.proof_v3.canary_policy import canary_prompt_token_tolerance_v3
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,10 @@ class EpochOutcome:
     own_receipts: List[ServiceReceipt] = field(default_factory=list)
     # Expected number of own receipts (canaries sent by this validator)
     expected_own_receipt_count: int = 0
+    # Exact signed v4 obligations: id -> (kind, target prompt tokens).
+    expected_canary_obligations: Dict[bytes, Tuple[str, int]] = field(
+        default_factory=dict
+    )
 
     # ALL receipts for this miner-model (from all validators)
     all_receipts: List[ServiceReceipt] = field(default_factory=list)
@@ -121,6 +126,7 @@ class EpochOutcome:
     # Model entry metadata (for scoring)
     max_context_len: int = 0
     quant: str = ""
+    quant_qualified: bool = True
 
     # 503 busy-skip count this epoch (audit trail for load-aware forgiveness)
     busy_skip_count: int = 0
@@ -255,20 +261,77 @@ def compute_epoch_entry_score(
     else:
         _who = outcome.miner_address[:10]
 
-    # Skip scoring below MIN_RECEIPTS_FOR_SCORING — at very low expected the
-    # 1-receipt slop collapses and a single delivery would pass integrity.
-    MIN_RECEIPTS_FOR_SCORING = 5
-    if outcome.expected_own_receipt_count > 0:
-        if outcome.expected_own_receipt_count < MIN_RECEIPTS_FOR_SCORING:
-            bt.logging.info(
-                f"Skipping score for {_who} model_index={outcome.model_index}: "
-                f"only {outcome.expected_own_receipt_count} canaries acked (< {MIN_RECEIPTS_FOR_SCORING})"
+    if not outcome.quant_qualified:
+        action = "score update suppressed" if suppress_hard_failures else "score=0"
+        bt.logging.info(
+            f"Unqualified proof-v3 quantization for {_who} "
+            f"model_index={outcome.model_index} -> {action}"
+        )
+        return None if suppress_hard_failures else 0.0
+
+    expected_obligations = dict(outcome.expected_canary_obligations)
+    if expected_obligations:
+        seen: Dict[bytes, ServiceReceipt] = {}
+        invalid = False
+        for receipt in outcome.own_receipts:
+            obligation_id = bytes(
+                getattr(receipt, "canary_obligation_id", b"") or b""
             )
-            return None
-        threshold = max(1, outcome.expected_own_receipt_count - 1)
-        if len(outcome.own_receipts) < threshold:
+            if not receipt.is_canary:
+                continue
+            expected_item = expected_obligations.get(obligation_id)
+            if (
+                int(getattr(receipt, "receipt_version", 1) or 1) < 4
+                or expected_item is None
+                or obligation_id in seen
+            ):
+                invalid = True
+                continue
+            expected_kind, expected_target = expected_item
+            actual_target = int(
+                getattr(receipt, "canary_target_prompt_tokens", 0) or 0
+            )
+            prompt_tokens = int(receipt.prompt_tokens or 0)
+            tolerance = canary_prompt_token_tolerance_v3(
+                int(expected_target)
+            )
+            if (
+                str(getattr(receipt, "canary_kind", "") or "")
+                != expected_kind
+                or actual_target != int(expected_target)
+                or prompt_tokens <= 0
+                or prompt_tokens > int(expected_target)
+                or int(expected_target) - prompt_tokens > tolerance
+            ):
+                invalid = True
+                continue
+            seen[obligation_id] = receipt
+        missing = set(expected_obligations).difference(seen)
+        if invalid or missing:
+            action = (
+                "score update suppressed"
+                if suppress_hard_failures
+                else "score=0"
+            )
+            bt.logging.info(
+                f"Canary receipt integrity failure for {_who} "
+                f"model_index={outcome.model_index}: "
+                f"expected={len(expected_obligations)} valid={len(seen)} "
+                f"missing={len(missing)} invalid={invalid} -> {action}"
+            )
+            return None if suppress_hard_failures else 0.0
+    elif outcome.expected_own_receipt_count > 0:
+        # Compatibility for historical callers without an obligation
+        # inventory: exact count, with no one-receipt slop.
+        own_count = len(outcome.own_receipts)
+        if own_count < outcome.expected_own_receipt_count:
             action = "score update suppressed" if suppress_hard_failures else "score=0"
-            bt.logging.info(f"Receipt integrity failure for {_who} model_index={outcome.model_index}: expected {outcome.expected_own_receipt_count} own receipts, found {len(outcome.own_receipts)} -> {action}")
+            bt.logging.info(
+                f"Receipt integrity failure for {_who} "
+                f"model_index={outcome.model_index}: expected "
+                f"{outcome.expected_own_receipt_count} own canary receipts, "
+                f"found {own_count} -> {action}"
+            )
             return None if suppress_hard_failures else 0.0
 
     # Proof verification failure: any failed proof -> hard penalty.
@@ -307,22 +370,23 @@ def compute_epoch_entry_score(
     ORGANIC_PROMPT_CAP = 4096
     ORGANIC_PROMPT_TO_OUTPUT_CAP = 8
 
-    # Canary contribution is capped at "one set's worth" of tokens (12 small
-    # canaries + 1 full-context canary) so that the score is independent of how
-    # many validators are on the network.  Canary seeds hash only
-    # (epoch, miner_address, test_index) — not the validator hotkey — so every
-    # validator generates the SAME prompts for a given (miner, epoch).  Without
-    # the cap, a miner's score would scale linearly with validator count.
-    #
-    # Dynamic per-miner budget — model-agnostic.  Sized to one set's worth
-    # scaled to the miner's actual max_context_len (256k → ~244k, 500k → ~463k,
-    # 1M → ~920k).  Anti-gaming: a miner registering an inflated max_context_len
-    # cannot earn more — they still must actually serve the canaries; the
-    # budget is the MAX they can earn from canaries.
-    fc_prompt = int(outcome.max_context_len * 0.8)  # matches canary.generate_full_context_canary_prompt
-    fc_weighted = fc_prompt + OUTPUT_WEIGHT * 200    # full-context canary worst case
-    smalls_weighted = 12 * (70 + OUTPUT_WEIGHT * 300)  # 12 small canaries
-    canary_tokens_budget = int((fc_weighted + smalls_weighted) * 1.1)  # +10% buffer
+    # Cap each validator's canary contribution at its exact planned inventory.
+    # Prompts are independently secret-seeded across validators, so this cap
+    # prevents validator count from inflating a miner's score.
+    if expected_obligations:
+        planned_prompt_tokens = sum(
+            int(target) for _kind, target in expected_obligations.values()
+        )
+        canary_tokens_budget = planned_prompt_tokens + (
+            OUTPUT_WEIGHT * CANARY_OUTPUT_CAP * len(expected_obligations)
+        )
+    else:
+        # Historical compatibility for callers that only know a count.
+        planned = max(0, int(outcome.expected_own_receipt_count))
+        canary_tokens_budget = (
+            max(0, int(outcome.max_context_len))
+            + planned * OUTPUT_WEIGHT * CANARY_OUTPUT_CAP
+        )
 
     canary_tokens = 0
     organic_tokens = 0
@@ -721,17 +785,38 @@ class CompositeScorer:
             self.states[uid]._traffic_volume = volume
         return volume
 
-    def get_weights(self) -> Dict[int, float]:
+    @staticmethod
+    def _excluded_entry_keys(
+        excluded_entries: Optional[Set[Tuple[str, int]]],
+    ) -> Set[Tuple[str, int]]:
+        return {
+            (str(address).lower(), int(model_index))
+            for address, model_index in (excluded_entries or set())
+        }
+
+    def get_weights(
+        self,
+        *,
+        excluded_entries: Optional[Set[Tuple[str, int]]] = None,
+    ) -> Dict[int, float]:
         """Get normalized weights for all UIDs.
 
         WEIGHT(uid) = normalize( AGGREGATE )
 
         Traffic volume is already captured in throughput² (total tokens
-        served per entry). No separate volume multiplier needed.
+        served per entry). No separate volume multiplier needed. Excluded
+        entries retain their EMA history but contribute no emission while an
+        external policy gate such as probation is active.
         """
+        excluded = self._excluded_entry_keys(excluded_entries)
         raw = {}
         for uid, state in self.states.items():
-            score = state.aggregate_score
+            address = state.address.lower()
+            score = sum(
+                entry.ema_score
+                for entry in state.entries.values()
+                if (address, entry.model_index) not in excluded
+            )
             # Floor dust-level scores to zero — prevents negligible weights
             # from persisting for miners that left the network long ago.
             if score < 1e-6:
@@ -748,6 +833,8 @@ class CompositeScorer:
         model_budgets: Dict[str, float],
         model_groups: Optional[Dict[str, str]] = None,
         group_budgets: Optional[Dict[str, float]] = None,
+        *,
+        excluded_entries: Optional[Set[Tuple[str, int]]] = None,
     ) -> Tuple[Dict[int, float], float]:
         """Get UID weights with approved logical-model buckets.
 
@@ -794,9 +881,12 @@ class CompositeScorer:
                 continue
             approved_groups.setdefault(group_id, set()).add(model_id)
 
+        excluded = self._excluded_entry_keys(excluded_entries)
         entries_by_group: Dict[str, List[Tuple[int, float]]] = {}
         for uid, state in self.states.items():
             for entry in state.entries.values():
+                if (state.address.lower(), entry.model_index) in excluded:
+                    continue
                 if entry.model_id not in budgets:
                     continue
                 group_id = groups.get(entry.model_id) or entry.model_id

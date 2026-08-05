@@ -80,9 +80,17 @@ if [ ! -d "$VENV_DIR" ]; then
         echo "  python3-venv not installed — installing..."
         PY_VER=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
         if command -v apt-get &>/dev/null; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq "python${PY_VER}-venv" 2>&1 | tail -3
+            if [ "$(id -u)" -eq 0 ]; then
+                apt-get update -qq && apt-get install -y -qq "python${PY_VER}-venv" 2>&1 | tail -3
+            else
+                sudo apt-get update -qq && sudo apt-get install -y -qq "python${PY_VER}-venv" 2>&1 | tail -3
+            fi
         elif command -v dnf &>/dev/null; then
-            sudo dnf install -y "python${PY_VER}-venv" 2>&1 | tail -3
+            if [ "$(id -u)" -eq 0 ]; then
+                dnf install -y "python${PY_VER}-venv" 2>&1 | tail -3
+            else
+                sudo dnf install -y "python${PY_VER}-venv" 2>&1 | tail -3
+            fi
         else
             echo "  ERROR: Cannot install python3-venv automatically."
             echo "  Please install it manually: apt install python${PY_VER}-venv"
@@ -109,12 +117,80 @@ if [ "$SKIP_INSTALL" = false ]; then
 
     $PYTHON -c 'import neurons; import bittensor as bt; assert bt.__version__ == "10.3.2"'
 
+    if ! command -v cc &>/dev/null; then
+        echo "  Installing native verifier build prerequisites..."
+        if command -v apt-get &>/dev/null; then
+            if [ "$(id -u)" -eq 0 ]; then
+                apt-get update -qq && apt-get install -y -qq build-essential libssl-dev 2>&1 | tail -5
+            else
+                sudo apt-get update -qq && sudo apt-get install -y -qq build-essential libssl-dev 2>&1 | tail -5
+            fi
+        elif command -v dnf &>/dev/null; then
+            if [ "$(id -u)" -eq 0 ]; then
+                dnf install -y gcc openssl-devel 2>&1 | tail -5
+            else
+                sudo dnf install -y gcc openssl-devel 2>&1 | tail -5
+            fi
+        else
+            echo "  ERROR: A C compiler is required for the validator Merkle verifier."
+            echo "  Install a C compiler and OpenSSL development headers, then rerun setup."
+            exit 1
+        fi
+    fi
+
     # Install zkllm wheel (required for verallm imports even without GPU)
     PY_VER=$($PYTHON -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
     ZKLLM_WHEEL=$(ls "${REPO_DIR}/dist"/zkllm-*-${PY_VER}-*.whl 2>/dev/null | head -1)
     if [ -n "$ZKLLM_WHEEL" ]; then
         echo "  Installing zkllm wheel..."
         $PYTHON -m pip install --no-cache-dir --force-reinstall "$ZKLLM_WHEEL" 2>&1 | tail -5
+        PCS_RUNTIME_DIR="${VENV_DIR}/lib/verathos"
+        PCS_RUNTIME_LIBRARY="${PCS_RUNTIME_DIR}/libverathos_pcs_v2.so"
+        mkdir -p "$PCS_RUNTIME_DIR"
+        $PYTHON - "$ZKLLM_WHEEL" "$PCS_RUNTIME_LIBRARY" <<'PY'
+import os
+import pathlib
+import sys
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+member = "zkllm/crypto/libverathos_pcs_v2.so"
+with zipfile.ZipFile(wheel) as archive:
+    try:
+        payload = archive.read(member)
+    except KeyError as exc:
+        raise SystemExit(f"{wheel} does not contain {member}") from exc
+temporary = destination.with_suffix(".so.tmp")
+temporary.write_bytes(payload)
+temporary.chmod(0o755)
+os.replace(temporary, destination)
+PY
+        if VERATHOS_PCS_V2_LIB="$PCS_RUNTIME_LIBRARY" $PYTHON -c "from zkllm.crypto.pcs_v2 import native_library_path; assert native_library_path().is_file()" 2>/dev/null; then
+            echo "  zkllm native PCS: OK"
+        else
+            echo "  ERROR: zkllm wheel installed but native PCS is unavailable"
+            exit 1
+        fi
+        if ! VERATHOS_PCS_V2_LIB="$PCS_RUNTIME_LIBRARY" $PYTHON - <<'PY'
+from zkllm.crypto.pcs_v2 import (
+    ABI_VERSION,
+    fold_u31_linear_coefficients,
+    native_library_path,
+    prove_i64_linear_combination_linear,
+)
+
+assert ABI_VERSION == 10, f"expected proof PCS ABI 10, got {ABI_VERSION}"
+assert callable(fold_u31_linear_coefficients)
+assert callable(prove_i64_linear_combination_linear)
+native_library_path()
+PY
+        then
+            echo "  ERROR: zkllm wheel is stale or lacks the proof PCS ABI required by this release."
+            echo "  Rebuild the release wheels with scripts/build_zkllm_wheel.sh."
+            exit 1
+        fi
+        echo "  Proof PCS ABI 10: OK"
     else
         echo "  WARNING: No zkllm wheel found for $PY_VER in dist/"
     fi
@@ -123,13 +199,40 @@ if [ "$SKIP_INSTALL" = false ]; then
     if [ -n "$HOT_CAPACITY_WHEEL" ]; then
         echo "  Installing hot-capacity audit wheel..."
         $PYTHON -m pip install --no-cache-dir --force-reinstall "$HOT_CAPACITY_WHEEL" 2>&1 | tail -5
-        if $PYTHON -c "from hot_capacity_workspace import bench_fp64_identity; assert hasattr(bench_fp64_identity, 'verify_fp64_identity_proof')" 2>/dev/null; then
+        if $PYTHON -c "from hot_capacity_workspace import bench_combined, bench_fp64_identity; p = bench_combined.build_parser(); a = next(a for a in p._actions if '--proof-protocol-version' in a.option_strings); assert tuple(a.choices) == (1, 2); assert hasattr(bench_fp64_identity, 'verify_fp64_identity_proof')" 2>/dev/null; then
             echo "  hot-capacity verifier wheel: OK"
         else
-            echo "  WARNING: hot-capacity verifier wheel installed but verifier import failed"
+            echo "  ERROR: hot-capacity verifier wheel lacks the strict-v2 runtime"
+            exit 1
         fi
     else
         echo "  WARNING: No hot-capacity audit wheel found for $PY_VER in dist/"
+    fi
+
+    if $PYTHON - <<'PY'
+from verallm.proof_v3.c_multiopen import load, sibling_coordinates
+
+assert load() is not None, "native Merkle verifier did not load"
+indices = (1, 6)
+current = set(indices)
+expected = []
+size = 8
+while size > 1:
+    expected.extend(
+        (level, index ^ 1)
+        for index in sorted(current)
+        if (index ^ 1) not in current
+        for level in (3 - size.bit_length() + 1,)
+    )
+    current = {index // 2 for index in current}
+    size //= 2
+assert sibling_coordinates(8, indices) == tuple(expected)
+PY
+    then
+        echo "  native Merkle multi-opening verifier: OK"
+    else
+        echo "  ERROR: native Merkle multi-opening verifier is unavailable"
+        exit 1
     fi
 
     echo ""
@@ -159,6 +262,18 @@ else
 fi
 
 # ── Next steps ───────────────────────────────────────────────────────────────
+
+if [ "$SKIP_INSTALL" = true ]; then
+    echo "  Verifying existing validator runtime (--skip-install)..."
+    "$PYTHON" - <<'PY'
+import torch
+import zstandard
+import zkllm
+import neurons.validator
+
+print(f"  Existing validator runtime: torch={torch.__version__}")
+PY
+fi
 
 echo ""
 echo "============================================================"

@@ -12,6 +12,8 @@ Usage:
 """
 
 import dataclasses
+import base64
+import binascii
 from typing import Any, Dict, Type, get_type_hints
 
 from zkllm.types import (
@@ -57,14 +59,33 @@ def _register(*classes):
 
 
 _register(
-    SpotCheck, SpotCheckWithProof, SumcheckRound, SumcheckProof,
-    MerklePath, GEMMBlockProof, GEMMProof, VerificationResult,
-    InferenceCommitment, LayerProof, GEMMChallenge, LayerChallenge,
-    EmbeddingChallenge, EmbeddingProof, EmbeddingRowOpening, EmbeddingOutputOpening,
-    ChallengeSet, InferenceProofBundle, ModelSpec,
-    ExpertChallenge, MoELayerChallenge, RouterCommitment,
-    RouterLogitsOpening, RouterOutputRow, RouterLayerProof,
-    SamplingChallenge, SamplingProof,
+    SpotCheck,
+    SpotCheckWithProof,
+    SumcheckRound,
+    SumcheckProof,
+    MerklePath,
+    GEMMBlockProof,
+    GEMMProof,
+    VerificationResult,
+    InferenceCommitment,
+    LayerProof,
+    GEMMChallenge,
+    LayerChallenge,
+    EmbeddingChallenge,
+    EmbeddingProof,
+    EmbeddingRowOpening,
+    EmbeddingOutputOpening,
+    ChallengeSet,
+    InferenceProofBundle,
+    ModelSpec,
+    ExpertChallenge,
+    MoELayerChallenge,
+    RouterCommitment,
+    RouterLogitsOpening,
+    RouterOutputRow,
+    RouterLayerProof,
+    SamplingChallenge,
+    SamplingProof,
 )
 
 
@@ -79,10 +100,7 @@ def to_dict(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [to_dict(item) for item in obj]
     if isinstance(obj, dict):
-        return {
-            _serialize_key(k): to_dict(v)
-            for k, v in obj.items()
-        }
+        return {_serialize_key(k): to_dict(v) for k, v in obj.items()}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         result = {"__type__": type(obj).__name__}
         for f in dataclasses.fields(obj):
@@ -184,6 +202,7 @@ def _deserialize_field(raw: Any, hint) -> Any:
 
 def _is_optional(hint) -> bool:
     import typing
+
     origin = getattr(hint, "__origin__", None)
     if origin is typing.Union:
         args = getattr(hint, "__args__", ())
@@ -203,6 +222,7 @@ def _deserialize_dict_key(key_str: str, hint) -> Any:
 # ============================================================================
 # Convenience functions for specific types
 # ============================================================================
+
 
 def model_spec_to_dict(spec: ModelSpec) -> dict:
     d = to_dict(spec)
@@ -239,11 +259,34 @@ def dict_to_challenge_set(d: dict) -> ChallengeSet:
     return from_dict(ChallengeSet, d)
 
 
-def proof_bundle_to_dict(pb: InferenceProofBundle) -> dict:
+def proof_bundle_to_dict(
+    pb: InferenceProofBundle,
+    *,
+    include_commitment: bool = True,
+) -> dict:
     d = to_dict(pb)
     d.pop("__type__", None)
+    if not include_commitment:
+        d.pop("commitment", None)
+    if pb.proof_protocol_version == 2 and pb.proof_v2_payload:
+        d["proof_v2_payload"] = "base64:" + base64.b64encode(
+            pb.proof_v2_payload
+        ).decode("ascii")
     return d
 
 
 def dict_to_proof_bundle(d: dict) -> InferenceProofBundle:
+    if not isinstance(d, dict):
+        raise TypeError("proof bundle must be an object")
+    value = d.get("proof_v2_payload")
+    if isinstance(value, str) and value.startswith("base64:"):
+        encoded = value.removeprefix("base64:")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("proof_v2_payload base64 is invalid") from exc
+        if base64.b64encode(decoded).decode("ascii") != encoded:
+            raise ValueError("proof_v2_payload base64 is noncanonical")
+        d = dict(d)
+        d["proof_v2_payload"] = decoded.hex()
     return from_dict(InferenceProofBundle, d)

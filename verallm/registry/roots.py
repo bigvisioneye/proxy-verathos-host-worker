@@ -50,6 +50,27 @@ from verallm.moe import (
 from verallm.types import ModelSpec
 
 
+def _unwrap_capture_weight_module(module):
+    """Return the projection module hidden by proof activation capture.
+
+    Proof-v3 installs ``CaptureLinearWrapper`` before the legacy ModelSpec
+    self-check runs.  The wrapper is transparent to inference, and must also
+    be transparent to static weight-root construction.  Otherwise a clean
+    proof-v3 startup takes the identity-forward fallback through the capture
+    path and derives roots that differ from both registration and a cached
+    startup.
+    """
+
+    try:
+        from verallm.vllm_plugin.capture_linear import CaptureLinearWrapper
+    except ImportError:
+        return module
+
+    while isinstance(module, CaptureLinearWrapper):
+        module = module.original
+    return module
+
+
 def _compute_lm_head_root_cpu(lm_head_mod, hidden_size: int, chunk_size: int) -> bytes:
     """Compute lm_head weight root: unpack on CPU, hash on GPU via chunked transfer.
 
@@ -207,6 +228,7 @@ def compute_model_roots(model, model_name: str, chunk_size: int = 128) -> ModelS
 
     def _compute_root_for_weight(gate_proj, W_raw_tensor=None):
         """Compute Merkle root for a weight tensor — auto-detects quant format."""
+        gate_proj = _unwrap_capture_weight_module(gate_proj)
         mode = detect_layer_quant_mode(gate_proj) if gate_proj is not None else "fp16"
         W_int8 = None
         if gate_proj is not None:

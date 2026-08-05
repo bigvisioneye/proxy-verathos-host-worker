@@ -342,7 +342,10 @@ See [Inference Protocol: TEE Verification](inference_protocol.md#tee-verificatio
 
 ## Pricing
 
-Pricing is in USD per million tokens, with four tiers based on model size (Small, Medium, Large, XL). Every request is verified, and verification cost is included in the price. TAO-paying users are charged at the live market rate.
+Pricing is in USD per million tokens, with tiers based on model size. Ordinary
+v3 requests receive light proofs, while unpredictable canaries carry
+hard execution proofs; protocol enforcement cost is included in the service
+price. TAO-paying users are charged at the live market rate.
 
 Use `GET /v1/price` to compute exact costs before sending, or `GET /v1/models` to see per-model pricing. See the [pricing table](intro.md#pricing-usd-per-1m-tokens) for full details.
 

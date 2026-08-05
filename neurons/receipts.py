@@ -68,6 +68,18 @@ class ServiceReceipt:
     timing_source: str = "legacy"
     observed_start_ts: float = 0.0
     observed_end_ts: float = 0.0
+    # Proof-v3 audit binding (receipt_version >= 3): one 32-byte digest
+    # committing the request's full capture-root chain (all layer
+    # activation roots + chunk claims + logits root).  Signed BEFORE any
+    # audit nonce exists, which is what makes retroactive audits and the
+    # per-response model-binding stamp non-back-fillable.
+    capture_chain_digest: bytes = b""
+    # Exact canary-obligation accounting (receipt_version >= 4). Empty for
+    # organic traffic. The opaque ID is validator-secret-derived and appears
+    # only after the request has completed.
+    canary_obligation_id: bytes = b""
+    canary_kind: str = ""
+    canary_target_prompt_tokens: int = 0
     timing_signature: bytes = b""  # legacy v2 migration only; new receipts leave this empty
 
     # Validator identity
@@ -204,14 +216,65 @@ def _encode_receipt_message_v2(receipt: ServiceReceipt) -> bytes:
     return b"".join(parts)
 
 
+def _encode_receipt_message_v3(receipt: ServiceReceipt) -> bytes:
+    """V3: the v2 field set plus the proof-v3 capture chain digest."""
+    digest = bytes(getattr(receipt, "capture_chain_digest", b"") or b"")
+    return b"".join([
+        b"VERATHOS_SERVICE_RECEIPT_V3",
+        _encode_receipt_message_v2(receipt),
+        struct.pack(">I", len(digest)),
+        digest,
+    ])
+
+
+def _encode_receipt_message_v4(receipt: ServiceReceipt) -> bytes:
+    """V4: bind an exact low/full canary obligation when present."""
+
+    obligation = bytes(
+        getattr(receipt, "canary_obligation_id", b"") or b""
+    )
+    kind = str(getattr(receipt, "canary_kind", "") or "")
+    if obligation and len(obligation) != 16:
+        raise ValueError("canary obligation id must be exactly 16 bytes")
+    if kind not in ("", "low", "full"):
+        raise ValueError("canary kind is invalid")
+    if bool(obligation) != bool(kind):
+        raise ValueError("canary obligation id and kind must appear together")
+    target = int(
+        getattr(receipt, "canary_target_prompt_tokens", 0) or 0
+    )
+    if target < 0 or target >= 1 << 32:
+        raise ValueError("canary target prompt tokens are out of range")
+    if not obligation and target != 0:
+        raise ValueError("organic receipt cannot carry a canary target")
+    encoded_kind = kind.encode("ascii")
+    return b"".join(
+        (
+            b"VERATHOS_SERVICE_RECEIPT_V4",
+            _encode_receipt_message_v3(receipt),
+            struct.pack(">I", len(obligation)),
+            obligation,
+            struct.pack(">I", len(encoded_kind)),
+            encoded_kind,
+            struct.pack(">I", target),
+        )
+    )
+
+
 def encode_receipt_message(receipt: ServiceReceipt) -> bytes:
     """Encode receipt fields into the canonical signed byte string.
 
     V1 receipts use the historical field set. V2 receipts sign the historical
     field set plus timing provenance in the primary signature; no separate
-    timing signature is needed for newly-created receipts.
+    timing signature is needed for newly-created receipts. V3 receipts
+    additionally sign the proof-v3 capture chain digest.
     """
-    if int(getattr(receipt, "receipt_version", 1) or 1) >= 2:
+    version = int(getattr(receipt, "receipt_version", 1) or 1)
+    if version >= 4:
+        return _encode_receipt_message_v4(receipt)
+    if version >= 3:
+        return _encode_receipt_message_v3(receipt)
+    if version >= 2:
         return _encode_receipt_message_v2(receipt)
     return _encode_receipt_message_v1(receipt)
 
@@ -257,28 +320,11 @@ def sign_receipt(receipt: ServiceReceipt, hotkey_seed: bytes) -> ServiceReceipt:
     signature = keypair.sign(message)
     if not isinstance(signature, bytes):
         signature = bytes.fromhex(signature[2:] if signature.startswith("0x") else signature)
-    return ServiceReceipt(
-        miner_address=receipt.miner_address,
-        model_id=receipt.model_id,
-        model_index=receipt.model_index,
-        epoch_number=receipt.epoch_number,
-        commitment_hash=receipt.commitment_hash,
-        timestamp=receipt.timestamp,
-        ttft_ms=receipt.ttft_ms,
-        tokens_generated=receipt.tokens_generated,
-        generation_time_ms=receipt.generation_time_ms,
-        tokens_per_sec=receipt.tokens_per_sec,
-        prompt_tokens=receipt.prompt_tokens,
-        proof_verified=receipt.proof_verified,
-        proof_requested=receipt.proof_requested,
-        tee_attestation_verified=receipt.tee_attestation_verified,
-        is_canary=receipt.is_canary,
-        receipt_version=receipt.receipt_version,
-        timing_source=receipt.timing_source,
-        observed_start_ts=receipt.observed_start_ts,
-        observed_end_ts=receipt.observed_end_ts,
+    import dataclasses
+
+    return dataclasses.replace(
+        receipt,
         timing_signature=b"",
-        validator_hotkey=receipt.validator_hotkey,
         validator_signature=signature,
     )
 
@@ -405,6 +451,10 @@ def create_receipt(
     observed_start_ts: float | None = None,
     observed_end_ts: float | None = None,
     timing_source: str = "validator_observed",
+    capture_chain_digest: bytes = b"",
+    canary_obligation_id: bytes = b"",
+    canary_kind: str = "",
+    canary_target_prompt_tokens: int = 0,
 ) -> ServiceReceipt:
     """Convenience: build and sign a receipt in one call.
 
@@ -436,10 +486,14 @@ def create_receipt(
         proof_requested=proof_requested,
         tee_attestation_verified=tee_attestation_verified,
         is_canary=is_canary,
-        receipt_version=2,
+        receipt_version=4,
         timing_source=timing_source,
         observed_start_ts=start_ts,
         observed_end_ts=end_ts,
+        capture_chain_digest=bytes(capture_chain_digest or b""),
+        canary_obligation_id=bytes(canary_obligation_id or b""),
+        canary_kind=str(canary_kind or ""),
+        canary_target_prompt_tokens=int(canary_target_prompt_tokens or 0),
         validator_hotkey=validator_hotkey,
     )
     return sign_receipt(receipt, validator_private_key)
@@ -467,6 +521,10 @@ def receipt_to_dict(receipt: ServiceReceipt) -> dict:
         "timing_source": receipt.timing_source,
         "observed_start_ts": receipt.observed_start_ts,
         "observed_end_ts": receipt.observed_end_ts,
+        "capture_chain_digest": receipt.capture_chain_digest.hex(),
+        "canary_obligation_id": receipt.canary_obligation_id.hex(),
+        "canary_kind": receipt.canary_kind,
+        "canary_target_prompt_tokens": receipt.canary_target_prompt_tokens,
         "timing_signature": receipt.timing_signature.hex(),
         "validator_hotkey": receipt.validator_hotkey.hex(),
         "validator_signature": receipt.validator_signature.hex(),
@@ -495,6 +553,15 @@ def receipt_from_dict(d: dict) -> ServiceReceipt:
         timing_source=d.get("timing_source", "legacy"),
         observed_start_ts=d.get("observed_start_ts", 0.0),
         observed_end_ts=d.get("observed_end_ts", 0.0),
+        capture_chain_digest=bytes.fromhex(d.get("capture_chain_digest", "")),
+        canary_obligation_id=bytes.fromhex(
+            d.get("canary_obligation_id", "")
+        ),
+        canary_kind=d.get("canary_kind", ""),
+        canary_target_prompt_tokens=d.get(
+            "canary_target_prompt_tokens",
+            0,
+        ),
         timing_signature=bytes.fromhex(d.get("timing_signature", "")),
         validator_hotkey=bytes.fromhex(d["validator_hotkey"]),
         validator_signature=bytes.fromhex(d["validator_signature"]),

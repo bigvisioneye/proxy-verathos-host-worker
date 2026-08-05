@@ -26,6 +26,7 @@ dependencies = [
     "torch>=2.0",
     "numpy>=1.24",
     "blake3>=0.3",
+    "zstandard>=0.22,<1",
     # zkllm is installed from the local dist/ wheel (not on PyPI).
     # Run: pip install dist/zkllm-*.whl (setup_miner.sh does this automatically)
 ]

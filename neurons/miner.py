@@ -46,6 +46,10 @@ from neurons.model_resolve import (
     resolve_model_config,
     validate_capacity_recommended_model,
 )
+from neurons.subnet_runtime_config import (
+    RuntimeSubnetConfigClient,
+    apply_runtime_config_to_neuron_config,
+)
 from neurons.version import spec_version, version_str, miner_version, miner_version_str
 from verallm.chain.config import ChainConfig
 from verallm.chain.miner_registry import MinerRegistryClient
@@ -64,6 +68,74 @@ def _health_vram_gb(health_url: str) -> int:
         return int(hw.get("vram_gb") or 0)
     except Exception:
         return 0
+
+PROOF_V2_MANIFEST_ENV = "VERATHOS_PROOF_V2_MANIFEST"
+PROOF_V2_WEIGHT_CATALOG_ENV = "VERATHOS_PROOF_V2_WEIGHT_CATALOG"
+PROOF_V2_ARTIFACT_BASE_URLS_ENV = "VERATHOS_PROOF_V2_ARTIFACT_BASE_URLS"
+PROOF_V2_ARTIFACT_CACHE_DIR_ENV = "VERATHOS_PROOF_V2_ARTIFACT_CACHE_DIR"
+PROOF_V3_MANIFEST_ENV = "VERATHOS_PROOF_V3_MANIFEST"
+PROOF_V3_EXECUTION_PROFILE_ENV = "VERATHOS_PROOF_V3_EXECUTION_PROFILE"
+PROOF_V3_CALIBRATION_SET_ENV = "VERATHOS_PROOF_V3_CALIBRATION_SET"
+PROOF_V3_ATTENTION_SEMANTICS_ENV = "VERATHOS_PROOF_V3_ATTENTION_SEMANTICS"
+PROOF_V3_GDN_SEMANTICS_ENV = "VERATHOS_PROOF_V3_GDN_SEMANTICS"
+PROOF_V3_LM_HEAD_CATALOG_ENV = "VERATHOS_PROOF_V3_LM_HEAD_CATALOG"
+PROOF_V3_PROJECTION_MANIFEST_ENV = "VERATHOS_PROOF_V3_PROJECTION_MANIFEST"
+PROOF_V3_PROJECTION_CATALOG_ENV = "VERATHOS_PROOF_V3_PROJECTION_CATALOG"
+PROOF_V3_RUNTIME_ENCODING_ENV = "VERATHOS_PROOF_V3_RUNTIME_ENCODING"
+PROOF_V3_WEIGHT_CACHE_DIR_ENV = "VERATHOS_PROOF_V3_WEIGHT_CACHE_DIR"
+PROOF_V3_RELEASE_ENV = "VERATHOS_PROOF_V3_RELEASE"
+
+
+def _configured_miner_proof_protocol_versions(
+    owner_allowed: tuple[int, ...],
+    *,
+    proof_v3_configured: bool,
+) -> tuple[int, ...]:
+    """Intersect owner policy with the proof stack this miner will serve.
+
+    Validators support both rollout generations.  A miner with an
+    authenticated v3 release serves v3 only; a legacy-configured miner serves
+    v1 only.  This keeps ``[1, 3]`` an owner compatibility allowlist without
+    forcing updated compressed checkpoints to construct an unused legacy-v1
+    weight tree.
+    """
+
+    locally_served = {3} if proof_v3_configured else {1}
+    return tuple(
+        version
+        for version in sorted(set(int(v) for v in owner_allowed))
+        if version in locally_served
+    )
+
+
+def _proof_v3_hard_auditor_record(
+    runtime,
+    validator_hotkeys: set[str],
+) -> dict[str, object]:
+    """Build the sole hard-auditor record forwarded to the server process."""
+
+    disabled: dict[str, object] = {
+        "enabled": False,
+        "validator_hotkey_ss58": "",
+        "config_version": 0,
+        "effective_epoch": None,
+    }
+    if runtime is None:
+        return disabled
+    policy = runtime.proof_v3_hard_auditor
+    hotkey = str(policy.validator_hotkey_ss58 or "")
+    if not policy.enabled or hotkey not in validator_hotkeys:
+        return {
+            **disabled,
+            "config_version": int(runtime.version),
+            "effective_epoch": runtime.effective_epoch,
+        }
+    return {
+        "enabled": True,
+        "validator_hotkey_ss58": hotkey,
+        "config_version": int(runtime.version),
+        "effective_epoch": runtime.effective_epoch,
+    }
 
 
 def _capacity_audit_worker_poll_interval(config) -> float:
@@ -245,6 +317,118 @@ def _verify_proxy_health_hardware(local_health_url: str, args) -> None:
         bt.logging.error(f"Proxy /health audit GPU verification failed: {exc}")
         sys.exit(1)
 
+def _forward_proof_v2_artifacts(
+    server_args: list[str],
+    *,
+    manifest: str | None,
+    weight_catalog: str | None,
+    artifact_base_urls: list[str] | None = None,
+    artifact_cache_dir: str | None = None,
+) -> list[str]:
+    """Forward configured proof-v2 artifacts to the inner miner server.
+
+    Arguments supplied directly to the inner server after ``--`` take
+    precedence over wrapper environment defaults.
+    """
+    out = list(server_args)
+    for flag, value in (
+        ("--proof-v2-manifest", manifest),
+        ("--proof-v2-weight-catalog", weight_catalog),
+        ("--proof-v2-artifact-cache-dir", artifact_cache_dir),
+    ):
+        if value and flag not in out:
+            out.extend([flag, value])
+    if (
+        artifact_base_urls
+        and "--proof-v2-artifact-base-url" not in out
+    ):
+        for value in artifact_base_urls:
+            if value:
+                out.extend(["--proof-v2-artifact-base-url", value])
+    return out
+
+
+def _forward_proof_v3_artifacts(
+    server_args: list[str],
+    *,
+    manifest: str | None,
+    execution_profile: str | None,
+    calibration_set: str | None,
+    attention_semantics: str | None,
+    gdn_semantics: str | None,
+    lm_head_catalog: str | None,
+    projection_manifest: str | None,
+    projection_catalog: str | None,
+    runtime_encoding: str | None,
+    weight_cache_dir: str | None,
+) -> list[str]:
+    """Forward one explicit authenticated proof-v3 release."""
+
+    out = list(server_args)
+    for flag, value in (
+        ("--proof-v3-manifest", manifest),
+        ("--proof-v3-execution-profile", execution_profile),
+        ("--proof-v3-calibration-set", calibration_set),
+        ("--proof-v3-attention-semantics", attention_semantics),
+        ("--proof-v3-gdn-semantics", gdn_semantics),
+        ("--proof-v3-lm-head-catalog", lm_head_catalog),
+        ("--proof-v3-projection-manifest", projection_manifest),
+        ("--proof-v3-projection-catalog", projection_catalog),
+        ("--proof-v3-runtime-encoding", runtime_encoding),
+        ("--proof-v3-weight-cache-dir", weight_cache_dir),
+    ):
+        if value and flag not in out:
+            out.extend([flag, value])
+    return out
+
+
+def _apply_proof_v3_release_descriptor(args, descriptor_path: str) -> None:
+    """Expand one authenticated release descriptor into server arguments."""
+
+    from verallm.proof_v3.economic_release_catalog import (
+        load_proof_v3_release_descriptor,
+        proof_v3_release_artifact_paths,
+    )
+
+    source, value = load_proof_v3_release_descriptor(descriptor_path)
+    _source, paths = proof_v3_release_artifact_paths(source)
+    attributes = {
+        "proof_v3_manifest": "manifest",
+        "proof_v3_execution_profile": "execution_profile",
+        "proof_v3_calibration_set": "calibration_set",
+        "proof_v3_attention_semantics": "attention_runtime_semantics",
+        "proof_v3_gdn_semantics": "gdn_runtime_semantics",
+        "proof_v3_lm_head_catalog": "lm_head_catalog",
+        "proof_v3_projection_manifest": "projection_manifest",
+        "proof_v3_projection_catalog": "projection_catalog",
+    }
+    explicitly_configured = tuple(
+        name
+        for name in attributes
+        if str(getattr(args, name, None) or "").strip()
+    )
+    if explicitly_configured:
+        raise RuntimeError(
+            "proof-v3 release descriptor conflicts with explicit artifact "
+            "paths: " + ", ".join(explicitly_configured)
+        )
+    for attribute, role in attributes.items():
+        setattr(
+            args,
+            attribute,
+            str(paths[role]) if role in paths else None,
+        )
+    existing_encoding = str(
+        getattr(args, "proof_v3_runtime_encoding", None) or ""
+    ).strip()
+    descriptor_encoding = str(value["runtime_encoding_id"])
+    if existing_encoding and existing_encoding != descriptor_encoding:
+        raise RuntimeError(
+            "proof-v3 release descriptor conflicts with the configured "
+            "runtime encoding"
+        )
+    args.proof_v3_runtime_encoding = descriptor_encoding
+
 
 def _capacity_audit_state_path(evm_address: str | None, port: int) -> str:
     address = "".join(
@@ -416,10 +600,16 @@ class MinerNeuron:
         self._miner_client: Optional[MinerRegistryClient] = None
         self._server_process: Optional[subprocess.Popen] = None
         self._capacity_audit_worker = None
+        self._subnet_runtime_config_client = (
+            RuntimeSubnetConfigClient.from_config(config, log=bt.logging)
+        )
+        self._proof_v3_configured = False
+        self._served_proof_protocol_versions: tuple[int, ...] = ()
         self._running = True
 
         self.evm_pk = ""
         self.evm_addr = ""
+        self.hotkey_ss58 = ""
         self.uid: Optional[int] = None  # resolved from metagraph during setup()
 
     def setup(self, private_key: Optional[str] = None):
@@ -450,6 +640,7 @@ class MinerNeuron:
                 self.config.wallet_name, self.config.hotkey_name, wallet,
             )
             self.hotkey_seed = hotkey_seed
+            self.hotkey_ss58 = wallet.hotkey.ss58_address
 
             self.evm_pk = derive_evm_private_key(hotkey_seed)
             self.evm_addr = derive_evm_address(hotkey_seed)
@@ -651,8 +842,9 @@ class MinerNeuron:
 
         Auto-handles the Mamba/GDN max_num_seqs auto-tune: if the first
         launch exits with code 42 and leaves a hint file, we re-spawn the
-        subprocess with --max-num-seqs N where N is the available Mamba
-        cache-block count vLLM reported.  See _MAMBA_HINT_PATH above.
+        subprocess with a hardware-bounded --max-num-seqs N derived from the
+        available Mamba cache-block count vLLM reported. See
+        _MAMBA_HINT_PATH above.
         This makes Qwen3.5 / Qwen3.6 / any future Mamba-hybrid model start
         out-of-the-box on any GPU size without operator intervention.
         """
@@ -1158,7 +1350,7 @@ class MinerNeuron:
         Validators must have a permit AND meet the on-chain minValidatorStake
         threshold (read from ValidatorRegistry every refresh cycle).
         """
-        from verallm.api.validator_auth import DEFAULT_VALIDATORS_PATH
+        from verallm.api.validator_auth import resolve_validators_path
         try:
             sub = self._get_subtensor()
             metagraph = sub.metagraph(netuid=self.config.netuid)
@@ -1193,6 +1385,46 @@ class MinerNeuron:
                         "stake": stake,
                     })
 
+            validator_hotkeys = {
+                str(row["hotkey_ss58"])
+                for row in validators
+                if row.get("hotkey_ss58")
+            }
+            hard_auditor = _proof_v3_hard_auditor_record(
+                None,
+                validator_hotkeys,
+            )
+            try:
+                block_value = getattr(metagraph, "block", 0)
+                if hasattr(block_value, "item"):
+                    block_value = block_value.item()
+                block_number = int(block_value or 0)
+                epoch_blocks = max(1, int(self.config.epoch_blocks))
+                current_epoch = (
+                    block_number // epoch_blocks if block_number > 0 else None
+                )
+                runtime = self._subnet_runtime_config_client.get(
+                    current_epoch=current_epoch,
+                    force=False,
+                )
+                hard_auditor = _proof_v3_hard_auditor_record(
+                    runtime,
+                    validator_hotkeys,
+                )
+                if runtime is not None:
+                    apply_runtime_config_to_neuron_config(runtime, self.config)
+                    policy = runtime.proof_v3_hard_auditor
+                    if policy.enabled and not hard_auditor["enabled"]:
+                        bt.logging.warning(
+                            "Configured proof-v3 hard auditor is not in the "
+                            "current validator allowlist; hard reveals remain disabled"
+                        )
+            except Exception as exc:
+                bt.logging.warning(
+                    "Could not refresh proof-v3 hard-auditor policy; "
+                    f"hard reveals remain disabled: {exc}"
+                )
+
             # Inject manually allowed validators (--allow-validators)
             allow_extra = getattr(self.config, "allow_validators", None) or []
             existing_ss58 = {v["hotkey_ss58"] for v in validators}
@@ -1201,12 +1433,24 @@ class MinerNeuron:
                     validators.append({"uid": -1, "hotkey_ss58": ss58, "stake": 0})
                     bt.logging.info(f"Manually allowed validator: {ss58}")
 
-            out_path = os.environ.get("VERATHOS_VALIDATORS_PATH", DEFAULT_VALIDATORS_PATH)
+            out_path_obj = resolve_validators_path()
+            out_path_obj.parent.mkdir(parents=True, exist_ok=True)
+            out_path = str(out_path_obj)
             data = {
                 "updated_at": int(time.time()),
                 "netuid": self.config.netuid,
                 "validators": validators,
+                "proof_v3_hard_auditor": hard_auditor,
+                "allowed_proof_protocol_versions": list(
+                    _configured_miner_proof_protocol_versions(
+                        self.config.proof_protocol_allowed_versions,
+                        proof_v3_configured=self._proof_v3_configured,
+                    )
+                ),
             }
+            self._served_proof_protocol_versions = tuple(
+                data["allowed_proof_protocol_versions"]
+            )
             # Atomic write: write to temp file then rename
             tmp_path = out_path + ".tmp"
             with open(tmp_path, "w") as f:
@@ -1508,6 +1752,144 @@ def parse_args():
     proxy_group.add_argument("--advertised-gpu-uuids", default=None,
                              help="Comma-separated GPU UUIDs for /health (or VERATHOS_ADVERTISED_GPU_UUIDS).")
 
+    proof_v2_group = parser.add_argument_group("proof v2")
+    proof_v2_group.add_argument(
+        "--proof-v2-manifest",
+        default=os.environ.get(PROOF_V2_MANIFEST_ENV),
+        help=(
+            "Path to the chain-authenticated proof-v2 manifest document "
+            f"(env: {PROOF_V2_MANIFEST_ENV})."
+        ),
+    )
+    proof_v2_group.add_argument(
+        "--proof-v2-weight-catalog",
+        default=os.environ.get(PROOF_V2_WEIGHT_CATALOG_ENV),
+        help=(
+            "Path to the static proof-v2 weight commitment catalog "
+            f"(env: {PROOF_V2_WEIGHT_CATALOG_ENV})."
+        ),
+    )
+    proof_v2_group.add_argument(
+        "--proof-v2-artifact-base-url",
+        action="append",
+        default=None,
+        help=(
+            "HTTPS base URL for a content-addressed proof-v2 artifact store. "
+            "Repeat to configure fallback mirrors "
+            f"(env: {PROOF_V2_ARTIFACT_BASE_URLS_ENV}, comma-separated)."
+        ),
+    )
+    proof_v2_group.add_argument(
+        "--proof-v2-artifact-cache-dir",
+        default=os.environ.get(PROOF_V2_ARTIFACT_CACHE_DIR_ENV),
+        help=(
+            "Local cache directory for downloaded proof-v2 artifacts "
+            f"(env: {PROOF_V2_ARTIFACT_CACHE_DIR_ENV})."
+        ),
+    )
+
+    proof_v3_group = parser.add_argument_group("proof v3")
+    proof_v3_group.add_argument(
+        "--proof-v3-release",
+        default=os.environ.get(PROOF_V3_RELEASE_ENV),
+        help=(
+            "Complete local proof-v3 release descriptor "
+            f"(env: {PROOF_V3_RELEASE_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-artifact-base-url",
+        action="append",
+        default=None,
+        help=(
+            "HTTPS base URL for content-addressed proof-v3 releases. "
+            "Repeat for mirrors; defaults to "
+            "VERATHOS_PROOF_V3_ARTIFACT_BASE_URLS."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-artifact-cache-dir",
+        default=None,
+        help=(
+            "Local content-addressed proof-v3 release cache; defaults to "
+            "VERATHOS_PROOF_V3_ARTIFACT_CACHE_DIR or VERALLM_DATA_DIR."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-manifest",
+        default=os.environ.get(PROOF_V3_MANIFEST_ENV),
+        help=f"Authority-signed projection manifest (env: {PROOF_V3_MANIFEST_ENV}).",
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-execution-profile",
+        default=os.environ.get(PROOF_V3_EXECUTION_PROFILE_ENV),
+        help=(
+            "Authority-signed execution profile "
+            f"(env: {PROOF_V3_EXECUTION_PROFILE_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-calibration-set",
+        default=os.environ.get(PROOF_V3_CALIBRATION_SET_ENV),
+        help=f"Manifest-bound calibration set (env: {PROOF_V3_CALIBRATION_SET_ENV}).",
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-attention-semantics",
+        default=os.environ.get(PROOF_V3_ATTENTION_SEMANTICS_ENV),
+        help=(
+            "Manifest-bound attention runtime semantics "
+            f"(env: {PROOF_V3_ATTENTION_SEMANTICS_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-gdn-semantics",
+        default=os.environ.get(PROOF_V3_GDN_SEMANTICS_ENV),
+        help=(
+            "Manifest-bound GDN runtime semantics when required "
+            f"(env: {PROOF_V3_GDN_SEMANTICS_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-lm-head-catalog",
+        default=os.environ.get(PROOF_V3_LM_HEAD_CATALOG_ENV),
+        help=(
+            "Manifest-bound LM-head commitment catalog "
+            f"(env: {PROOF_V3_LM_HEAD_CATALOG_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-projection-manifest",
+        default=os.environ.get(PROOF_V3_PROJECTION_MANIFEST_ENV),
+        help=(
+            "Authority-signed projection catalog manifest "
+            f"(env: {PROOF_V3_PROJECTION_MANIFEST_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-projection-catalog",
+        default=os.environ.get(PROOF_V3_PROJECTION_CATALOG_ENV),
+        help=(
+            "Manifest-bound projection catalog "
+            f"(env: {PROOF_V3_PROJECTION_CATALOG_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-runtime-encoding",
+        default=os.environ.get(PROOF_V3_RUNTIME_ENCODING_ENV),
+        help=(
+            "Qualified activation encoding ID "
+            f"(env: {PROOF_V3_RUNTIME_ENCODING_ENV})."
+        ),
+    )
+    proof_v3_group.add_argument(
+        "--proof-v3-weight-cache-dir",
+        default=os.environ.get(PROOF_V3_WEIGHT_CACHE_DIR_ENV),
+        help=(
+            "Persistent authenticated static-weight cache "
+            f"(env: {PROOF_V3_WEIGHT_CACHE_DIR_ENV})."
+        ),
+    )
+
     # TEE (Trusted Execution Environment)
     tee_group = parser.add_argument_group("tee")
     parser.add_argument("--allow-validators", nargs="+", default=None,
@@ -1541,6 +1923,22 @@ def parse_args():
     # Everything after -- is passed to the miner server
     args, server_args = parser.parse_known_args()
     return args, _normalize_server_args(server_args)
+
+
+def _neuron_config_from_args(args) -> NeuronConfig:
+    """Construct network-scoped miner config from parsed CLI arguments."""
+
+    overrides = {
+        "wallet_name": args.wallet or "default",
+        "hotkey_name": args.hotkey,
+        "netuid": args.netuid,
+    }
+    if args.subtensor_network:
+        # Bind network-scoped runtime URLs at construction time. Mutating
+        # ``subtensor_network`` afterward leaves the default subnet-config and
+        # owner-verdict URLs on their previous network.
+        overrides["subtensor_network"] = args.subtensor_network
+    return NeuronConfig.from_env(**overrides)
 
 
 def _extract_code_measurement(platform: str, attestation_report: bytes, Web3) -> bytes:
@@ -1693,6 +2091,16 @@ def main():
     setup_neuron_logging(args)
     _clear_stale_compile_caches()
 
+    # The updater executing the first v1 -> v3 fast-forward is still the old
+    # in-memory module and cannot install a newly introduced CUDA wheel.  The
+    # restarted miner verifies the installed payload byte-for-byte against the
+    # selected bundled wheel and installs it only when missing or stale.
+    from neurons.auto_update import ensure_local_proof_v3_cuda_wheel
+
+    if not ensure_local_proof_v3_cuda_wheel():
+        bt.logging.error("Proof-v3 CUDA runtime installation failed")
+        sys.exit(1)
+
     if not args.wallet and not args.private_key:
         bt.logging.error("Either --wallet or --private-key is required")
         sys.exit(1)
@@ -1706,11 +2114,7 @@ def main():
         sys.exit(1)
     args.chain_config = resolved_chain_path  # update for downstream use
 
-    config = NeuronConfig.from_env(
-        wallet_name=args.wallet or "default",
-        hotkey_name=args.hotkey,
-        netuid=args.netuid,
-    )
+    config = _neuron_config_from_args(args)
     if getattr(args, "capacity_audit", False):
         config.capacity_audit_enabled = True
 
@@ -1812,6 +2216,7 @@ def main():
     # it into GPU. This avoids wasting ~60s on model load + root
     # computation only to fail at _chain_self_check in the server.
     on_chain_models: list[str] | None = None
+    model_client = None
     if chain_config.model_registry_address:
         try:
             from verallm.chain.model_registry import ModelRegistryClient
@@ -1840,7 +2245,67 @@ def main():
                 f"The server will re-check after model load."
             )
 
+    from verallm.proof_v3.artifact_store import (
+        configured_proof_v3_artifact_base_urls,
+    )
+
+    proof_v3_sources = configured_proof_v3_artifact_base_urls(
+        args.proof_v3_artifact_base_url,
+        default_values=getattr(
+            chain_config,
+            "proof_v3_artifact_base_urls",
+            (),
+        ),
+    )
+    proof_v3_descriptor = str(args.proof_v3_release or "").strip()
+    if proof_v3_descriptor and proof_v3_sources:
+        bt.logging.info(
+            "Using explicit proof-v3 release descriptor instead of remote "
+            "artifact discovery"
+        )
+    if not proof_v3_descriptor and proof_v3_sources:
+        if model_client is None:
+            bt.logging.error(
+                "Remote proof-v3 releases require ModelRegistry access"
+            )
+            sys.exit(1)
+        try:
+            from verallm.proof_v3.artifact_store import (
+                resolve_remote_proof_v3_release,
+            )
+
+            resolved_v3 = resolve_remote_proof_v3_release(
+                resolved.model_id,
+                proof_v3_sources,
+                chain_config=chain_config,
+                model_registry_client=model_client,
+                cache_directory=(
+                    args.proof_v3_artifact_cache_dir
+                    or getattr(
+                        chain_config,
+                        "proof_v3_artifact_cache_dir",
+                        "",
+                    )
+                    or None
+                ),
+            )
+            proof_v3_descriptor = str(resolved_v3.descriptor_path)
+            bt.logging.info(
+                "Authenticated cached proof-v3 release from "
+                f"{resolved_v3.index_source_url}"
+            )
+        except Exception as exc:
+            bt.logging.error(f"Proof-v3 artifact resolution failed: {exc}")
+            sys.exit(1)
+    if proof_v3_descriptor:
+        try:
+            _apply_proof_v3_release_descriptor(args, proof_v3_descriptor)
+        except Exception as exc:
+            bt.logging.error(f"Proof-v3 release configuration failed: {exc}")
+            sys.exit(1)
+
     neuron = MinerNeuron(config)
+    neuron._proof_v3_configured = bool(args.proof_v3_manifest)
 
     def signal_handler(sig, _frame):
         bt.logging.info(f"Received signal {sig}, shutting down")
@@ -1894,6 +2359,38 @@ def main():
         server_args.extend(["--chain-config", args.chain_config])
     if chain_config.rpc_url and "--evm-rpc-url" not in server_args:
         server_args.extend(["--evm-rpc-url", chain_config.rpc_url])
+
+    server_args = _forward_proof_v2_artifacts(
+        server_args,
+        manifest=args.proof_v2_manifest,
+        weight_catalog=args.proof_v2_weight_catalog,
+        artifact_base_urls=args.proof_v2_artifact_base_url,
+        artifact_cache_dir=args.proof_v2_artifact_cache_dir,
+    )
+    server_args = _forward_proof_v3_artifacts(
+        server_args,
+        manifest=args.proof_v3_manifest,
+        execution_profile=args.proof_v3_execution_profile,
+        calibration_set=args.proof_v3_calibration_set,
+        attention_semantics=args.proof_v3_attention_semantics,
+        gdn_semantics=args.proof_v3_gdn_semantics,
+        lm_head_catalog=args.proof_v3_lm_head_catalog,
+        projection_manifest=args.proof_v3_projection_manifest,
+        projection_catalog=args.proof_v3_projection_catalog,
+        runtime_encoding=args.proof_v3_runtime_encoding,
+        weight_cache_dir=args.proof_v3_weight_cache_dir,
+    )
+    if args.proof_v3_manifest:
+        if not neuron.hotkey_ss58:
+            bt.logging.error(
+                "Proof-v3 requires a Bittensor wallet hotkey identity; "
+                "direct EVM private-key mode is unsupported."
+            )
+            sys.exit(1)
+        if "--miner-hotkey-ss58" not in server_args:
+            server_args.extend(
+                ["--miner-hotkey-ss58", neuron.hotkey_ss58]
+            )
 
     # Forward TEE args to server subprocess
     if args.tee_enabled and "--tee-enabled" not in server_args:
@@ -1963,6 +2460,26 @@ def main():
             neuron._refresh_validator_allowlist()
         except Exception as e:
             bt.logging.warning(f"Initial validator allowlist write failed: {e} — server will block until next refresh succeeds")
+    served_proof_protocol_versions = (
+        neuron._served_proof_protocol_versions
+        or _configured_miner_proof_protocol_versions(
+            config.proof_protocol_allowed_versions,
+            proof_v3_configured=bool(args.proof_v3_manifest),
+        )
+    )
+    if not served_proof_protocol_versions:
+        bt.logging.error(
+            "Miner has no configured proof protocol allowed by the subnet"
+        )
+        sys.exit(1)
+    server_args = _set_server_arg(
+        server_args,
+        "--allowed-proof-protocol-versions",
+        ",".join(
+            str(version)
+            for version in served_proof_protocol_versions
+        ),
+    )
 
     # ── External port reachability check ──
     # Verify the endpoint port is reachable from outside BEFORE loading vLLM

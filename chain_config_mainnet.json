@@ -7,5 +7,8 @@
   "validator_registry_address": "0x0e8d3b4D1CDFc2D15cA13A0A87Ef4ef6F9A2Ad77",
   "checkpoint_registry_address": "0x21155aa55dfb6BbF01565abb69E1e70D7ED17798",
   "subnet_config_address": "0xcF56EE8e88fAaCD0513Cde33805423608A4A6833",
+  "proof_v3_artifact_base_urls": [
+    "https://verathos.ai/gleipnir/mainnet/"
+  ],
   "mock": false
 }
