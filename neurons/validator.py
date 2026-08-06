@@ -976,6 +976,12 @@ class ValidatorNeuron:
         self._epoch_close_backoff: float = 30.0  # seconds, doubles on failure
         self._weight_update_due: bool = False
         self._last_known_block: int = 0  # fallback for _get_current_block
+        # The stream watchdog can replace a subscription while its callback is
+        # still completing a slow epoch close.  Serialize block delivery across
+        # subscription generations so a stale reconnect cursor cannot dispatch
+        # the boundary twice or overtake the callback that already claimed it.
+        self._block_dispatch_lock = threading.Lock()
+        self._highest_dispatched_block: int = -1
         self._last_block_hash_warning_at: float = 0.0
         self._capacity_audit_server = None
         self._capacity_audit_server_thread = None
@@ -12203,25 +12209,46 @@ class ValidatorNeuron:
     ) -> int:
         if current_block <= last_block:
             return last_block
-        self._last_known_block = current_block
+        dispatch_lock = getattr(self, "_block_dispatch_lock", None)
+        if dispatch_lock is None:
+            # Compatibility for narrow unit fixtures and state restored from a
+            # process created before this guard existed.
+            dispatch_lock = threading.Lock()
+            self._block_dispatch_lock = dispatch_lock
         for block_num in range(last_block + 1, current_block + 1):
             if not self._running:
                 break
-            if block_num == current_block and current_hash is not None:
-                block_hash, block_hash_real = current_hash, current_hash_real
-            else:
-                block_hash, block_hash_real = self._get_chain_block_hash(
-                    block_num,
-                    subtensor_obj,
+            with dispatch_lock:
+                highest = int(
+                    getattr(self, "_highest_dispatched_block", -1) or -1
                 )
-            try:
-                self.on_finalized_block(
+                if block_num <= highest:
+                    last_block = max(last_block, block_num)
+                    continue
+                # Claim before executing. The existing stream loop advances
+                # past a block even when its handler raises; preserving that
+                # behavior prevents a reconnect from replaying partial side
+                # effects after an exception.
+                self._highest_dispatched_block = block_num
+                self._last_known_block = max(
+                    int(getattr(self, "_last_known_block", 0) or 0),
                     block_num,
-                    block_hash,
-                    block_hash_real=block_hash_real,
                 )
-            except Exception as e:
-                bt.logging.debug(f"Block {block_num} processing: {e}")
+                if block_num == current_block and current_hash is not None:
+                    block_hash, block_hash_real = current_hash, current_hash_real
+                else:
+                    block_hash, block_hash_real = self._get_chain_block_hash(
+                        block_num,
+                        subtensor_obj,
+                    )
+                try:
+                    self.on_finalized_block(
+                        block_num,
+                        block_hash,
+                        block_hash_real=block_hash_real,
+                    )
+                except Exception as e:
+                    bt.logging.debug(f"Block {block_num} processing: {e}")
             last_block = block_num
         confirmer = getattr(self, "_confirm_capacity_audit_finalized_blocks", None)
         if callable(confirmer):

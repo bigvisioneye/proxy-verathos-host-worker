@@ -2055,6 +2055,33 @@ def _extract_server_port(server_args: list[str]) -> int:
     return 8000  # matches verallm.api.server default
 
 
+def _compile_cache_dirs(
+    *,
+    environ=None,
+    home=None,
+    tmp_root=None,
+) -> tuple:
+    """Return the exact compile-cache directories owned by this miner."""
+
+    import pathlib
+
+    environ = os.environ if environ is None else environ
+    home = pathlib.Path.home() if home is None else pathlib.Path(home)
+    tmp_root = pathlib.Path("/tmp") if tmp_root is None else pathlib.Path(tmp_root)
+    cache_dirs = [
+        home / ".cache" / "vllm" / "torch_compile_cache",
+        home / ".triton" / "cache",
+    ]
+    for name in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
+        value = str(environ.get(name, "")).strip()
+        if value:
+            cache_dirs.append(pathlib.Path(value).expanduser())
+    cache_dirs.extend(tmp_root.glob("torchinductor_*"))
+    # Keep ordering stable for logs/tests while avoiding repeat deletion when
+    # an environment variable points at one of the standard locations.
+    return tuple(dict.fromkeys(cache_dirs))
+
+
 def _clear_stale_compile_caches() -> None:
     """Clear torch.compile / Triton caches to prevent stale kernels.
 
@@ -2063,17 +2090,8 @@ def _clear_stale_compile_caches() -> None:
     every startup is safe — recompilation adds ~30s to first startup only.
     """
     import shutil
-    import pathlib
-    home = pathlib.Path.home()
-    cache_dirs = [
-        home / ".cache" / "vllm" / "torch_compile_cache",
-        home / ".triton" / "cache",
-    ]
-    # /tmp/torchinductor_<user> — match any user
-    for p in pathlib.Path("/tmp").glob("torchinductor_*"):
-        cache_dirs.append(p)
     cleared = 0
-    for d in cache_dirs:
+    for d in _compile_cache_dirs():
         if d.is_dir():
             try:
                 shutil.rmtree(d)
