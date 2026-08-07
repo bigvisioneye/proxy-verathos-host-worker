@@ -233,6 +233,73 @@ def compute_speed_factor(
     return min(1.3, math.sqrt(miner_median_tps / model_median_tps))
 
 
+def _canonical_canary_tokens(
+    receipts: List[ServiceReceipt],
+    *,
+    max_context_len: int,
+    output_weight: int,
+    output_cap: int,
+) -> int:
+    """Return a validator-role-independent canary throughput contribution.
+
+    Every honest validator pulls the same authenticated receipt set, but the
+    designated hard auditor and light-only followers intentionally schedule
+    different local inventories.  A shared receipt pool must therefore never
+    be clipped by the observer's local schedule.
+
+    Compute one bounded contribution per receipt signer and use the largest
+    completed inventory.  This preserves the strongest observed work sample
+    while preventing the number of validators from multiplying canary credit.
+    Organic receipts are accounted separately and remain additive.
+    """
+
+    per_validator: Dict[bytes, int] = {}
+    obligation_values: Dict[Tuple[bytes, bytes], int] = {}
+    context_cap = max(0, int(max_context_len))
+
+    for receipt in receipts:
+        if not receipt.is_canary or int(receipt.tokens_generated or 0) <= 0:
+            continue
+        if receipt.proof_requested and not receipt.proof_verified:
+            continue
+
+        signer = bytes(getattr(receipt, "validator_hotkey", b"") or b"")
+        output_tokens = min(
+            max(0, int(receipt.tokens_generated or 0)),
+            int(output_cap),
+        )
+        prompt_tokens = max(0, int(receipt.prompt_tokens or 0))
+        if context_cap > 0:
+            prompt_tokens = min(prompt_tokens, context_cap)
+
+        # Receipt v4 binds the validator's intended prompt target.  It is an
+        # additional per-receipt ceiling, never a source of extra credit.
+        version = int(getattr(receipt, "receipt_version", 1) or 1)
+        target = int(
+            getattr(receipt, "canary_target_prompt_tokens", 0) or 0
+        )
+        if version >= 4 and target > 0:
+            prompt_tokens = min(prompt_tokens, target)
+
+        weighted = prompt_tokens + int(output_weight) * output_tokens
+        obligation_id = bytes(
+            getattr(receipt, "canary_obligation_id", b"") or b""
+        )
+        if version >= 4 and len(obligation_id) == 16:
+            key = (signer, obligation_id)
+            obligation_values[key] = max(
+                obligation_values.get(key, 0),
+                weighted,
+            )
+        else:
+            per_validator[signer] = per_validator.get(signer, 0) + weighted
+
+    for (signer, _obligation_id), weighted in obligation_values.items():
+        per_validator[signer] = per_validator.get(signer, 0) + weighted
+
+    return max(per_validator.values(), default=0)
+
+
 def compute_epoch_entry_score(
     outcome: EpochOutcome,
     active_params_b: float,
@@ -370,25 +437,16 @@ def compute_epoch_entry_score(
     ORGANIC_PROMPT_CAP = 4096
     ORGANIC_PROMPT_TO_OUTPUT_CAP = 8
 
-    # Cap each validator's canary contribution at its exact planned inventory.
-    # Prompts are independently secret-seeded across validators, so this cap
-    # prevents validator count from inflating a miner's score.
-    if expected_obligations:
-        planned_prompt_tokens = sum(
-            int(target) for _kind, target in expected_obligations.values()
-        )
-        canary_tokens_budget = planned_prompt_tokens + (
-            OUTPUT_WEIGHT * CANARY_OUTPUT_CAP * len(expected_obligations)
-        )
-    else:
-        # Historical compatibility for callers that only know a count.
-        planned = max(0, int(outcome.expected_own_receipt_count))
-        canary_tokens_budget = (
-            max(0, int(outcome.max_context_len))
-            + planned * OUTPUT_WEIGHT * CANARY_OUTPUT_CAP
-        )
-
-    canary_tokens = 0
+    # Canary credit is derived from the shared authenticated receipt set, not
+    # from this observer's local obligation inventory.  Owner and follower
+    # validators schedule different work by design; using the local inventory
+    # here made identical receipt sets produce different throughput scores.
+    canary_tokens = _canonical_canary_tokens(
+        outcome.all_receipts,
+        max_context_len=outcome.max_context_len,
+        output_weight=OUTPUT_WEIGHT,
+        output_cap=CANARY_OUTPUT_CAP,
+    )
     organic_tokens = 0
     for r in outcome.all_receipts:
         if r.tokens_generated <= 0:
@@ -398,20 +456,16 @@ def compute_epoch_entry_score(
         cap = CANARY_OUTPUT_CAP if r.is_canary else ORGANIC_OUTPUT_CAP
         output_tokens = min(r.tokens_generated, cap)
         if r.is_canary:
-            prompt_tokens = r.prompt_tokens
-        else:
-            prompt_tokens = min(
-                r.prompt_tokens,
-                ORGANIC_PROMPT_CAP,
-                ORGANIC_PROMPT_TO_OUTPUT_CAP * output_tokens,
-            )
+            continue
+        prompt_tokens = min(
+            r.prompt_tokens,
+            ORGANIC_PROMPT_CAP,
+            ORGANIC_PROMPT_TO_OUTPUT_CAP * output_tokens,
+        )
         weighted = OUTPUT_WEIGHT * output_tokens + prompt_tokens
-        if r.is_canary:
-            canary_tokens += weighted
-        else:
-            organic_tokens += weighted
+        organic_tokens += weighted
 
-    total_tokens = min(canary_tokens, canary_tokens_budget) + organic_tokens
+    total_tokens = canary_tokens + organic_tokens
     if total_tokens <= 0:
         return None if suppress_hard_failures else 0.0
 

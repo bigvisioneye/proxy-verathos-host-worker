@@ -34,7 +34,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import bittensor as bt
 import httpx
@@ -85,6 +85,10 @@ PROOF_V3_RUNTIME_ENCODING_ENV = "VERATHOS_PROOF_V3_RUNTIME_ENCODING"
 PROOF_V3_WEIGHT_CACHE_DIR_ENV = "VERATHOS_PROOF_V3_WEIGHT_CACHE_DIR"
 PROOF_V3_RELEASE_ENV = "VERATHOS_PROOF_V3_RELEASE"
 
+PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS = 60.0
+PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS = 5.0
+PROOF_V3_ARTIFACT_REFRESH_MAX_ACTIVE_DEFERRAL_SECONDS = 300.0
+
 
 def _configured_miner_proof_protocol_versions(
     owner_allowed: tuple[int, ...],
@@ -106,6 +110,162 @@ def _configured_miner_proof_protocol_versions(
         for version in sorted(set(int(v) for v in owner_allowed))
         if version in locally_served
     )
+
+
+class ProofV3ArtifactRefreshWatcher:
+    """Detect and adopt authenticated remote proof-v3 release changes.
+
+    A cheap chain-context-checked index probe runs on the steady-state path.
+    A candidate change is fully downloaded and authenticated before a restart
+    is scheduled.  Hard proofs and capacity audits are never interrupted;
+    ordinary requests receive a bounded idle-window opportunity so sustained
+    traffic cannot suppress a required security-profile adoption forever.
+    """
+
+    def __init__(
+        self,
+        *,
+        current_release_sha256: bytes,
+        probe_release: Callable[[], object],
+        resolve_release: Callable[[], object],
+        busy_state: Callable[[], tuple[int, int, bool, bool]],
+        restart: Callable[[], None],
+        interval_seconds: float = PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS,
+        retry_seconds: float = PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS,
+        max_active_deferral_seconds: float = (
+            PROOF_V3_ARTIFACT_REFRESH_MAX_ACTIVE_DEFERRAL_SECONDS
+        ),
+    ) -> None:
+        if (
+            type(current_release_sha256) is not bytes
+            or len(current_release_sha256) != 32
+        ):
+            raise ValueError("current proof-v3 release digest is invalid")
+        if not all(
+            callable(value)
+            for value in (probe_release, resolve_release, busy_state, restart)
+        ):
+            raise ValueError("proof-v3 artifact refresh callbacks are invalid")
+        if min(interval_seconds, retry_seconds, max_active_deferral_seconds) <= 0:
+            raise ValueError("proof-v3 artifact refresh timing is invalid")
+        self.current_release_sha256 = current_release_sha256
+        self.probe_release = probe_release
+        self.resolve_release = resolve_release
+        self.busy_state = busy_state
+        self.restart = restart
+        self.interval_seconds = float(interval_seconds)
+        self.retry_seconds = float(retry_seconds)
+        self.max_active_deferral_seconds = float(max_active_deferral_seconds)
+        self._pending_release_sha256: bytes | None = None
+        self._pending_since: float | None = None
+        self._restart_triggered = False
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def check_once(self, *, now: float | None = None) -> str:
+        """Run one deterministic refresh/adoption decision."""
+
+        if self._stop_event.is_set():
+            return "stopped"
+        if self._restart_triggered:
+            return "restart_triggered"
+        selected_now = time.monotonic() if now is None else float(now)
+        if self._pending_release_sha256 is None:
+            probe = self.probe_release()
+            candidate = getattr(probe, "release_sha256", None)
+            if type(candidate) is not bytes or len(candidate) != 32:
+                raise RuntimeError("proof-v3 release probe digest is invalid")
+            if candidate == self.current_release_sha256:
+                return "unchanged"
+            resolved = self.resolve_release()
+            resolved_digest = getattr(resolved, "release_sha256", None)
+            if type(resolved_digest) is not bytes or len(resolved_digest) != 32:
+                raise RuntimeError(
+                    "authenticated proof-v3 release digest is invalid"
+                )
+            if resolved_digest != candidate:
+                raise RuntimeError(
+                    "authenticated proof-v3 release does not match the probed index"
+                )
+            self._pending_release_sha256 = resolved_digest
+            self._pending_since = selected_now
+            bt.logging.warning(
+                "Authenticated proof-v3 artifact update detected: "
+                f"{self.current_release_sha256.hex()[:16]}... -> "
+                f"{resolved_digest.hex()[:16]}...; waiting for an idle "
+                "adoption window"
+            )
+
+        active_requests, proof_pending, hard_exclusive, capacity_active = (
+            self.busy_state()
+        )
+        if proof_pending > 0 or hard_exclusive or capacity_active:
+            return "deferred_proof_or_audit"
+        pending_since = self._pending_since
+        if (
+            active_requests > 0
+            and pending_since is not None
+            and selected_now - pending_since
+            < self.max_active_deferral_seconds
+        ):
+            return "deferred_active_requests"
+        if self._stop_event.is_set():
+            return "stopped"
+
+        self._restart_triggered = True
+        if active_requests > 0:
+            bt.logging.warning(
+                "Proof-v3 artifact adoption reached its bounded ordinary-request "
+                "deferral; restarting onto the authenticated release"
+            )
+        else:
+            bt.logging.info(
+                "Proof-v3 artifact adoption window is idle; restarting onto "
+                "the authenticated release"
+            )
+        try:
+            self.restart()
+        except BaseException:
+            # A failed restart attempt must remain retryable.  The production
+            # restart helper normally does not return, but this also covers a
+            # PM2/exec failure without pinning the watcher in a false-success
+            # state.
+            self._restart_triggered = False
+            raise
+        return "restart_triggered"
+
+    def _run(self) -> None:
+        if self._stop_event.wait(self.interval_seconds):
+            return
+        while not self._stop_event.is_set():
+            delay = self.interval_seconds
+            try:
+                result = self.check_once()
+                if result.startswith("deferred_"):
+                    delay = self.retry_seconds
+            except Exception as exc:
+                bt.logging.warning(
+                    f"Proof-v3 artifact refresh rejected; keeping current release: {exc}"
+                )
+            if self._stop_event.wait(delay):
+                return
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="proof-v3-artifact-refresh",
+        )
+        self._thread.start()
+        bt.logging.info(
+            "Proof-v3 artifact refresh started "
+            f"(interval={self.interval_seconds:.0f}s)"
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
 
 
 def _proof_v3_hard_auditor_record(
@@ -600,6 +760,9 @@ class MinerNeuron:
         self._miner_client: Optional[MinerRegistryClient] = None
         self._server_process: Optional[subprocess.Popen] = None
         self._capacity_audit_worker = None
+        self._proof_v3_artifact_watcher: Optional[
+            ProofV3ArtifactRefreshWatcher
+        ] = None
         self._subnet_runtime_config_client = (
             RuntimeSubnetConfigClient.from_config(config, log=bt.logging)
         )
@@ -1031,6 +1194,92 @@ class MinerNeuron:
         except Exception as e:
             bt.logging.warning(f"Could not query server for actual context: {e}")
             return None
+
+    def _proof_v3_refresh_busy_state(
+        self,
+        endpoint: str,
+    ) -> tuple[int, int, bool, bool]:
+        """Return bounded local work state for authenticated release adoption."""
+
+        capacity_active = False
+        worker = self._capacity_audit_worker
+        if worker is not None:
+            try:
+                capacity_active = bool(worker._has_active_local_audit())
+            except Exception:
+                # An unreadable audit state must delay, never authorize, a
+                # restart that could destroy an active capacity witness.
+                capacity_active = True
+        proc = self._server_process
+        if proc is None or proc.poll() is not None:
+            return 0, 0, False, capacity_active
+        try:
+            response = httpx.get(f"{endpoint}/health", timeout=5.0)
+            response.raise_for_status()
+            health = response.json()
+            active_requests = max(0, int(health.get("active_requests", 0)))
+            proof_pending = max(0, int(health.get("proof_pending", 0)))
+            hard_exclusive = bool(health.get("hard_proof_exclusive", False))
+            return (
+                active_requests,
+                proof_pending,
+                hard_exclusive,
+                capacity_active,
+            )
+        except Exception:
+            # A live but unreadable server gets the ordinary bounded deferral;
+            # it cannot suppress adoption indefinitely by hiding health.
+            return 1, 0, False, capacity_active
+
+    def start_proof_v3_artifact_refresh(
+        self,
+        *,
+        model_id: str,
+        base_urls: tuple[str, ...],
+        chain_config,
+        model_registry_client,
+        cache_directory: str | None,
+        current_release_sha256: bytes,
+        local_health_url: str,
+    ) -> None:
+        """Watch one remote release and restart onto authenticated changes."""
+
+        if self._proof_v3_artifact_watcher is not None:
+            return
+        from neurons.auto_update import restart_process
+        from verallm.proof_v3.artifact_store import (
+            probe_remote_proof_v3_release,
+            resolve_remote_proof_v3_release,
+        )
+
+        def _probe():
+            return probe_remote_proof_v3_release(
+                model_id,
+                base_urls,
+                chain_config=chain_config,
+                cache_directory=cache_directory,
+            )
+
+        def _resolve():
+            return resolve_remote_proof_v3_release(
+                model_id,
+                base_urls,
+                chain_config=chain_config,
+                model_registry_client=model_registry_client,
+                cache_directory=cache_directory,
+            )
+
+        watcher = ProofV3ArtifactRefreshWatcher(
+            current_release_sha256=current_release_sha256,
+            probe_release=_probe,
+            resolve_release=_resolve,
+            busy_state=lambda: self._proof_v3_refresh_busy_state(
+                local_health_url
+            ),
+            restart=restart_process,
+        )
+        self._proof_v3_artifact_watcher = watcher
+        watcher.start()
 
     @staticmethod
     def _ctx_close_enough(old: int, new: int, tolerance: float = 0.10) -> bool:
@@ -1656,6 +1905,9 @@ class MinerNeuron:
     def shutdown(self):
         """Clean shutdown."""
         self._running = False
+        artifact_watcher = getattr(self, "_proof_v3_artifact_watcher", None)
+        if artifact_watcher is not None:
+            artifact_watcher.stop()
         if self._capacity_audit_worker is not None:
             self._capacity_audit_worker.stop()
         proc = self._server_process
@@ -2275,6 +2527,16 @@ def main():
             (),
         ),
     )
+    resolved_v3 = None
+    proof_v3_cache_directory = (
+        args.proof_v3_artifact_cache_dir
+        or getattr(
+            chain_config,
+            "proof_v3_artifact_cache_dir",
+            "",
+        )
+        or None
+    )
     proof_v3_descriptor = str(args.proof_v3_release or "").strip()
     if proof_v3_descriptor and proof_v3_sources:
         bt.logging.info(
@@ -2297,15 +2559,7 @@ def main():
                 proof_v3_sources,
                 chain_config=chain_config,
                 model_registry_client=model_client,
-                cache_directory=(
-                    args.proof_v3_artifact_cache_dir
-                    or getattr(
-                        chain_config,
-                        "proof_v3_artifact_cache_dir",
-                        "",
-                    )
-                    or None
-                ),
+                cache_directory=proof_v3_cache_directory,
             )
             proof_v3_descriptor = str(resolved_v3.descriptor_path)
             bt.logging.info(
@@ -2663,6 +2917,17 @@ def main():
             jitter_seed=neuron.hotkey_seed,
         )
         updater.start()
+
+    if resolved_v3 is not None:
+        neuron.start_proof_v3_artifact_refresh(
+            model_id=resolved.model_id,
+            base_urls=proof_v3_sources,
+            chain_config=chain_config,
+            model_registry_client=model_client,
+            cache_directory=proof_v3_cache_directory,
+            current_release_sha256=resolved_v3.release_sha256,
+            local_health_url=local_health_url,
+        )
 
     bt.logging.success(
         f"Miner ready — serving {resolved.model_id} ({resolved.quant}) "

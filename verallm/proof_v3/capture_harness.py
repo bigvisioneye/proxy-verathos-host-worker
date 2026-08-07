@@ -31,7 +31,21 @@ def _select_economic_capture_buffers(
 ):
     """Select raw witnesses by their canonical signed stage suffix."""
 
-    candidates = tuple(capture_buffers) + tuple(root_row_aliases)
+    candidates = list(tuple(capture_buffers) + tuple(root_row_aliases))
+    candidate_keys = tuple(
+        (int(item[0]), str(item[1])) for item in candidates
+    )
+    # Mirror the production server's convergence of graph-native reduction
+    # aliases into the ordinary raw-witness inventory.  Split-mode attention
+    # may expose its compact K/V row only through the whole-step reduction
+    # buffer rather than the projection wrapper's own output storage.
+    for item in required_root_row_aliases:
+        key = (int(item[0]), str(item[1]))
+        if suffix_filter is not None and key[1] not in suffix_filter:
+            continue
+        if key not in candidate_keys:
+            candidates.append(item)
+            candidate_keys += (key,)
     selected = tuple(
         item
         for item in candidates
@@ -129,6 +143,21 @@ def _reduction_capture_mode_v3(
             "buffer-mode reduction capture lacks canonical buffers"
         )
     return "buffer"
+
+
+def _reduction_wrapper_is_dedicated_buffer_v3(wrappers) -> bool:
+    """Mirror production's base-inventory exclusion for reduction wrappers."""
+
+    import torch
+
+    row_indices = wrappers.get("row_indices")
+    qkv = wrappers.get("qkv")
+    output = wrappers.get("o")
+    return (
+        not isinstance(row_indices, torch.Tensor)
+        or bool(getattr(qkv, "_use_buffer", False))
+        or bool(getattr(output, "_use_buffer", False))
+    )
 
 
 class CaptureMiner:
@@ -237,22 +266,7 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
     reduction_wrapper_ids = {
         id(wrapper)
         for wrappers in reduction_wrappers.values()
-        if _reduction_capture_mode_v3(
-            wrappers["qkv"],
-            wrappers["o"],
-            qkv_output_buffer=wrappers.get(
-                "qkv_output_buffer",
-                wrappers["qkv"]._capture_output_buf,
-            ),
-            o_input_buffer=wrappers.get(
-                "o_input_buffer",
-                wrappers["o"]._capture_buf,
-            ),
-            row_indices=wrappers.get(
-                "row_indices",
-                getattr(wrappers["qkv"], "_capture_row_indices", None),
-            ),
-        ) != "split"
+        if _reduction_wrapper_is_dedicated_buffer_v3(wrappers)
         for wrapper in (wrappers["qkv"], wrappers["o"])
     }
     tr = RequestActivationTracker(be.model_runner, backend="splitting_ops")

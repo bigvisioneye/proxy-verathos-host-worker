@@ -292,6 +292,7 @@ def _corridor_check(
     w_sq: float | None = None,
     sigma_cap: float = _CORRIDOR_SIGMA,
     output_quant_floor: float | None = None,
+    captured_is_quantized: bool = True,
 ) -> float:
     """|dequant(surrogate) - dequant(captured)| within the signed corridor.
 
@@ -313,6 +314,15 @@ def _corridor_check(
     import math
 
     lhs = surrogate_value * x_scale * w_scale + bias_value
+    # Most callers open an int8 output oracle, where +/- rails represent a
+    # one-sided interval rather than a point.  The attention runtime bridge
+    # instead supplies an exact decoded BF16/FP16 value.  Do not coerce that
+    # value to int: doing so truncates the authenticated runtime row before
+    # both its per-cell and aggregate corridor checks.
+    if captured_is_quantized:
+        captured_value = int(captured_value)
+    else:
+        captured_value = float(captured_value)
     rhs = captured_value * y_scale
     # per-cell std of the int8 quantization error, propagated:
     #   dx (<= x_scale/2 band, var (x_scale)^2/12) through W  -> sum W_i^2
@@ -329,17 +339,31 @@ def _corridor_check(
     # output int8 half-step (+ the bias reveal's own half-step when the
     # projection carries a manifest-bound bias) + a small relative bf16
     # accumulation allowance
+    captured_on_rail = captured_is_quantized and captured_value in (-128, 127)
     floor = (
-        0.5 * y_scale
-        if output_quant_floor is None
-        else float(output_quant_floor)
+        0.0
+        if captured_on_rail
+        else (
+            0.5 * y_scale
+            if output_quant_floor is None
+            else float(output_quant_floor)
+        )
     ) + bias_quant
     rel = _REL_COEFF * x_scale * w_scale * math.sqrt(x_sq * w_sq)
     extra = floor + rel
     bound = sigma_cap * sigma + extra
-    delta = abs(lhs - rhs)
+    if captured_is_quantized and captured_value == 127:
+        delta = max(126.5 * y_scale - lhs, 0.0)
+    elif captured_is_quantized and captured_value == -128:
+        delta = max(lhs + 127.5 * y_scale, 0.0)
+    else:
+        delta = abs(lhs - rhs)
     if stats is not None:
-        stats.append((kind, delta, sigma + extra))
+        # Keep the exact relation label for failure diagnostics.  Acceptance
+        # still aggregates by ``kind`` exactly as before; the extra field is
+        # observational only and lets a retained failing bundle identify the
+        # nonce-selected layer/relation that dominated the statistic.
+        stats.append((kind, delta, sigma + extra, what))
     if _CORRIDOR_REPORT is not None:
         _CORRIDOR_REPORT.append((what, kind, delta, sigma, extra))
         return delta / bound if bound > 0 else 0.0
@@ -378,6 +402,55 @@ def _fixed_quantization_corridor_check(
     if delta > bound:
         raise _fail(failure)
     return delta / bound if bound > 0.0 else 0.0
+
+
+def _quantized_sum_corridor_check(
+    *,
+    output_i8: int,
+    output_scale: float,
+    left_i8: int,
+    left_scale: float,
+    right_i8: int,
+    right_scale: float,
+    what: str,
+    kind: str,
+    failure: str,
+) -> float:
+    """Check ``output = left + right`` with correct one-sided rails."""
+
+    def value_interval(value: int, scale: float) -> tuple[float, float]:
+        value = int(value)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise _fail("quantized sum scale is malformed")
+        if value == 127:
+            return 126.5 * scale, math.inf
+        if value == -128:
+            return -math.inf, -127.5 * scale
+        center = value * scale
+        return center - 0.5 * scale, center + 0.5 * scale
+
+    output_interval = value_interval(output_i8, output_scale)
+    left_interval = value_interval(left_i8, left_scale)
+    right_interval = value_interval(right_i8, right_scale)
+    summed_interval = (
+        left_interval[0] + right_interval[0],
+        left_interval[1] + right_interval[1],
+    )
+    delta = max(
+        output_interval[0] - summed_interval[1],
+        summed_interval[0] - output_interval[1],
+        0.0,
+    )
+    center_output = int(output_i8) * output_scale
+    center_sum = int(left_i8) * left_scale + int(right_i8) * right_scale
+    return _fixed_quantization_corridor_check(
+        delta=delta,
+        quant=0.0,
+        relative=_REL_COEFF * max(abs(center_output), abs(center_sum)),
+        what=what,
+        kind=kind,
+        failure=failure,
+    )
 
 
 def _swiglu_output_is_forced_to_quantization_rail_v3(
@@ -463,6 +536,209 @@ def _rmsnorm_denominator_interval(
     )
 
 
+def _rmsnorm_saturation_aware_interval(
+    *,
+    source_row: tuple[int, ...] | list[int],
+    source_scale: float,
+    target_row: tuple[int, ...] | list[int],
+    target_scale: float,
+    norm_row: tuple[int, ...] | list[int],
+    norm_scale: float,
+    norm_gain_offset: float,
+    epsilon: float,
+) -> tuple[
+    tuple[float, float],
+    dict[int, tuple[float, float]],
+    dict[int, tuple[float, float]],
+]:
+    """Bound RMSNorm when a committed int8 source row hits a rail.
+
+    A rail value represents a half-infinite interval, not the ordinary
+    half-step bin used by :func:`_rmsnorm_denominator_interval`.  The proof
+    already authenticates the complete quantized RMSNorm source, output and
+    norm-weight rows.  For each saturated source coordinate, ``output/gain``
+    bounds ``source/rms``.  Substituting those ratios into the RMS equation
+    gives a finite, conservative denominator interval without a fitted
+    tolerance or an additional wire opening.
+
+    A gain interval that crosses zero cannot be inverted.  For that case the
+    exact RMSNorm identity still gives ``abs(source / rms) <= sqrt(width)``;
+    use that model-independent interval directly instead of dividing by a
+    near-zero gain.
+    """
+
+    import numpy as np
+
+    source = np.asarray(source_row, dtype=np.int16)
+    target = np.asarray(target_row, dtype=np.int16)
+    weights = np.asarray(norm_row, dtype=np.int16)
+    if (
+        source.ndim != 1
+        or target.shape != source.shape
+        or weights.shape != source.shape
+        or len(source) == 0
+        or source_scale <= 0.0
+        or target_scale <= 0.0
+        or norm_scale <= 0.0
+        or epsilon <= 0.0
+    ):
+        raise _fail("saturated RMSNorm interval geometry is malformed")
+    saturated = np.flatnonzero((source == -128) | (source == 127))
+    if not len(saturated):
+        return (
+            _rmsnorm_denominator_interval(
+                source_row=source_row,
+                source_scale=source_scale,
+                epsilon=epsilon,
+            ),
+            {},
+            {},
+        )
+
+    source_half = 0.5 * source_scale
+    unsaturated = (source != -128) & (source != 127)
+    magnitudes = np.abs(source[unsaturated].astype(np.float64) * source_scale)
+    square_min_sum = float(
+        np.square(np.maximum(magnitudes - source_half, 0.0)).sum()
+    )
+    square_max_sum = float(np.square(magnitudes + source_half).sum())
+
+    ratio_intervals: dict[int, tuple[float, float]] = {}
+    direct_output_intervals: dict[int, tuple[float, float]] = {}
+    ratio_square_min = 0.0
+    ratio_square_max = 0.0
+    rail_square_min_sum = 0.0
+    for raw_column in saturated:
+        column = int(raw_column)
+        target_value = int(target[column])
+        gain_center = (
+            int(weights[column]) * norm_scale + norm_gain_offset
+        )
+        gain_interval = (
+            gain_center - 0.5 * norm_scale,
+            gain_center + 0.5 * norm_scale,
+        )
+        rail_edge = (
+            126.5 * source_scale
+            if int(source[column]) == 127
+            else -127.5 * source_scale
+        )
+        rail_square_min_sum += rail_edge * rail_edge
+        if gain_interval[0] <= 0.0 <= gain_interval[1]:
+            ratio_cap = math.sqrt(len(source))
+            ratio_low, ratio_high = (
+                (0.0, ratio_cap)
+                if int(source[column]) == 127
+                else (-ratio_cap, 0.0)
+            )
+            output_candidates = tuple(
+                ratio * gain
+                for ratio in (ratio_low, ratio_high)
+                for gain in gain_interval
+            )
+            direct_output_intervals[column] = (
+                min(output_candidates),
+                max(output_candidates),
+            )
+        else:
+            target_center = target_value * target_scale
+            if target_value not in (-128, 127):
+                target_interval = (
+                    target_center - 0.5 * target_scale,
+                    target_center + 0.5 * target_scale,
+                )
+                ratios = tuple(
+                    numerator / denominator
+                    for numerator in target_interval
+                    for denominator in gain_interval
+                )
+                ratio_low, ratio_high = min(ratios), max(ratios)
+            else:
+                # RMSNorm itself gives the model-independent global bound
+                # |source/rms| < sqrt(width).  Combine it with the finite edge
+                # of the target rail; the open side remains conservative.
+                ratio_cap = math.sqrt(len(source))
+                if target_value == 127:
+                    target_edge = 126.5 * target_scale
+                    edge_ratios = tuple(
+                        target_edge / denominator
+                        for denominator in gain_interval
+                    )
+                    if gain_interval[0] > 0.0:
+                        ratio_low, ratio_high = min(edge_ratios), ratio_cap
+                    else:
+                        ratio_low, ratio_high = -ratio_cap, max(edge_ratios)
+                else:
+                    target_edge = -127.5 * target_scale
+                    edge_ratios = tuple(
+                        target_edge / denominator
+                        for denominator in gain_interval
+                    )
+                    if gain_interval[0] > 0.0:
+                        ratio_low, ratio_high = -ratio_cap, max(edge_ratios)
+                    else:
+                        ratio_low, ratio_high = min(edge_ratios), ratio_cap
+        if int(source[column]) == 127:
+            ratio_low = max(ratio_low, 0.0)
+            if ratio_high <= 0.0:
+                raise _fail("saturated RMSNorm source has the wrong sign")
+        else:
+            ratio_high = min(ratio_high, 0.0)
+            if ratio_low >= 0.0:
+                raise _fail("saturated RMSNorm source has the wrong sign")
+        ratio_intervals[column] = (ratio_low, ratio_high)
+        ratio_magnitudes = (abs(ratio_low), abs(ratio_high))
+        ratio_square_min += min(ratio_magnitudes) ** 2
+        ratio_square_max += max(ratio_magnitudes) ** 2
+
+    width = len(source)
+    denominator_upper = (
+        math.inf
+        if ratio_square_max >= width
+        else math.sqrt(
+            (square_max_sum / width + epsilon)
+            / (1.0 - ratio_square_max / width)
+        )
+    )
+    fixed_point_lower = math.sqrt(
+            (square_min_sum / width + epsilon)
+            / (1.0 - ratio_square_min / width)
+        )
+    rail_lower = math.sqrt(
+        (square_min_sum + rail_square_min_sum) / width + epsilon
+    )
+    denominator_interval = (
+        max(fixed_point_lower, rail_lower),
+        denominator_upper,
+    )
+    denominator_low, denominator_high = denominator_interval
+    source_intervals: dict[int, tuple[float, float]] = {}
+    for column, (ratio_low, ratio_high) in ratio_intervals.items():
+        if not math.isfinite(denominator_high):
+            source_intervals[column] = (
+                (126.5 * source_scale, math.inf)
+                if int(source[column]) == 127
+                else (-math.inf, -127.5 * source_scale)
+            )
+            continue
+        candidates = tuple(
+            denominator * ratio
+            for denominator in denominator_interval
+            for ratio in (ratio_low, ratio_high)
+        )
+        source_low, source_high = min(candidates), max(candidates)
+        if int(source[column]) == 127:
+            source_low = max(source_low, 126.5 * source_scale)
+        else:
+            source_high = min(source_high, -127.5 * source_scale)
+        if source_low > source_high:
+            raise _fail(
+                "saturated RMSNorm source is inconsistent with its rail"
+            )
+        source_intervals[column] = (source_low, source_high)
+    return denominator_interval, source_intervals, direct_output_intervals
+
+
 def _rmsnorm_quantization_interval(
     *,
     source_row: tuple[int, ...] | list[int],
@@ -473,6 +749,7 @@ def _rmsnorm_quantization_interval(
     column: int,
     epsilon: float,
     denominator_interval: tuple[float, float] | None = None,
+    selected_source_interval: tuple[float, float] | None = None,
 ) -> tuple[float, float]:
     """Enclose RMSNorm output for every value represented by the inputs.
 
@@ -493,12 +770,21 @@ def _rmsnorm_quantization_interval(
     ):
         raise _fail("RMSNorm quantization interval geometry is malformed")
 
-    source_half = 0.5 * source_scale
-    selected_center = int(source_row[column]) * source_scale
-    selected_interval = (
-        selected_center - source_half,
-        selected_center + source_half,
-    )
+    if selected_source_interval is None:
+        source_half = 0.5 * source_scale
+        selected_center = int(source_row[column]) * source_scale
+        selected_interval = (
+            selected_center - source_half,
+            selected_center + source_half,
+        )
+    else:
+        selected_interval = selected_source_interval
+        if (
+            len(selected_interval) != 2
+            or selected_interval[0] > selected_interval[1]
+            or any(math.isnan(value) for value in selected_interval)
+        ):
+            raise _fail("RMSNorm selected source interval is malformed")
     if denominator_interval is None:
         rms_lower, rms_upper = _rmsnorm_denominator_interval(
             source_row=source_row,
@@ -511,7 +797,7 @@ def _rmsnorm_quantization_interval(
             rms_lower <= 0.0
             or rms_upper < rms_lower
             or not math.isfinite(rms_lower)
-            or not math.isfinite(rms_upper)
+            or math.isnan(rms_upper)
         ):
             raise _fail("RMSNorm denominator interval is malformed")
     gain_center = norm_weight * norm_scale + norm_gain_offset
@@ -547,6 +833,7 @@ def _rmsnorm_corridor_check(
     column: int,
     epsilon: float,
     denominator_interval: tuple[float, float] | None = None,
+    selected_source_interval: tuple[float, float] | None = None,
     what: str,
     kind: str,
     failure: str,
@@ -560,6 +847,7 @@ def _rmsnorm_corridor_check(
         column=column,
         epsilon=epsilon,
         denominator_interval=denominator_interval,
+        selected_source_interval=selected_source_interval,
     )
     delta = max(lower - got, got - upper, 0.0)
     relative = _REL_COEFF * max(abs(lower), abs(upper), abs(got))
@@ -583,6 +871,7 @@ def _rmsnorm_exact_source_corridor_check(
     norm_gain_offset: float,
     column: int,
     epsilon: float,
+    denominator: float | None = None,
     what: str,
     kind: str,
     failure: str,
@@ -610,7 +899,10 @@ def _rmsnorm_exact_source_corridor_check(
         or epsilon <= 0.0
     ):
         raise _fail("exact RMSNorm source geometry is malformed")
-    denominator = math.sqrt(float(np.square(values).mean()) + epsilon)
+    if denominator is None:
+        denominator = math.sqrt(float(np.square(values).mean()) + epsilon)
+    elif not math.isfinite(denominator) or denominator <= 0.0:
+        raise _fail("exact RMSNorm denominator is malformed")
     gain_center = norm_weight * norm_scale + norm_gain_offset
     gain_low = gain_center - 0.5 * norm_scale
     gain_high = gain_center + 0.5 * norm_scale
@@ -3376,6 +3668,7 @@ def verify_economic_recompute_v3(
             row_indices=bottom_rows,
         ),
     )
+    exact_final_source = None
     if anchor_binding is not None:
         anchor_binding.verify_rows(
             oracle_id=residual0_oracle.oracle_id,
@@ -3729,7 +4022,7 @@ def verify_economic_recompute_v3(
         )
     import math
 
-    corridor_stats: list[tuple[str, float, float]] = []
+    corridor_stats: list[tuple[str, float, float, str]] = []
     for coupling in proof.couplings:
         layer = coupling.layer_index
         layer_tokens = projection_tokens_by_layer[layer]
@@ -4486,6 +4779,7 @@ def verify_economic_recompute_v3(
                                 abs(raw_value) * relative_step,
                                 2.0 ** -24,
                             ),
+                            captured_is_quantized=False,
                         )
                 replay_k = runtime_kv_head_quantized_v3(
                     tag="k",
@@ -4620,6 +4914,7 @@ def verify_economic_recompute_v3(
                             abs(raw_value) * relative_step,
                             2.0 ** -24,
                         ),
+                        captured_is_quantized=False,
                     )
 
         # --- (c) residual compositions over ALL hidden columns ---
@@ -4635,53 +4930,91 @@ def verify_economic_recompute_v3(
         d_y_scale = bits_to_scale_v3(oracles["down_y"].scale_bits)
         for token in layer_tokens:
             for col in residual_cols:
-                mid_value = mid_rows[token][col] * mid_scale
+                mid_i8 = mid_rows[token][col]
+                rin_i8 = rin_rows[token][col]
+                attn_o_i8 = attn_o_y_rows[(token, col)]
+                mid_value = mid_i8 * mid_scale
                 composed = (
-                    rin_rows[token][col] * rin_scale
-                    + attn_o_y_rows[(token, col)] * o_y_scale
+                    rin_i8 * rin_scale
+                    + attn_o_i8 * o_y_scale
                 )
                 quant = 0.5 * (mid_scale + rin_scale + o_y_scale)
-                _fixed_quantization_corridor_check(
-                    delta=abs(mid_value - composed),
-                    quant=quant,
-                    relative=_REL_COEFF * max(
-                        abs(mid_value),
-                        abs(composed),
-                    ),
-                    what=f"coupling l{layer} attention residual composition",
-                    kind="attention_residual",
-                    failure=(
-                        f"coupling l{layer} attention residual composition "
-                        "broken: residual_in + o_proj output != "
-                        "mid-residual (fabricated attention trace)"
-                    ),
+                attention_failure = (
+                    f"coupling l{layer} attention residual composition "
+                    "broken: residual_in + o_proj output != "
+                    "mid-residual (fabricated attention trace)"
                 )
+                if any(
+                    value in (-128, 127)
+                    for value in (mid_i8, rin_i8, attn_o_i8)
+                ):
+                    _quantized_sum_corridor_check(
+                        output_i8=mid_i8,
+                        output_scale=mid_scale,
+                        left_i8=rin_i8,
+                        left_scale=rin_scale,
+                        right_i8=attn_o_i8,
+                        right_scale=o_y_scale,
+                        what=f"coupling l{layer} attention residual composition",
+                        kind="attention_residual",
+                        failure=attention_failure,
+                    )
+                else:
+                    _fixed_quantization_corridor_check(
+                        delta=abs(mid_value - composed),
+                        quant=quant,
+                        relative=_REL_COEFF * max(
+                            abs(mid_value),
+                            abs(composed),
+                        ),
+                        what=f"coupling l{layer} attention residual composition",
+                        kind="attention_residual",
+                        failure=attention_failure,
+                    )
                 out_quantized = (
                     rout_rows[(token, col)]
                     if anchor_binding is not None
                     else rout_rows[token][col]
                 )
+                down_i8 = down_y_rows[(token, col)]
                 out_value = out_quantized * rout_scale
                 composed_out = (
-                    mid_rows[token][col] * mid_scale
-                    + down_y_rows[(token, col)] * d_y_scale
+                    mid_i8 * mid_scale
+                    + down_i8 * d_y_scale
                 )
                 quant_out = 0.5 * (rout_scale + mid_scale + d_y_scale)
-                _fixed_quantization_corridor_check(
-                    delta=abs(out_value - composed_out),
-                    quant=quant_out,
-                    relative=_REL_COEFF * max(
-                        abs(out_value),
-                        abs(composed_out),
-                    ),
-                    what=f"coupling l{layer} MLP residual composition",
-                    kind="mlp_residual",
-                    failure=(
-                        f"coupling l{layer} MLP residual composition broken: "
-                        "mid-residual + down output != residual_out "
-                        "(fabricated MLP trace)"
-                    ),
+                mlp_failure = (
+                    f"coupling l{layer} MLP residual composition broken: "
+                    "mid-residual + down output != residual_out "
+                    "(fabricated MLP trace)"
                 )
+                if any(
+                    value in (-128, 127)
+                    for value in (out_quantized, mid_i8, down_i8)
+                ):
+                    _quantized_sum_corridor_check(
+                        output_i8=out_quantized,
+                        output_scale=rout_scale,
+                        left_i8=mid_i8,
+                        left_scale=mid_scale,
+                        right_i8=down_i8,
+                        right_scale=d_y_scale,
+                        what=f"coupling l{layer} MLP residual composition",
+                        kind="mlp_residual",
+                        failure=mlp_failure,
+                    )
+                else:
+                    _fixed_quantization_corridor_check(
+                        delta=abs(out_value - composed_out),
+                        quant=quant_out,
+                        relative=_REL_COEFF * max(
+                            abs(out_value),
+                            abs(composed_out),
+                        ),
+                        what=f"coupling l{layer} MLP residual composition",
+                        kind="mlp_residual",
+                        failure=mlp_failure,
+                    )
 
         # --- (d) both RMSNorm links at sampled columns ---
         input_norm_row = artifacts.verify_weight_row(
@@ -4692,6 +5025,46 @@ def verify_economic_recompute_v3(
         )
         input_norm_scale = artifacts.scale_for(f"l{layer}.input_norm")
         post_norm_scale = artifacts.scale_for(f"l{layer}.post_norm")
+        exact_input_norm_sources = {}
+        if lean and layer != layer_universe[0]:
+            # The compact proof already authenticates the exact previous-layer
+            # residual row.  Use it for the input RMSNorm denominator instead
+            # of deriving that denominator from a possibly clipped int8 rail.
+            from verallm.proof_v3.economic_execution_anchor import (
+                _decode_row_v3,
+            )
+
+            layer_slot = layer_universe.index(layer)
+            previous_layer = layer_universe[layer_slot - 1]
+            input_stage_id = f"l{previous_layer}.residual_out"
+            for token in layer_tokens:
+                position = lean_positions_by_layer[layer][token]
+                try:
+                    input_raw = anchor_rows[input_stage_id][position]
+                except KeyError:
+                    # Some all-attention corridors open only their signed
+                    # endpoints.  They retain the pre-existing conservative
+                    # int8 interval until the exact predecessor is available.
+                    continue
+                input_values = _decode_row_v3(input_raw, anchor_encoding)
+                if len(input_values) != embed_hidden:
+                    raise _fail(
+                        f"coupling l{layer} exact input norm source has the "
+                        "wrong width"
+                    )
+                expected_input = quantize_execution_anchor_row_v3(
+                    row_bytes=input_raw,
+                    scale=rin_scale,
+                    encoding_id=anchor_encoding,
+                )
+                if not _replay_capture_row_matches_v3(
+                    rin_rows[token], expected_input
+                ):
+                    raise _fail(
+                        f"coupling l{layer} exact input norm source is "
+                        "detached from its authenticated residual row"
+                    )
+                exact_input_norm_sources[token] = input_values
         for which, norm_row, norm_scale, source_rows, source_scale,                 target_key, target_scale_name in (
             (
                 "input",
@@ -4721,24 +5094,46 @@ def verify_economic_recompute_v3(
             )
             for token in layer_tokens:
                 source_row = source_rows[token]
-                denominator_interval = _rmsnorm_denominator_interval(
-                    source_row=source_row,
-                    source_scale=source_scale,
-                    epsilon=rmsnorm_epsilon,
+                exact_source = (
+                    exact_input_norm_sources[token]
+                    if which == "input" and token in exact_input_norm_sources
+                    else None
                 )
-                for col in norm_cols:
-                    got = target_rows[token][col] * target_scale
-                    _rmsnorm_corridor_check(
-                        got=got,
-                        target_scale=target_scale,
+                saturated_source_intervals = {}
+                direct_saturated_outputs = {}
+                if exact_source is not None:
+                    denominator_interval = None
+                elif any(value in (-128, 127) for value in source_row):
+                    (
+                        denominator_interval,
+                        saturated_source_intervals,
+                        direct_saturated_outputs,
+                    ) = _rmsnorm_saturation_aware_interval(
                         source_row=source_row,
                         source_scale=source_scale,
+                        target_row=target_rows[token],
+                        target_scale=target_scale,
+                        norm_row=norm_row,
+                        norm_scale=norm_scale,
+                        norm_gain_offset=norm_gain_offset,
+                        epsilon=rmsnorm_epsilon,
+                    )
+                else:
+                    denominator_interval = _rmsnorm_denominator_interval(
+                        source_row=source_row,
+                        source_scale=source_scale,
+                        epsilon=rmsnorm_epsilon,
+                    )
+                for col in norm_cols:
+                    got = target_rows[token][col] * target_scale
+                    check_kwargs = dict(
+                        got=got,
+                        target_scale=target_scale,
                         norm_weight=norm_row[col],
                         norm_scale=norm_scale,
                         norm_gain_offset=norm_gain_offset,
                         column=col,
                         epsilon=rmsnorm_epsilon,
-                        denominator_interval=denominator_interval,
                         what=f"coupling l{layer} {which} RMSNorm link",
                         kind=f"rmsnorm_{which}",
                         failure=(
@@ -4747,6 +5142,42 @@ def verify_economic_recompute_v3(
                             "norm trace)"
                         ),
                     )
+                    if exact_source is not None:
+                        _rmsnorm_exact_source_corridor_check(
+                            source_values=exact_source,
+                            **check_kwargs,
+                        )
+                    elif col in direct_saturated_outputs:
+                        lower, upper = direct_saturated_outputs[col]
+                        _fixed_quantization_corridor_check(
+                            delta=max(lower - got, got - upper, 0.0),
+                            quant=0.5 * target_scale,
+                            relative=_REL_COEFF
+                            * max(abs(lower), abs(upper), abs(got)),
+                            what=check_kwargs["what"],
+                            kind=check_kwargs["kind"],
+                            failure=check_kwargs["failure"],
+                        )
+                    else:
+                        if (
+                            col in saturated_source_intervals
+                            and target_rows[token][col] in (-128, 127)
+                        ):
+                            # This coordinate's one-sided target rail was
+                            # already incorporated into the global RMS
+                            # equation above.  Re-expanding the correlated
+                            # source/rms ratio as independent infinite
+                            # intervals would lose that relation.
+                            continue
+                        _rmsnorm_corridor_check(
+                            source_row=source_row,
+                            source_scale=source_scale,
+                            denominator_interval=denominator_interval,
+                            selected_source_interval=(
+                                saturated_source_intervals.get(col)
+                            ),
+                            **check_kwargs,
+                        )
 
     if (
         tuple(c.layer_index for c in proof.gdn_couplings)
@@ -5281,55 +5712,93 @@ def verify_economic_recompute_v3(
                     )
         for token in layer_tokens:
             for col in residual_cols:
-                mid_value = mid_rows[token][col] * mid_scale
+                mid_i8 = mid_rows[token][col]
+                rin_i8 = rin_rows[token][col]
+                gdn_o_i8 = gdn_o_y_rows[(token, col)]
+                mid_value = mid_i8 * mid_scale
                 composed_mid = (
-                    rin_rows[token][col] * rin_scale
-                    + gdn_o_y_rows[(token, col)] * gdn_o_y_scale
+                    rin_i8 * rin_scale
+                    + gdn_o_i8 * gdn_o_y_scale
                 )
                 quant_mid = 0.5 * (
                     mid_scale + rin_scale + gdn_o_y_scale
                 )
-                _fixed_quantization_corridor_check(
-                    delta=abs(mid_value - composed_mid),
-                    quant=quant_mid,
-                    relative=_REL_COEFF * max(
-                        abs(mid_value),
-                        abs(composed_mid),
-                    ),
-                    what=f"GDN coupling l{layer} input residual composition",
-                    kind="gdn_attention_residual",
-                    failure=(
-                        f"GDN coupling l{layer} residual_in + output "
-                        "projection != mid-residual"
-                    ),
+                gdn_input_failure = (
+                    f"GDN coupling l{layer} residual_in + output "
+                    "projection != mid-residual"
                 )
+                if any(
+                    value in (-128, 127)
+                    for value in (mid_i8, rin_i8, gdn_o_i8)
+                ):
+                    _quantized_sum_corridor_check(
+                        output_i8=mid_i8,
+                        output_scale=mid_scale,
+                        left_i8=rin_i8,
+                        left_scale=rin_scale,
+                        right_i8=gdn_o_i8,
+                        right_scale=gdn_o_y_scale,
+                        what=f"GDN coupling l{layer} input residual composition",
+                        kind="gdn_attention_residual",
+                        failure=gdn_input_failure,
+                    )
+                else:
+                    _fixed_quantization_corridor_check(
+                        delta=abs(mid_value - composed_mid),
+                        quant=quant_mid,
+                        relative=_REL_COEFF * max(
+                            abs(mid_value),
+                            abs(composed_mid),
+                        ),
+                        what=f"GDN coupling l{layer} input residual composition",
+                        kind="gdn_attention_residual",
+                        failure=gdn_input_failure,
+                    )
                 out_quantized = (
                     rout_rows[(token, col)]
                     if anchor_binding is not None
                     else rout_rows[token][col]
                 )
+                down_i8 = down_y_rows[(token, col)]
                 out_value = out_quantized * rout_scale
                 composed_out = (
-                    mid_rows[token][col] * mid_scale
-                    + down_y_rows[(token, col)] * down_y_scale
+                    mid_i8 * mid_scale
+                    + down_i8 * down_y_scale
                 )
                 quant_out = 0.5 * (
                     rout_scale + mid_scale + down_y_scale
                 )
-                _fixed_quantization_corridor_check(
-                    delta=abs(out_value - composed_out),
-                    quant=quant_out,
-                    relative=_REL_COEFF * max(
-                        abs(out_value),
-                        abs(composed_out),
-                    ),
-                    what=f"GDN coupling l{layer} MLP residual composition",
-                    kind="gdn_mlp_residual",
-                    failure=(
-                        f"GDN coupling l{layer} mid-residual + MLP output "
-                        "!= residual_out"
-                    ),
+                gdn_mlp_failure = (
+                    f"GDN coupling l{layer} mid-residual + MLP output "
+                    "!= residual_out"
                 )
+                if any(
+                    value in (-128, 127)
+                    for value in (out_quantized, mid_i8, down_i8)
+                ):
+                    _quantized_sum_corridor_check(
+                        output_i8=out_quantized,
+                        output_scale=rout_scale,
+                        left_i8=mid_i8,
+                        left_scale=mid_scale,
+                        right_i8=down_i8,
+                        right_scale=down_y_scale,
+                        what=f"GDN coupling l{layer} MLP residual composition",
+                        kind="gdn_mlp_residual",
+                        failure=gdn_mlp_failure,
+                    )
+                else:
+                    _fixed_quantization_corridor_check(
+                        delta=abs(out_value - composed_out),
+                        quant=quant_out,
+                        relative=_REL_COEFF * max(
+                            abs(out_value),
+                            abs(composed_out),
+                        ),
+                        what=f"GDN coupling l{layer} MLP residual composition",
+                        kind="gdn_mlp_residual",
+                        failure=gdn_mlp_failure,
+                    )
 
         # Both parallel GDN projections must be the input RMSNorm output;
         # the common MLP projection must be the post-GDN RMSNorm output.
@@ -5466,17 +5935,37 @@ def verify_economic_recompute_v3(
     # diluting the signal.
     if corridor_stats and _CORRIDOR_REPORT is None:
         by_kind: dict[str, list[float]] = {}
-        for kind, delta, spread in corridor_stats:
-            by_kind.setdefault(kind, []).append((delta / spread) ** 2)
-        worst = max(sum(values) / len(values) for values in by_kind.values())
+        by_relation: dict[tuple[str, str], list[float]] = {}
+        for kind, delta, spread, relation in corridor_stats:
+            normalized_sq = (delta / spread) ** 2
+            by_kind.setdefault(kind, []).append(normalized_sq)
+            by_relation.setdefault((kind, relation), []).append(
+                normalized_sq
+            )
+        worst_kind, worst = max(
+            (
+                (kind, sum(values) / len(values))
+                for kind, values in by_kind.items()
+            ),
+            key=lambda item: item[1],
+        )
         chi2_cap = _CORRIDOR_CHI2
         manifest_bits = getattr(artifacts.manifest, "corridor_chi2_bits", 0)
         if manifest_bits:
             chi2_cap = bits_to_scale_v3(manifest_bits)
         if worst > chi2_cap:
+            (_relation_kind, worst_relation), relation_values = max(
+                by_relation.items(),
+                key=lambda item: sum(item[1]) / len(item[1]),
+            )
+            relation_mean = sum(relation_values) / len(relation_values)
             raise _fail(
                 "aggregate corridor statistic is outside the honest "
-                "quantization envelope (distributed weight substitution)"
+                "quantization envelope (distributed weight substitution); "
+                f"worst_kind={worst_kind} mean_sq={worst:.9g} "
+                f"cap={chi2_cap:.9g}; worst_relation={worst_relation} "
+                f"relation_mean_sq={relation_mean:.9g} "
+                f"cells={len(relation_values)}"
             )
 
     _profile_mark("transition-couplings")
@@ -5539,6 +6028,7 @@ def verify_economic_recompute_v3(
         )
     elif lean:
         from verallm.proof_v3.economic_execution_anchor import (
+            _decode_row_v3,
             quantize_execution_anchor_row_v3,
         )
 
@@ -5572,6 +6062,7 @@ def verify_economic_recompute_v3(
             raise _fail(
                 "lean final residual is detached from its pre-nonce checkpoint"
             )
+        exact_final_source = _decode_row_v3(raw_last, anchor_encoding)
     final_norm_gains = artifacts.verify_weight_row(
         name="final_norm", reveal=final.final_norm_row
     )
@@ -5580,7 +6071,11 @@ def verify_economic_recompute_v3(
     final_scale = bits_to_scale_v3(final_oracle.scale_bits)
     import math as _math
 
-    source_real = [value * last_scale for value in last_rows[producing_row]]
+    source_real = (
+        exact_final_source
+        if exact_final_source is not None
+        else [value * last_scale for value in last_rows[producing_row]]
+    )
     mean_square = (
         sum(value * value for value in source_real) / embed_hidden
         + rmsnorm_epsilon
@@ -5588,6 +6083,25 @@ def verify_economic_recompute_v3(
     rms = _math.sqrt(mean_square)
     sum_abs = sum(abs(value) for value in source_real)
     for col in range(embed_hidden):
+        if exact_final_source is not None:
+            _rmsnorm_exact_source_corridor_check(
+                got=final_row[col] * final_scale,
+                target_scale=final_scale,
+                source_values=exact_final_source,
+                norm_weight=final_norm_gains[col],
+                norm_scale=final_norm_scale,
+                norm_gain_offset=norm_gain_offset,
+                column=col,
+                epsilon=rmsnorm_epsilon,
+                denominator=rms,
+                what="final RMSNorm link",
+                kind="final_rmsnorm",
+                failure=(
+                    "final-norm link broken: audited final hidden row is not "
+                    "the RMSNorm of the last residual_out (detached top anchor)"
+                ),
+            )
+            continue
         gain = (
             final_norm_gains[col] * final_norm_scale
             + norm_gain_offset

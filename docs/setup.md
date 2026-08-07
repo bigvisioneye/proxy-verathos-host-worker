@@ -563,6 +563,14 @@ automatically:
   against the current on-chain `ModelSpec` and manifest authority.
 - Cached artifacts remain usable if the artifact host is temporarily
   unavailable.
+- Running proof-v3 miners poll the bounded index automatically. An unchanged
+  model entry does not reload model artifacts. When its descriptor or any
+  referenced artifact changes, the miner downloads and authenticates the
+  complete replacement, preserves any active hard proof or capacity audit, and
+  automatically restarts into the new release at an observed idle window.
+  Continuous ordinary traffic receives a bounded drain opportunity but cannot
+  indefinitely suppress a security release. No additional operator flag is
+  required.
 
 The first URL is the primary store. Additional URLs are read-only mirrors.
 Operators normally use the URLs shipped in the official chain config.

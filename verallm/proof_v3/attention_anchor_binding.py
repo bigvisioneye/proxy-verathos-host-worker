@@ -9,6 +9,7 @@ from functools import lru_cache
 from typing import Mapping
 
 from verallm.proof_v3.attention_runtime_semantics import (
+    ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
     AttentionRuntimeSemanticsV3,
     GEMMA_RMS_NORM_V3,
     NO_QK_NORM_V3,
@@ -673,6 +674,39 @@ def _canonical_rope_coefficients(
     return tuple(cosines), tuple(sines)
 
 
+def _runtime_rope_coefficients(semantics, position: int):
+    """Return the signed runtime coefficient row for one position.
+
+    Version-2 artifacts carry the exact FP16/BF16 table materialized by the
+    qualified runtime. Version 1 remains readable for already signed legacy
+    artifacts, but new qualification never rebuilds GPU coefficients through
+    the verifier host's libm.
+    """
+
+    if semantics.version != ATTENTION_RUNTIME_SEMANTICS_VERSION_V3:
+        return _canonical_rope_coefficients(
+            semantics.rotary_dimension,
+            float(semantics.rope_theta),
+            int(position),
+        )
+    if not 0 <= int(position) < semantics.rope_coefficient_row_count:
+        raise ProofV3VerificationError(
+            "attention position exceeds the signed runtime RoPE table"
+        )
+    width = int(semantics.rotary_dimension)
+    start = int(position) * width * 2
+    raw = semantics.rope_coefficient_bytes[start:start + width * 2]
+    values = decode_runtime_values_v3(
+        raw, semantics.rope_coefficient_encoding_id
+    )
+    if len(values) != width:
+        raise ProofV3VerificationError(
+            "signed runtime RoPE coefficient row is truncated"
+        )
+    half = width // 2
+    return tuple(values[:half]), tuple(values[half:])
+
+
 def _rope(values, *, position: int, semantics, encoding_id: str):
     import numpy as np
 
@@ -682,10 +716,8 @@ def _rope(values, *, position: int, semantics, encoding_id: str):
     # precision.  Replaying an ideal float64 RoPE is measurably different at
     # long positions and does not authenticate the paged-KV values actually
     # consumed by the serving kernel.
-    cos_f32, sin_f32 = _canonical_rope_coefficients(
-        rot,
-        float(semantics.rope_theta),
-        int(position),
+    cos_f32, sin_f32 = _runtime_rope_coefficients(
+        semantics, int(position)
     )
     cos = _round_runtime_precision(
         np.asarray(cos_f32, dtype=np.float32), encoding_id

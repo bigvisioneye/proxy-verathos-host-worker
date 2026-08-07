@@ -1,6 +1,6 @@
 """Signed runtime semantics for anchor-backed full-attention verification.
 
-The projection manifest authenticates the digest of this small artifact.
+The projection manifest authenticates the digest of this artifact.
 Validators load it without model weights and use it to interpret raw QKV
 execution-anchor bytes.  Unknown layouts, normalization rules, RoPE rules or
 cache mappings fail closed rather than falling back to local model code.
@@ -8,6 +8,8 @@ cache mappings fail closed rather than falling back to local model code.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -16,8 +18,12 @@ from dataclasses import dataclass
 
 from verallm.proof_v3.errors import ProofV3Error, ProofV3VerificationError
 
-ATTENTION_RUNTIME_SEMANTICS_VERSION_V3 = 1
+ATTENTION_RUNTIME_SEMANTICS_VERSION_V3 = 2
+ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3 = 1
 ATTENTION_RUNTIME_SEMANTICS_ABI_V3 = (
+    "attention.runtime_semantics.anchor_kv.v2"
+)
+ATTENTION_RUNTIME_SEMANTICS_LEGACY_ABI_V3 = (
     "attention.runtime_semantics.anchor_kv.v1"
 )
 QKV_CONTIGUOUS_LAYOUT_V3 = "qkv.contiguous.v1"
@@ -27,7 +33,8 @@ GEMMA_RMS_NORM_V3 = "gemma_rms.v1"
 NEOX_ROPE_V3 = "neox.v1"
 LOGICAL_PAGED_KV_V3 = "paged_kv.logical.v1"
 
-_DOMAIN = b"VERATHOS/PROOF_V3/ATTENTION_RUNTIME_SEMANTICS/V1"
+_DOMAIN = b"VERATHOS/PROOF_V3/ATTENTION_RUNTIME_SEMANTICS/V2"
+_LEGACY_DOMAIN = b"VERATHOS/PROOF_V3/ATTENTION_RUNTIME_SEMANTICS/V1"
 _LAYOUTS = frozenset(
     {QKV_CONTIGUOUS_LAYOUT_V3, Q_GATE_INTERLEAVED_LAYOUT_V3}
 )
@@ -35,6 +42,8 @@ _NORMS = frozenset({NO_QK_NORM_V3, GEMMA_RMS_NORM_V3})
 
 __all__ = [
     "ATTENTION_RUNTIME_SEMANTICS_ABI_V3",
+    "ATTENTION_RUNTIME_SEMANTICS_LEGACY_ABI_V3",
+    "ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3",
     "ATTENTION_RUNTIME_SEMANTICS_VERSION_V3",
     "AttentionRuntimeSemanticsV3",
     "AttentionNormBindingV3",
@@ -99,11 +108,17 @@ class AttentionRuntimeSemanticsV3:
     norm_encoding_id: str = "bf16.v1"
     norm_bindings: tuple[AttentionNormBindingV3, ...] = ()
     integer_tolerance: int = 0
-    version: int = ATTENTION_RUNTIME_SEMANTICS_VERSION_V3
+    rope_coefficient_row_count: int = 0
+    rope_coefficient_encoding_id: str = ""
+    rope_coefficient_bytes: bytes = b""
+    version: int = ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3
 
     def __post_init__(self) -> None:
         if (
-            self.version != ATTENTION_RUNTIME_SEMANTICS_VERSION_V3
+            self.version not in {
+                ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3,
+                ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
+            }
             or not isinstance(self.adapter_id, str)
             or not self.adapter_id
             or len(self.adapter_id.encode("ascii", "strict")) > 96
@@ -123,6 +138,34 @@ class AttentionRuntimeSemanticsV3:
             or not 0 <= self.integer_tolerance <= 2
         ):
             raise ProofV3Error("attention runtime semantics are malformed")
+        coefficient_size = (
+            int(self.rope_coefficient_row_count)
+            * int(self.rotary_dimension)
+            * 2
+        )
+        if self.version == ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3:
+            if (
+                self.rope_coefficient_row_count != 0
+                or self.rope_coefficient_encoding_id
+                or self.rope_coefficient_bytes
+            ):
+                raise ProofV3Error(
+                    "legacy attention runtime semantics carry RoPE "
+                    "coefficients"
+                )
+        elif (
+            isinstance(self.rope_coefficient_row_count, bool)
+            or not isinstance(self.rope_coefficient_row_count, int)
+            or self.rope_coefficient_row_count < 1
+            or self.rope_coefficient_row_count >= 1 << 32
+            or self.rope_coefficient_encoding_id
+            not in {"fp16.v1", "bf16.v1"}
+            or not isinstance(self.rope_coefficient_bytes, bytes)
+            or len(self.rope_coefficient_bytes) != coefficient_size
+        ):
+            raise ProofV3Error(
+                "attention runtime RoPE coefficient table is malformed"
+            )
         _float_bits(self.rope_theta, "rope_theta", positive=True)
         _float_bits(self.q_norm_epsilon, "q_norm_epsilon", positive=False)
         _float_bits(self.k_norm_epsilon, "k_norm_epsilon", positive=False)
@@ -173,8 +216,15 @@ class AttentionRuntimeSemanticsV3:
         return self.qkv_layout_id == Q_GATE_INTERLEAVED_LAYOUT_V3
 
     def canonical_bytes(self) -> bytes:
+        legacy = (
+            self.version == ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3
+        )
         fields = (
-            ATTENTION_RUNTIME_SEMANTICS_ABI_V3,
+            (
+                ATTENTION_RUNTIME_SEMANTICS_LEGACY_ABI_V3
+                if legacy
+                else ATTENTION_RUNTIME_SEMANTICS_ABI_V3
+            ),
             self.adapter_id,
             self.qkv_layout_id,
             self.q_norm_id,
@@ -202,8 +252,8 @@ class AttentionRuntimeSemanticsV3:
                     binding.k_weight_bytes,
                 )
             )
-        return (
-            _DOMAIN
+        result = (
+            (_LEGACY_DOMAIN if legacy else _DOMAIN)
             + struct.pack(
                 "<IIQQQI",
                 self.version,
@@ -224,6 +274,21 @@ class AttentionRuntimeSemanticsV3:
             + b"".join(encoded)
             + b"".join(norm_payload)
         )
+        if not legacy:
+            coefficient_encoding = self.rope_coefficient_encoding_id.encode(
+                "ascii", "strict"
+            )
+            result += (
+                struct.pack(
+                    "<IH",
+                    self.rope_coefficient_row_count,
+                    len(coefficient_encoding),
+                )
+                + coefficient_encoding
+                + struct.pack("<Q", len(self.rope_coefficient_bytes))
+                + self.rope_coefficient_bytes
+            )
+        return result
 
     def digest(self) -> bytes:
         return hashlib.sha256(self.canonical_bytes()).digest()
@@ -258,6 +323,22 @@ def dump_attention_runtime_semantics_v3(
         "rope_id": semantics.rope_id,
         "rope_theta": semantics.rope_theta,
         "rotary_dimension": semantics.rotary_dimension,
+        **(
+            {
+                "rope_coefficient_row_count": (
+                    semantics.rope_coefficient_row_count
+                ),
+                "rope_coefficient_encoding_id": (
+                    semantics.rope_coefficient_encoding_id
+                ),
+                "rope_coefficient_bytes_b64": base64.b64encode(
+                    semantics.rope_coefficient_bytes
+                ).decode("ascii"),
+            }
+            if semantics.version
+            == ATTENTION_RUNTIME_SEMANTICS_VERSION_V3
+            else {}
+        ),
         "version": semantics.version,
     }
 
@@ -279,6 +360,10 @@ def load_attention_runtime_semantics_v3(
             "attention runtime semantics must be a JSON object"
         )
     try:
+        version = int(obj["version"])
+        coefficient_payload = obj.get("rope_coefficient_bytes_b64", "")
+        if not isinstance(coefficient_payload, str):
+            raise ValueError("RoPE coefficient payload is not text")
         result = AttentionRuntimeSemanticsV3(
             adapter_id=str(obj["adapter_id"]),
             qkv_layout_id=str(obj["qkv_layout_id"]),
@@ -300,9 +385,20 @@ def load_attention_runtime_semantics_v3(
                 for item in obj.get("norm_bindings", ())
             ),
             integer_tolerance=int(obj.get("integer_tolerance", 0)),
-            version=int(obj["version"]),
+            rope_coefficient_row_count=int(
+                obj.get("rope_coefficient_row_count", 0)
+            ),
+            rope_coefficient_encoding_id=str(
+                obj.get("rope_coefficient_encoding_id", "")
+            ),
+            rope_coefficient_bytes=(
+                base64.b64decode(coefficient_payload, validate=True)
+                if coefficient_payload
+                else b""
+            ),
+            version=version,
         )
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, binascii.Error) as exc:
         raise ProofV3Error(
             f"attention runtime semantics are malformed: {exc}"
         ) from exc

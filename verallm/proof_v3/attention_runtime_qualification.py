@@ -8,6 +8,7 @@ while the model is being qualified.
 from __future__ import annotations
 
 from verallm.proof_v3.attention_runtime_semantics import (
+    ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
     AttentionNormBindingV3,
     AttentionRuntimeSemanticsV3,
     GEMMA_RMS_NORM_V3,
@@ -81,11 +82,78 @@ def _norm_bytes(module, *, head_dim: int):
     return raw, encoding, epsilon
 
 
+def _qualified_rope_table(*, layers, selected, rotary_dimension, row_count):
+    """Freeze the exact runtime BF16/FP16 coefficient table.
+
+    vLLM creates this table on the accelerator. Rare float32 sin/cos ULP
+    differences are observable after fixed-point K quantization, so rebuilding
+    it with a validator's libm is not an exact execution binding.
+    """
+
+    import torch
+
+    if (
+        isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or row_count < 1
+    ):
+        raise ProofV3Error(
+            "qualified attention RoPE row count is malformed"
+        )
+    reference = None
+    encoding = None
+    for layer_index in selected:
+        attention = _unwrap_attention(layers[layer_index])
+        rotary = getattr(attention, "rotary_emb", None)
+        table = getattr(rotary, "cos_sin_cache", None)
+        if (
+            not isinstance(table, torch.Tensor)
+            or table.ndim != 2
+            or int(table.shape[0]) < row_count
+            or int(table.shape[1]) != int(rotary_dimension)
+            or table.dtype not in (torch.float16, torch.bfloat16)
+            or not bool(torch.isfinite(table[:row_count]).all())
+        ):
+            raise ProofV3Error(
+                f"qualified attention layer {layer_index} has no exact "
+                "runtime RoPE table"
+            )
+        current_encoding = (
+            "fp16.v1" if table.dtype == torch.float16 else "bf16.v1"
+        )
+        # Qualification may shard layers across devices. Compare the exact
+        # materialized bytes on the host rather than invoking a cross-device
+        # equality kernel.
+        current = table[:row_count].detach().cpu().contiguous()
+        if reference is None:
+            reference = current
+            encoding = current_encoding
+        elif (
+            encoding != current_encoding
+            or not bool(torch.equal(reference, current))
+        ):
+            raise ProofV3Error(
+                "qualified full-attention layers have different runtime "
+                "RoPE tables"
+            )
+    if reference is None or encoding is None:
+        raise ProofV3Error("qualified attention RoPE inventory is empty")
+    raw = bytes(
+        reference.view(torch.uint8).numpy().tobytes()
+    )
+    if len(raw) != row_count * int(rotary_dimension) * 2:
+        raise ProofV3Error(
+            "qualified attention RoPE table has a wrong byte length"
+        )
+    return raw, encoding
+
+
 def qualify_attention_runtime_semantics_v3(
     *,
     config,
     layers,
     full_attention_layers,
+    rope_position_count: int,
     adapter_id: str = "qwen.paged_attention.v1",
     integer_tolerance: int = 0,
 ) -> AttentionRuntimeSemanticsV3:
@@ -101,6 +169,12 @@ def qualify_attention_runtime_semantics_v3(
         raise ProofV3Error(
             "qualified full-attention layer inventory is malformed"
         )
+    rope_bytes, rope_encoding = _qualified_rope_table(
+        layers=layers,
+        selected=selected,
+        rotary_dimension=semantics.rot_dim,
+        row_count=rope_position_count,
+    )
     if not semantics.gated:
         return AttentionRuntimeSemanticsV3(
             adapter_id=adapter_id,
@@ -113,8 +187,12 @@ def qualify_attention_runtime_semantics_v3(
             rope_theta=semantics.theta,
             rotary_dimension=semantics.rot_dim,
             cache_layout_id=LOGICAL_PAGED_KV_V3,
-            norm_encoding_id="bf16.v1",
+            norm_encoding_id=rope_encoding,
             integer_tolerance=integer_tolerance,
+            rope_coefficient_row_count=rope_position_count,
+            rope_coefficient_encoding_id=rope_encoding,
+            rope_coefficient_bytes=rope_bytes,
+            version=ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
         )
 
     bindings = []
@@ -173,4 +251,8 @@ def qualify_attention_runtime_semantics_v3(
         norm_encoding_id=str(encoding),
         norm_bindings=tuple(bindings),
         integer_tolerance=integer_tolerance,
+        rope_coefficient_row_count=rope_position_count,
+        rope_coefficient_encoding_id=rope_encoding,
+        rope_coefficient_bytes=rope_bytes,
+        version=ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
     )

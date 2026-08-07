@@ -18,6 +18,7 @@ from dataclasses import replace
 from typing import Sequence
 
 from verallm.proof_v3.attention_runtime_semantics import (
+    ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
     AttentionRuntimeSemanticsV3,
     Q_GATE_INTERLEAVED_LAYOUT_V3,
 )
@@ -497,6 +498,15 @@ def _attention_geometry(
     if semantics.rotary_dimension > head_dim:
         raise ProofV3Error(
             "attention runtime semantics exceed the calibrated head dimension"
+        )
+    if (
+        semantics.version == ATTENTION_RUNTIME_SEMANTICS_VERSION_V3
+        and semantics.rope_coefficient_row_count
+        < max(int(band.hi) for band in calibration_set.bands)
+    ):
+        raise ProofV3Error(
+            "attention runtime coefficient table does not cover the "
+            "calibrated context"
         )
     multiplier = 2 if semantics.qkv_layout_id == Q_GATE_INTERLEAVED_LAYOUT_V3 else 1
     kv_count: int | None = None

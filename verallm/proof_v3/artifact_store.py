@@ -247,6 +247,19 @@ class ProofV3ArtifactIndexEntry:
             "model_id": self.model_id,
         }
 
+    def release_sha256(self) -> bytes:
+        """Return the complete model-entry identity used for hot refresh."""
+
+        encoded = json.dumps(
+            self.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return hashlib.sha256(
+            b"verathos.proof_v3.release-index-entry.v1\0" + encoded
+        ).digest()
+
     @classmethod
     def from_dict(cls, value: object) -> "ProofV3ArtifactIndexEntry":
         if not isinstance(value, dict) or set(value) != {
@@ -472,6 +485,7 @@ class ResolvedProofV3Release:
     model_id: str
     descriptor_path: Path
     release: QualifiedEconomicProofV3Release
+    release_sha256: bytes
     index_source_url: str
 
 
@@ -494,6 +508,21 @@ class RemoteProofV3ReleaseResolution:
             "failures",
             MappingProxyType(dict(self.failures)),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ProofV3ReleaseIndexProbe:
+    """Authenticated-context discovery metadata for one published release.
+
+    The index is not a trust anchor.  Callers may use this lightweight probe
+    only to detect a possible descriptor change; they must still resolve and
+    authenticate the complete release before adopting it.
+    """
+
+    model_id: str
+    release_sha256: bytes
+    descriptor_sha256: bytes
+    index_source_url: str
 
 
 def normalize_proof_v3_artifact_base_urls(
@@ -829,6 +858,7 @@ def resolve_remote_proof_v3_releases(
                 model_id=model_id,
                 descriptor_path=descriptor_path,
                 release=release,
+                release_sha256=entry.release_sha256(),
                 index_source_url=source_url,
             )
         except Exception as exc:
@@ -839,6 +869,47 @@ def resolve_remote_proof_v3_releases(
         failures=failures,
         index_source_url=source_url,
         canary_policy_path=canary_policy_path,
+    )
+
+
+def probe_remote_proof_v3_release(
+    model_id: str,
+    base_urls: Iterable[str],
+    *,
+    chain_config,
+    cache_directory: str | Path | None = None,
+    timeout_seconds: float = DEFAULT_PROOF_V3_ARTIFACT_TIMEOUT_SECONDS,
+) -> ProofV3ReleaseIndexProbe:
+    """Fetch only the bounded index entry for one model.
+
+    This avoids repeatedly loading large model catalogs on a running miner.
+    A changed probe is deliberately insufficient for adoption; the caller
+    must follow it with :func:`resolve_remote_proof_v3_release`.
+    """
+
+    selected_model = _model_id(model_id)
+    sources = normalize_proof_v3_artifact_base_urls(base_urls)
+    cache = proof_v3_artifact_cache_directory(
+        cache_directory,
+        chain_id=chain_config.chain_id,
+        netuid=chain_config.netuid,
+    )
+    index, source_url = _load_remote_index(
+        sources,
+        cache_directory=cache,
+        chain_config=chain_config,
+        timeout_seconds=timeout_seconds,
+    )
+    entry = index.by_model.get(selected_model)
+    if entry is None:
+        raise ProofV3ArtifactStoreError(
+            f"no remote proof-v3 release is published for model: {selected_model}"
+        )
+    return ProofV3ReleaseIndexProbe(
+        model_id=selected_model,
+        release_sha256=entry.release_sha256(),
+        descriptor_sha256=entry.descriptor_sha256,
+        index_source_url=source_url,
     )
 
 
@@ -896,6 +967,7 @@ __all__ = [
     "PROOF_V3_ARTIFACT_INDEX_SCHEMA_V1",
     "ProofV3ArtifactIndex",
     "ProofV3ArtifactIndexEntry",
+    "ProofV3ReleaseIndexProbe",
     "ProofV3ArtifactObject",
     "ProofV3ArtifactStoreError",
     "RemoteProofV3ReleaseResolution",
@@ -904,6 +976,7 @@ __all__ = [
     "configured_proof_v3_artifact_base_urls",
     "normalize_proof_v3_artifact_base_urls",
     "proof_v3_artifact_cache_directory",
+    "probe_remote_proof_v3_release",
     "resolve_remote_proof_v3_release",
     "resolve_remote_proof_v3_releases",
 ]

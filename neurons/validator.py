@@ -151,6 +151,7 @@ from verallm.registry import get_model, MODELS_BY_ID
 
 logger = logging.getLogger(__name__)
 _PROOF_V2_ARTIFACT_REFRESH_SECONDS = 3600.0
+_PROOF_V3_ARTIFACT_REFRESH_SECONDS = 3600.0
 
 
 class _ProofV3ValidatorConfigurationError(RuntimeError):
@@ -933,6 +934,8 @@ class ValidatorNeuron:
         # contain validator artifacts and signed profiles, never model weights.
         self._proof_v3_releases: Dict[str, object] = {}
         self._proof_v3_canary_policy = None
+        self._proof_v3_local_release_model_ids: Set[str] = set()
+        self._proof_v3_remote_refresh_after: float = 0.0
         # Remote miner_version tracking — opens a forgiveness window after a
         # release lands in the public repo, so miners restarting to pull the
         # new code don't get probation for "canary errors" that are really
@@ -1414,6 +1417,7 @@ class ValidatorNeuron:
                     f"Proof-v3 release authentication failed: {exc}"
                 )
                 raise
+        self._proof_v3_local_release_model_ids = set(releases)
         if remote_base_urls:
             from verallm.proof_v3.artifact_store import (
                 resolve_remote_proof_v3_releases,
@@ -1501,6 +1505,135 @@ class ValidatorNeuron:
             "Authenticated proof-v3 canary policy "
             f"{self._proof_v3_canary_policy.policy_abi_id}"
         )
+        if remote_base_urls:
+            self._proof_v3_remote_refresh_after = (
+                time.monotonic() + _PROOF_V3_ARTIFACT_REFRESH_SECONDS
+            )
+
+    def _refresh_remote_proof_v3_releases(
+        self,
+        model_ids: Set[str] | None = None,
+    ) -> None:
+        """Atomically adopt authenticated replacement v3 releases.
+
+        The content-addressed objects are immutable, but the signed remote
+        index may replace the release selected for an existing model.  Refresh
+        the complete requested inventory and its signed canary policy as one
+        unit; a partial download or stale policy leaves the last authenticated
+        snapshot active.
+        """
+
+        remote_base_urls = tuple(
+            getattr(self.config, "proof_v3_artifact_base_urls", ()) or ()
+        )
+        if not remote_base_urls:
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_proof_v3_remote_refresh_after", 0.0):
+            return
+        self._proof_v3_remote_refresh_after = (
+            now + _PROOF_V3_ARTIFACT_REFRESH_SECONDS
+        )
+        requested = (
+            set(model_ids)
+            if model_ids is not None
+            else set(self._model_client.get_model_list())
+        )
+        # The signed policy binds the complete qualified release inventory.
+        # Refresh every already-admitted remote release as well as the models
+        # active this epoch, otherwise an inactive model replacement could
+        # leave the newly downloaded policy intentionally stale.
+        requested.update(getattr(self, "_proof_v3_releases", {}))
+        if not requested:
+            return
+
+        from verallm.proof_v3.artifact_store import (
+            resolve_remote_proof_v3_releases,
+        )
+
+        try:
+            remote = resolve_remote_proof_v3_releases(
+                remote_base_urls,
+                chain_config=self.config,
+                model_registry_client=self._model_client,
+                cache_directory=getattr(
+                    self.config,
+                    "proof_v3_artifact_cache_dir",
+                    None,
+                ),
+                model_ids=requested,
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                "Proof-v3 artifact refresh failed; retaining authenticated "
+                f"snapshot: {exc}"
+            )
+            return
+
+        updated = dict(getattr(self, "_proof_v3_releases", {}))
+        local_overrides = set(
+            getattr(self, "_proof_v3_local_release_model_ids", set())
+        )
+        changed = 0
+        for model_id, item in remote.releases.items():
+            if model_id in local_overrides:
+                continue
+            previous = updated.get(model_id)
+            replacement = item.release
+            if (
+                previous is None
+                or previous.qualified_profile.profile.digest()
+                != replacement.qualified_profile.profile.digest()
+            ):
+                changed += 1
+            updated[model_id] = replacement
+
+        policy_path = str(
+            getattr(self.config, "proof_v3_canary_policy_path", "") or ""
+        ).strip()
+        if not policy_path:
+            policy_path = str(
+                getattr(remote, "canary_policy_path", "") or ""
+            ).strip()
+        try:
+            if not policy_path:
+                raise RuntimeError(
+                    "refreshed proof-v3 index has no signed canary policy"
+                )
+            from verallm.proof_v3.canary_policy import (
+                load_signed_canary_policy_document_v3,
+                qualify_canary_policy_v3,
+            )
+
+            authority = self._model_client.get_manifest_authority()
+            document = load_signed_canary_policy_document_v3(policy_path)
+            policy = qualify_canary_policy_v3(
+                document,
+                qualified_releases=updated,
+                expected_authority_signers=tuple(authority.signers),
+                authority_threshold=int(authority.threshold),
+            )
+        except Exception as exc:
+            bt.logging.warning(
+                "Proof-v3 policy refresh failed; retaining authenticated "
+                f"snapshot: {exc}"
+            )
+            return
+
+        # Epoch setup calls this before dispatching the new plan. Replacing
+        # both references here ensures that no newly scheduled canary can mix
+        # an old policy with a new release (or the inverse).
+        self._proof_v3_releases = updated
+        self._proof_v3_canary_policy = policy
+        if changed:
+            bt.logging.info(
+                f"Refreshed {changed} proof-v3 release(s) and signed policy "
+                f"from {remote.index_source_url}"
+            )
+        for model_id, failure in remote.failures.items():
+            bt.logging.warning(
+                f"Proof-v3 artifact refresh failed for {model_id}: {failure}"
+            )
 
     def _refresh_remote_proof_v2_manifests(
         self,
@@ -6686,6 +6819,7 @@ class ValidatorNeuron:
                     bt.logging.warning(f"Failed to fetch ModelSpec for {model_id}: {e} — no cache available")
 
         self._refresh_remote_proof_v2_manifests(unique_models)
+        self._refresh_remote_proof_v3_releases(unique_models)
 
         # Reset per-epoch attempt state. Exact obligations are registered after
         # the scheduler has produced the signed-policy plan.

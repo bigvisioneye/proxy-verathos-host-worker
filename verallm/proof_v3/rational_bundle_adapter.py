@@ -588,6 +588,12 @@ def apply_capture_kv_sections_v3(
                     claimed = int(by_leaf[native_leaf])
                     if claimed > half_p:
                         claimed -= GOLDILOCKS_MODULUS
+                    kv_head, remainder = divmod(
+                        int(native_leaf), int(sp) * int(dim)
+                    )
+                    position, coordinate = divmod(
+                        remainder, int(dim)
+                    )
                     expected = int(
                         anchor_kv_value(
                             int(plan.layer),
@@ -600,7 +606,11 @@ def apply_capture_kv_sections_v3(
                     if abs(claimed - expected) > tolerance:
                         raise ProofV3VerificationError(
                             "attention K/V PCS value is detached from the "
-                            "pre-nonce raw QKV execution anchor"
+                            "pre-nonce raw QKV execution anchor "
+                            f"(layer={int(plan.layer)}, tag={tag}, "
+                            f"head={kv_head}, position={position}, "
+                            f"coordinate={coordinate}, "
+                            f"delta={claimed - expected})"
                         )
         if external:
             for tag, statement_entry in stmts.items():

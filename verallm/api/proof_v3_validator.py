@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
+import os
+from pathlib import Path
+import threading
 import time
 from dataclasses import dataclass
 from typing import (
@@ -47,6 +51,81 @@ from verallm.proof_v3.session import (
 )
 
 MAX_PROOF_V3_SSE_EVENT_BYTES = 1 << 20
+
+_FAILED_HARD_BUNDLE_COUNT = 8
+_FAILED_HARD_BUNDLE_BYTES = 512 << 20
+_FAILED_HARD_BUNDLE_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
+
+
+def _retain_failed_hard_bundle(encoded_bundle: bytes) -> Path:
+    """Keep a bounded private replay artifact after verifier rejection.
+
+    Failed hard proofs are otherwise absent from the receipt-matched miner
+    bundle index, which makes an intermittent verifier rejection impossible to
+    reproduce.  Owner hard audits are canaries, so this stores only bounded
+    canary token ids/output plus the already-received public proof.  It has no
+    effect on admission, verification, receipts, or the wire protocol.
+    """
+
+    from verallm.proof_v3.hard_bundle import MAX_HARD_BUNDLE_BYTES_V3
+
+    if (
+        not isinstance(encoded_bundle, bytes)
+        or not encoded_bundle
+        or len(encoded_bundle) > MAX_HARD_BUNDLE_BYTES_V3
+    ):
+        raise ProofV3VerificationError(
+            "failed proof-v3 replay bundle is out of range"
+        )
+    base = Path(
+        os.environ.get("VERALLM_DATA_DIR", str(Path.home() / ".verathos"))
+    ).expanduser()
+    directory = base / "proof_v3_failed_bundles"
+    with _FAILED_HARD_BUNDLE_LOCK:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        # The retained-bundle digest is its final 32 bytes.  Include a
+        # nanosecond timestamp so two independently malformed payloads for the
+        # same envelope cannot overwrite one another.
+        digest = encoded_bundle[-32:].hex()
+        path = directory / f"{time.time_ns()}-{digest}.bundle"
+        temporary = directory / (
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded_bundle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        except Exception:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+        entries = sorted(
+            directory.glob("*.bundle"),
+            key=lambda item: item.stat().st_mtime_ns,
+            reverse=True,
+        )
+        retained_bytes = 0
+        for index, entry in enumerate(entries):
+            size = entry.stat().st_size
+            retained_bytes += size
+            if (
+                index >= _FAILED_HARD_BUNDLE_COUNT
+                or retained_bytes > _FAILED_HARD_BUNDLE_BYTES
+            ):
+                entry.unlink(missing_ok=True)
+        return path
 
 
 class ProofV3PeerFailure(ProofV3VerificationError):
@@ -116,6 +195,7 @@ class ProofV3ValidatorExchange:
         self._observed_output: ObservedExecutionOutputV3 | None = None
         self._decision: PostCommitAuditDecisionV3 | None = None
         self._reveal_ns: int | None = None
+        self._nonce_reveal_bytes: bytes | None = None
         self._verification_result: object | None = None
         self._verification_ns: int | None = None
         self._proof_received_ns: int | None = None
@@ -444,7 +524,37 @@ class ProofV3ValidatorExchange:
             self.fail_closed()
             raise
         self._reveal_ns = revealed_monotonic_ns
-        return reveal.canonical_bytes()
+        encoded = reveal.canonical_bytes()
+        self._nonce_reveal_bytes = encoded
+        return encoded
+
+    def _failed_hard_bundle_bytes(self, *, encoded_proof: bytes) -> bytes:
+        """Build a replayable bundle from validator-owned exchange state."""
+
+        from verallm.proof_v3.hard_bundle import RetainedHardProofBundleV3
+        from verallm.proof_v3.session import NonceRevealV3
+
+        if (
+            self._precommit_bytes is None
+            or self._observed_output is None
+            or self._nonce_reveal_bytes is None
+        ):
+            raise ProofV3VerificationError(
+                "failed proof-v3 exchange lacks replay context"
+            )
+        bundle = RetainedHardProofBundleV3(
+            precommit_context=self.session.precommit_context,
+            prompt_token_ids=tuple(
+                self.validator_request_context.prompt_token_ids
+            ),
+            observed_output=self._observed_output,
+            envelope=commitment_envelope_from_bytes(self._precommit_bytes),
+            nonce_reveal=NonceRevealV3.from_canonical_bytes(
+                self._nonce_reveal_bytes
+            ),
+            encoded_proof=encoded_proof,
+        )
+        return bundle.canonical_bytes()
 
     def verify_hard_proof(
         self,
@@ -466,6 +576,24 @@ class ProofV3ValidatorExchange:
                 observed_output=self._observed_output,
             )
         except Exception:
+            try:
+                retained = _retain_failed_hard_bundle(
+                    self._failed_hard_bundle_bytes(
+                        encoded_proof=encoded_proof,
+                    )
+                )
+                logger.warning(
+                    "Retained failed proof-v3 hard bundle for deterministic "
+                    "replay: %s",
+                    retained,
+                )
+            except Exception as retention_error:
+                # Retention is diagnostic only.  Never replace, suppress, or
+                # alter the actual fail-closed verifier result.
+                logger.warning(
+                    "Failed proof-v3 hard bundle could not be retained: %s",
+                    retention_error,
+                )
             self.fail_closed()
             raise
         self._verification_ns = time.monotonic_ns() - started

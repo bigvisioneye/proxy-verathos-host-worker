@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 # Repo root = directory containing this file's parent (neurons/ -> repo root)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_FIRST_PARTY_SOURCE_ROOTS = ("neurons", "verallm", "zkllm", "trainllm")
 
 
 def _run_git(*args: str, cwd: Optional[Path] = None) -> tuple[int, str]:
@@ -310,6 +311,37 @@ def get_current_branch() -> Optional[str]:
     return out if rc == 0 else None
 
 
+def _clear_first_party_bytecode_caches() -> bool:
+    """Remove stale timestamp-based bytecode after a source fast-forward.
+
+    Git can replace a same-sized Python file within the same timestamp second.
+    CPython's default bytecode header then cannot distinguish the new source
+    from the old one.  Clear only first-party ``__pycache__`` entries before
+    restart; environments and third-party packages are deliberately excluded.
+    """
+
+    try:
+        for root_name in _FIRST_PARTY_SOURCE_ROOTS:
+            source_root = _REPO_ROOT / root_name
+            if not source_root.is_dir():
+                continue
+            for cache_dir in source_root.rglob("__pycache__"):
+                if not cache_dir.is_dir():
+                    continue
+                for bytecode in cache_dir.glob("*.pyc"):
+                    bytecode.unlink()
+                try:
+                    cache_dir.rmdir()
+                except OSError:
+                    # Leave directories containing non-bytecode files alone.
+                    pass
+    except OSError as exc:
+        bt.logging.error(f"Cannot clear first-party bytecode cache: {exc}")
+        return False
+    importlib.invalidate_caches()
+    return True
+
+
 def fetch_origin() -> bool:
     """Fetch from origin. Returns True on success."""
     rc, out = _run_git("fetch", "origin", "--quiet")
@@ -487,6 +519,9 @@ def pull_and_install(
             bt.logging.error(f"git reset also failed: {out2}")
             return False
         bt.logging.info(f"Reset to origin/{branch} successful")
+
+    if not _clear_first_party_bytecode_caches():
+        return False
 
     new_head = get_local_head()
     _head = new_head[:8] if new_head else "unknown"
