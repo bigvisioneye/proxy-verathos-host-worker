@@ -2039,7 +2039,10 @@ class ValidatorClient:
         from verallm.proof_v3.sampler import (
             economic_sampler_config_digest_v3,
         )
-        from verallm.proof_v3.session import QualifiedExecutionProfileV3
+        from verallm.proof_v3.session import (
+            QualifiedExecutionProfileV3,
+            hard_proof_arrival_budget_for_decode_v3,
+        )
 
         if not isinstance(qualified_profile, QualifiedExecutionProfileV3):
             raise TypeError("qualified_profile has an unexpected type")
@@ -2115,6 +2118,9 @@ class ValidatorClient:
             prompt_token_ids=prompt_token_ids,
             sampler_config_digest=sampler_digest,
             runtime_policy=runtime_policy,
+            hard_proof_arrival_budget_ns=(
+                hard_proof_arrival_budget_for_decode_v3(max_new_tokens)
+            ),
             nonce_reveal_hold_budget_ns=nonce_reveal_hold_budget_ns,
             expected_hard_audit=expected_hard_audit,
         )

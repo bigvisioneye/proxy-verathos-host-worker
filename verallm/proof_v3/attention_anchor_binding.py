@@ -9,7 +9,8 @@ from functools import lru_cache
 from typing import Mapping
 
 from verallm.proof_v3.attention_runtime_semantics import (
-    ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
+    ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3,
+    ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3,
     AttentionRuntimeSemanticsV3,
     GEMMA_RMS_NORM_V3,
     NO_QK_NORM_V3,
@@ -42,7 +43,10 @@ __all__ = [
     "runtime_attention_q_head_quantized_v3",
     "runtime_attention_q13_pool_v3",
     "runtime_attention_quantized_row_v3",
+    "runtime_kv_head_quantization_bounds_v3",
     "runtime_kv_head_quantized_v3",
+    "runtime_kv_head_value_bounds_v3",
+    "runtime_kv_head_values_v3",
 ]
 
 
@@ -683,7 +687,7 @@ def _runtime_rope_coefficients(semantics, position: int):
     the verifier host's libm.
     """
 
-    if semantics.version != ATTENTION_RUNTIME_SEMANTICS_VERSION_V3:
+    if semantics.version == ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3:
         return _canonical_rope_coefficients(
             semantics.rotary_dimension,
             float(semantics.rope_theta),
@@ -705,6 +709,24 @@ def _runtime_rope_coefficients(semantics, position: int):
         )
     half = width // 2
     return tuple(values[:half]), tuple(values[half:])
+
+
+def _round_post_norm_runtime_precision_v3(
+    values,
+    *,
+    semantics: AttentionRuntimeSemanticsV3,
+    encoding_id: str,
+):
+    """Apply the runtime norm-output boundary for signed v3 semantics.
+
+    Versions 1 and 2 intentionally retain their already-signed arithmetic.
+    Changing that arithmetic would invalidate their Q transcript and make an
+    artifact parser update retroactively reinterpret existing proofs.
+    """
+
+    if semantics.version == ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3:
+        return _round_runtime_precision(values, encoding_id)
+    return values
 
 
 def _rope(values, *, position: int, semantics, encoding_id: str):
@@ -738,9 +760,81 @@ def _rope(values, *, position: int, semantics, encoding_id: str):
     )
 
 
+def _rope_input_ulp_bounds_v3(
+    values,
+    *,
+    position: int,
+    semantics: AttentionRuntimeSemanticsV3,
+    encoding_id: str,
+    ulps: int,
+):
+    """Propagate a norm-output ULP interval through signed RoPE.
+
+    The qualified runtime variation occurs at the GPU RMSNorm output, before
+    RoPE.  A one-ULP difference there can span many ULPs after a near-zero
+    RoPE cancellation, so applying the allowance to the final K value is not
+    the same relation.  RoPE is linear for fixed signed coefficients; interval
+    propagation therefore gives the exact extrema without widening the
+    attention corridor or depending on a validator backend.
+    """
+
+    import numpy as np
+
+    lower, upper = _runtime_precision_neighbor_bounds_v3(
+        values,
+        encoding_id=encoding_id,
+        ulps=ulps,
+    )
+    rot = int(semantics.rotary_dimension)
+    cos_f32, sin_f32 = _runtime_rope_coefficients(
+        semantics, int(position)
+    )
+    cos = _round_runtime_precision(
+        np.asarray(cos_f32, dtype=np.float32), encoding_id
+    )
+    sin = _round_runtime_precision(
+        np.asarray(sin_f32, dtype=np.float32), encoding_id
+    )
+    half = rot // 2
+
+    def _mul_interval(lo, hi, coefficient):
+        first = lo * coefficient
+        second = hi * coefficient
+        return np.minimum(first, second), np.maximum(first, second)
+
+    first_cos_lo, first_cos_hi = _mul_interval(
+        lower[:half], upper[:half], cos
+    )
+    second_sin_lo, second_sin_hi = _mul_interval(
+        lower[half:rot], upper[half:rot], sin
+    )
+    first_lo = first_cos_lo - second_sin_hi
+    first_hi = first_cos_hi - second_sin_lo
+
+    second_cos_lo, second_cos_hi = _mul_interval(
+        lower[half:rot], upper[half:rot], cos
+    )
+    first_sin_lo, first_sin_hi = _mul_interval(
+        lower[:half], upper[:half], sin
+    )
+    second_lo = second_cos_lo + first_sin_lo
+    second_hi = second_cos_hi + first_sin_hi
+
+    rope_lower = np.concatenate((first_lo, second_lo, lower[rot:]))
+    rope_upper = np.concatenate((first_hi, second_hi, upper[rot:]))
+    rope_lower = _round_runtime_precision(rope_lower, encoding_id)
+    rope_upper = _round_runtime_precision(rope_upper, encoding_id)
+    if bool(np.any(rope_lower > rope_upper)):
+        raise ProofV3VerificationError(
+            "attention RoPE runtime interval is malformed"
+        )
+    return rope_lower, rope_upper
+
+
 def _round_clip(values, scale, low: int, high: int):
     import numpy as np
 
+    values = np.asarray(values, dtype=np.float64)
     return tuple(
         int(value)
         for value in np.clip(
@@ -922,11 +1016,15 @@ def runtime_attention_quantized_row_v3(
             base = head * geometry.head_dim
             q_raw = row[base:base + geometry.head_dim]
         q_post = _rope(
-            _normalize(
-                q_raw,
-                norm_id=semantics.q_norm_id,
-                weights=q_weights,
-                epsilon=semantics.q_norm_epsilon,
+            _round_post_norm_runtime_precision_v3(
+                _normalize(
+                    q_raw,
+                    norm_id=semantics.q_norm_id,
+                    weights=q_weights,
+                    epsilon=semantics.q_norm_epsilon,
+                ),
+                semantics=semantics,
+                encoding_id=encoding_id,
             ),
             position=position,
             semantics=semantics,
@@ -956,11 +1054,15 @@ def runtime_attention_quantized_row_v3(
         start = geometry.k_block_offset + kv_head * geometry.head_dim
         k_raw = row[start:start + geometry.head_dim]
         k_post = _rope(
-            _normalize(
-                k_raw,
-                norm_id=semantics.k_norm_id,
-                weights=k_weights,
-                epsilon=semantics.k_norm_epsilon,
+            _round_post_norm_runtime_precision_v3(
+                _normalize(
+                    k_raw,
+                    norm_id=semantics.k_norm_id,
+                    weights=k_weights,
+                    epsilon=semantics.k_norm_epsilon,
+                ),
+                semantics=semantics,
+                encoding_id=encoding_id,
             ),
             position=position,
             semantics=semantics,
@@ -1037,16 +1139,20 @@ def runtime_attention_q_head_quantized_v3(
             for value in (1.0 / (1.0 + np.exp(-gate_raw))).tolist()
         )
     q_post = _rope(
-        _normalize(
-            q_raw,
-            norm_id=semantics.q_norm_id,
-            weights=_norm_weights(
-                semantics,
-                int(layer),
-                "q",
-                geometry.head_dim,
+        _round_post_norm_runtime_precision_v3(
+            _normalize(
+                q_raw,
+                norm_id=semantics.q_norm_id,
+                weights=_norm_weights(
+                    semantics,
+                    int(layer),
+                    "q",
+                    geometry.head_dim,
+                ),
+                epsilon=semantics.q_norm_epsilon,
             ),
-            epsilon=semantics.q_norm_epsilon,
+            semantics=semantics,
+            encoding_id=encoding_id,
         ),
         position=int(position),
         semantics=semantics,
@@ -1164,30 +1270,108 @@ def runtime_kv_head_quantized_v3(
     params_by_head,
     encoding_id: str,
 ) -> tuple[int, ...]:
-    values = decode_runtime_values_v3(raw_head_bytes, encoding_id)
-    if len(values) != geometry.head_dim:
-        raise ProofV3VerificationError(
-            "attention anchor KV head has the wrong width"
+    values, scale, low, high = _runtime_kv_head_values_v3(
+        tag=tag,
+        raw_head_bytes=raw_head_bytes,
+        layer=layer,
+        position=position,
+        kv_head=kv_head,
+        geometry=geometry,
+        semantics=semantics,
+        params_by_head=params_by_head,
+        encoding_id=encoding_id,
+    )
+    return _round_clip(values, scale, low, high)
+
+
+def runtime_kv_head_quantization_bounds_v3(
+    *,
+    tag: str,
+    raw_head_bytes: bytes,
+    layer: int,
+    position: int,
+    kv_head: int,
+    geometry: AttentionAnchorGeometryV3,
+    semantics: AttentionRuntimeSemanticsV3,
+    params_by_head,
+    encoding_id: str,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return signed per-cell bounds for qualified runtime arithmetic.
+
+    The center reconstruction uses the canonical signed adapter.  Version-3
+    semantics may additionally admit a small number of adjacent values in the
+    runtime activation format.  Mapping those representable values through
+    each signed K scale is materially tighter than a blanket integer delta:
+    one BF16 ULP may span different numbers of fixed-point bins per cell.
+    """
+
+    values, scale, low, high = _runtime_kv_head_values_v3(
+        tag=tag,
+        raw_head_bytes=raw_head_bytes,
+        layer=layer,
+        position=position,
+        kv_head=kv_head,
+        geometry=geometry,
+        semantics=semantics,
+        params_by_head=params_by_head,
+        encoding_id=encoding_id,
+    )
+    lower_values, upper_values = runtime_kv_head_value_bounds_v3(
+        tag=tag,
+        raw_head_bytes=raw_head_bytes,
+        layer=layer,
+        position=position,
+        kv_head=kv_head,
+        geometry=geometry,
+        semantics=semantics,
+        encoding_id=encoding_id,
+    )
+    if not all(
+        lower <= center <= upper
+        for lower, center, upper in zip(
+            lower_values, values, upper_values, strict=True
         )
+    ):
+        raise ProofV3VerificationError(
+            "attention runtime interval excludes its canonical value"
+        )
+    return (
+        _round_clip(lower_values, scale, low, high),
+        _round_clip(upper_values, scale, low, high),
+    )
+
+
+def _runtime_kv_head_values_v3(
+    *,
+    tag: str,
+    raw_head_bytes: bytes,
+    layer: int,
+    position: int,
+    kv_head: int,
+    geometry: AttentionAnchorGeometryV3,
+    semantics: AttentionRuntimeSemanticsV3,
+    params_by_head,
+    encoding_id: str,
+):
+    import numpy as np
+
+    values = np.asarray(
+        runtime_kv_head_values_v3(
+            tag=tag,
+            raw_head_bytes=raw_head_bytes,
+            layer=layer,
+            position=position,
+            kv_head=kv_head,
+            geometry=geometry,
+            semantics=semantics,
+            encoding_id=encoding_id,
+        ),
+        dtype=np.float64,
+    )
     params = _params_for_kv(
         tuple(params_by_head), int(kv_head), geometry
     )
     if tag == "k":
-        values = _rope(
-            _normalize(
-                values,
-                norm_id=semantics.k_norm_id,
-                weights=_norm_weights(
-                    semantics, layer, "k", geometry.head_dim
-                ),
-                epsilon=semantics.k_norm_epsilon,
-            ),
-            position=position,
-            semantics=semantics,
-            encoding_id=encoding_id,
-        )
-        import numpy as np
-
         scale = np.asarray(
             [
                 numerator / (1 << exponent)
@@ -1197,21 +1381,192 @@ def runtime_kv_head_quantized_v3(
             ],
             dtype=np.float64,
         )
-        return _round_clip(
-            values,
-            scale,
-            -params.qk_qmax,
-            params.qk_qmax,
-        )
+        return values, scale, -params.qk_qmax, params.qk_qmax
     if tag == "v":
-        return _round_clip(
-            values,
-            params.v_num / (1 << params.v_e),
-            -127,
-            127,
-        )
+        return values, params.v_num / (1 << params.v_e), -127, 127
     raise ProofV3VerificationError(
         "attention anchor KV tag is unsupported"
+    )
+
+
+def runtime_kv_head_values_v3(
+    *,
+    tag: str,
+    raw_head_bytes: bytes,
+    layer: int,
+    position: int,
+    kv_head: int,
+    geometry: AttentionAnchorGeometryV3,
+    semantics: AttentionRuntimeSemanticsV3,
+    encoding_id: str,
+) -> tuple[float, ...]:
+    """Reconstruct one runtime K/V head before fixed-point quantization.
+
+    Qualification uses this exact production adapter to compare raw QKV
+    captures with the paged-cache values consumed by attention.  Keeping the
+    comparison on the shared adapter prevents an offline harness from silently
+    qualifying arithmetic different from the verifier's.
+    """
+
+    values = decode_runtime_values_v3(raw_head_bytes, encoding_id)
+    if len(values) != geometry.head_dim:
+        raise ProofV3VerificationError(
+            "attention anchor KV head has the wrong width"
+        )
+    if tag == "k":
+        values = _rope(
+            _round_post_norm_runtime_precision_v3(
+                _normalize(
+                    values,
+                    norm_id=semantics.k_norm_id,
+                    weights=_norm_weights(
+                        semantics, layer, "k", geometry.head_dim
+                    ),
+                    epsilon=semantics.k_norm_epsilon,
+                ),
+                semantics=semantics,
+                encoding_id=encoding_id,
+            ),
+            position=position,
+            semantics=semantics,
+            encoding_id=encoding_id,
+        )
+    elif tag != "v":
+        raise ProofV3VerificationError(
+            "attention anchor KV tag is unsupported"
+        )
+    return tuple(float(value) for value in values)
+
+
+def runtime_kv_head_value_bounds_v3(
+    *,
+    tag: str,
+    raw_head_bytes: bytes,
+    layer: int,
+    position: int,
+    kv_head: int,
+    geometry: AttentionAnchorGeometryV3,
+    semantics: AttentionRuntimeSemanticsV3,
+    encoding_id: str,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Return the signed runtime-value interval for one K/V head.
+
+    V is copied directly into paged cache and remains exact.  For version-3
+    K semantics, the signed ULP allowance applies at the RMSNorm output and
+    is propagated through the signed RoPE table.  This is both tighter and
+    more faithful than interpreting a final-K ULP distance near zero.
+    """
+
+    values = decode_runtime_values_v3(raw_head_bytes, encoding_id)
+    if len(values) != geometry.head_dim:
+        raise ProofV3VerificationError(
+            "attention anchor KV head has the wrong width"
+        )
+    if tag == "v":
+        exact = tuple(float(value) for value in values)
+        return exact, exact
+    if tag != "k":
+        raise ProofV3VerificationError(
+            "attention anchor KV tag is unsupported"
+        )
+
+    normalized = _round_post_norm_runtime_precision_v3(
+        _normalize(
+            values,
+            norm_id=semantics.k_norm_id,
+            weights=_norm_weights(
+                semantics, layer, "k", geometry.head_dim
+            ),
+            epsilon=semantics.k_norm_epsilon,
+        ),
+        semantics=semantics,
+        encoding_id=encoding_id,
+    )
+    ulps = int(semantics.runtime_ulp_tolerance)
+    if not ulps:
+        exact = _rope(
+            normalized,
+            position=position,
+            semantics=semantics,
+            encoding_id=encoding_id,
+        )
+        exact = tuple(float(value) for value in exact)
+        return exact, exact
+    lower, upper = _rope_input_ulp_bounds_v3(
+        normalized,
+        position=position,
+        semantics=semantics,
+        encoding_id=encoding_id,
+        ulps=ulps,
+    )
+    return (
+        tuple(float(value) for value in lower),
+        tuple(float(value) for value in upper),
+    )
+
+
+def _runtime_precision_neighbor_bounds_v3(
+    values,
+    *,
+    encoding_id: str,
+    ulps: int,
+):
+    import numpy as np
+
+    if not 0 < int(ulps) <= 2:
+        raise ProofV3VerificationError(
+            "attention runtime ULP tolerance is unsupported"
+        )
+    rounded = _round_runtime_precision(values, encoding_id)
+    if encoding_id == "fp16.v1":
+        words = np.asarray(rounded, dtype="<f2").view("<u2")
+
+        def decode(word):
+            return float(
+                np.asarray([word], dtype="<u2")
+                .view("<f2")
+                .astype(np.float64)[0]
+            )
+
+    elif encoding_id == "bf16.v1":
+        words = (
+            np.asarray(rounded, dtype="<f4").view("<u4") >> np.uint32(16)
+        ).astype("<u2")
+
+        def decode(word):
+            bits = np.asarray(
+                [np.uint32(word) << np.uint32(16)], dtype="<u4"
+            )
+            return float(bits.view("<f4")[0])
+
+    else:
+        raise ProofV3VerificationError(
+            "attention runtime precision boundary is not qualified"
+        )
+
+    lower = []
+    upper = []
+    for value, raw_word in zip(rounded, words, strict=True):
+        word = int(raw_word)
+        candidates = {
+            decode(candidate)
+            for candidate in range(
+                max(0, word - int(ulps)),
+                min(0xFFFF, word + int(ulps)) + 1,
+            )
+        }
+        if float(value) == 0.0:
+            candidates.update((decode(0x0001), decode(0x8001)))
+        finite = tuple(item for item in candidates if math.isfinite(item))
+        if not finite:
+            raise ProofV3VerificationError(
+                "attention runtime ULP neighborhood is malformed"
+            )
+        lower.append(min(finite))
+        upper.append(max(finite))
+    return (
+        np.asarray(lower, dtype=np.float64),
+        np.asarray(upper, dtype=np.float64),
     )
 
 

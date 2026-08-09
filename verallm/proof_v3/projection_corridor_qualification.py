@@ -10,15 +10,26 @@ the qualification cases or trust miner-provided evidence.
 from __future__ import annotations
 
 from collections.abc import Iterable
+import math
 
 from verallm.proof_v3.errors import ProofV3Error
 
 PROJECTION_CORRIDOR_QUALIFICATION_ABI_V2 = (
     "verathos.proof_v3.projection_corridor_qualification.v2"
 )
+PROJECTION_CORRIDOR_HONEST_QUALIFICATION_ABI_V2 = (
+    "verathos.proof_v3.projection_corridor_honest_qualification.v2"
+)
+PROJECTION_CORRIDOR_QUALIFICATION_ABI_V3 = (
+    "verathos.proof_v3.projection_corridor_qualification.v3"
+)
 PROJECTION_CORRIDOR_NEGATIVE_GATE_ABI_V3 = (
     "verathos.proof_v3.projection_corridor_negative_gate.v1"
 )
+
+MINIMUM_CORRIDOR_CALIBRATION_LAYER_SELECTIONS_V3 = 2
+MINIMUM_CORRIDOR_HELDOUT_LAYER_SELECTIONS_V3 = 1
+MINIMUM_CORRIDOR_LENGTH_SAMPLES_V3 = 2
 
 _COMMON_NEGATIVE_CASES_V3 = frozenset(
     (
@@ -57,6 +68,442 @@ _CASE_EVIDENCE_CLASSES_V3 = {
         ("real_model_wire", "qualified_relation_fixture")
     ),
 }
+
+
+def required_projection_corridor_decode_lengths_v3(
+    maximum: int,
+) -> tuple[int, ...]:
+    """Return canonical octave checkpoints through the admitted decode reach."""
+
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ProofV3Error("projection-corridor decode reach is malformed")
+    current = min(64, maximum)
+    values = [current]
+    while current < maximum:
+        current = min(maximum, current * 2)
+        values.append(current)
+    return tuple(values)
+
+
+def required_projection_corridor_context_lengths_v3(
+    maximum: int,
+) -> tuple[int, ...]:
+    """Return canonical 4x context checkpoints through the admitted reach."""
+
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 2:
+        raise ProofV3Error("projection-corridor context reach is malformed")
+    current = min(2_048, maximum)
+    values = [current]
+    while current < maximum:
+        current = min(maximum, current * 4)
+        values.append(current)
+    return tuple(values)
+
+
+def projection_corridor_manifest_layers_v3(
+    manifest_entry_names: Iterable[str],
+) -> tuple[int, ...]:
+    """Extract the complete canonical runtime-layer inventory from operations."""
+
+    layers = set()
+    for raw_name in manifest_entry_names:
+        name = str(raw_name)
+        prefix = name.split(".", 1)[0]
+        if len(prefix) < 2 or prefix[0] != "l" or not prefix[1:].isdigit():
+            continue
+        layers.add(int(prefix[1:]))
+    if not layers:
+        raise ProofV3Error(
+            "projection-corridor manifest layer inventory is empty"
+        )
+    ordered = tuple(sorted(layers))
+    if ordered != tuple(range(ordered[-1] + 1)):
+        raise ProofV3Error(
+            "projection-corridor manifest layer inventory is not contiguous"
+        )
+    return ordered
+
+
+def _canonical_positive_counts(
+    value,
+    *,
+    key_name: str,
+    inventory_name: str,
+) -> dict[int, int]:
+    if not isinstance(value, list) or not value:
+        raise ProofV3Error(
+            f"projection-corridor {inventory_name} inventory is malformed"
+        )
+    result = {}
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {key_name, "count"}
+        ):
+            raise ProofV3Error(
+                f"projection-corridor {inventory_name} inventory is malformed"
+            )
+        key = item[key_name]
+        count = item["count"]
+        if (
+            isinstance(key, bool)
+            or not isinstance(key, int)
+            or key < 0
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            or key in result
+        ):
+            raise ProofV3Error(
+                f"projection-corridor {inventory_name} inventory is malformed"
+            )
+        result[key] = count
+    if tuple(result) != tuple(sorted(result)):
+        raise ProofV3Error(
+            f"projection-corridor {inventory_name} inventory is not canonical"
+        )
+    return result
+
+
+def _canonical_layer_counts(value, *, name: str) -> dict[int, tuple[int, int]]:
+    if not isinstance(value, list) or not value:
+        raise ProofV3Error(f"projection-corridor {name} is malformed")
+    result = {}
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"layer", "count", "distinct_plan_count"}
+        ):
+            raise ProofV3Error(f"projection-corridor {name} is malformed")
+        layer = item["layer"]
+        count = item["count"]
+        plan_count = item["distinct_plan_count"]
+        if (
+            isinstance(layer, bool)
+            or not isinstance(layer, int)
+            or layer < 0
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            or isinstance(plan_count, bool)
+            or not isinstance(plan_count, int)
+            or not 1 <= plan_count <= count
+            or layer in result
+        ):
+            raise ProofV3Error(f"projection-corridor {name} is malformed")
+        result[layer] = (count, plan_count)
+    if tuple(result) != tuple(sorted(result)):
+        raise ProofV3Error(f"projection-corridor {name} is not canonical")
+    return result
+
+
+def validate_projection_corridor_honest_coverage_v3(
+    value,
+    *,
+    manifest_entry_names: Iterable[str],
+) -> None:
+    """Validate final-profile layer, nonce, context and decode coverage.
+
+    Calibration observations derive the signed thresholds. Held-out cases are
+    checked against those frozen thresholds and therefore cannot silently
+    widen them.
+    """
+
+    if not isinstance(value, dict):
+        raise ProofV3Error("projection-corridor qualification is malformed")
+    required = {
+        "qualified_decode_tokens",
+        "qualified_context_tokens",
+        "qualified_decode_token_lengths",
+        "qualified_context_token_lengths",
+        "minimum_calibration_layer_selections",
+        "minimum_heldout_layer_selections",
+        "minimum_length_samples",
+        "selected_layer_count",
+        "calibration_layer_counts",
+        "heldout_layer_counts",
+        "decode_length_counts",
+        "context_length_counts",
+        "geometry_counts",
+        "maximum_geometry_case_count",
+        "honest_coverage_gate_passed",
+        "heldout_gate_passed",
+        "heldout_maximum_required_sigma",
+        "heldout_maximum_chi2",
+        "heldout_maximum_required_fixed_quant_coeff",
+        "qualified_corridor_sigma",
+        "qualified_corridor_chi2",
+        "protocol_fixed_quant_coeff",
+        "cases",
+    }
+    if not required.issubset(value) or value.get(
+        "honest_coverage_gate_passed"
+    ) is not True or value.get("heldout_gate_passed") is not True:
+        raise ProofV3Error(
+            "projection-corridor honest coverage is incomplete"
+        )
+    decode_max = value["qualified_decode_tokens"]
+    context_max = value["qualified_context_tokens"]
+    if (
+        isinstance(decode_max, bool)
+        or not isinstance(decode_max, int)
+        or decode_max < 1
+        or isinstance(context_max, bool)
+        or not isinstance(context_max, int)
+        or context_max < 2
+    ):
+        raise ProofV3Error("projection-corridor qualified reach is malformed")
+    try:
+        decode_lengths = tuple(value["qualified_decode_token_lengths"])
+        context_lengths = tuple(value["qualified_context_token_lengths"])
+    except TypeError as exc:
+        raise ProofV3Error(
+            "projection-corridor qualified length coverage is malformed"
+        ) from exc
+    if (
+        any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 1
+            for item in decode_lengths
+        )
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 2
+            for item in context_lengths
+        )
+        or not decode_lengths
+        or not context_lengths
+        or decode_lengths != tuple(sorted(set(decode_lengths)))
+        or context_lengths != tuple(sorted(set(context_lengths)))
+        or decode_lengths
+        != required_projection_corridor_decode_lengths_v3(decode_max)
+        or context_lengths
+        != required_projection_corridor_context_lengths_v3(context_max)
+    ):
+        raise ProofV3Error(
+            "projection-corridor qualified length coverage is incomplete"
+        )
+    calibration_minimum = value["minimum_calibration_layer_selections"]
+    heldout_minimum = value["minimum_heldout_layer_selections"]
+    length_minimum = value["minimum_length_samples"]
+    selected_layer_count = value["selected_layer_count"]
+    if any(
+        isinstance(item, bool) or not isinstance(item, int)
+        for item in (calibration_minimum, heldout_minimum, length_minimum)
+    ) or (
+        calibration_minimum < MINIMUM_CORRIDOR_CALIBRATION_LAYER_SELECTIONS_V3
+        or heldout_minimum < MINIMUM_CORRIDOR_HELDOUT_LAYER_SELECTIONS_V3
+        or length_minimum < MINIMUM_CORRIDOR_LENGTH_SAMPLES_V3
+        or isinstance(selected_layer_count, bool)
+        or not isinstance(selected_layer_count, int)
+        or selected_layer_count < 1
+    ):
+        raise ProofV3Error(
+            "projection-corridor coverage minimum is too weak"
+        )
+    layers = projection_corridor_manifest_layers_v3(manifest_entry_names)
+    calibration_counts = _canonical_layer_counts(
+        value["calibration_layer_counts"],
+        name="calibration layer counts",
+    )
+    heldout_counts = _canonical_layer_counts(
+        value["heldout_layer_counts"],
+        name="held-out layer counts",
+    )
+    decode_counts = _canonical_positive_counts(
+        value["decode_length_counts"],
+        key_name="decode_tokens",
+        inventory_name="decode length counts",
+    )
+    context_counts = _canonical_positive_counts(
+        value["context_length_counts"],
+        key_name="context_tokens",
+        inventory_name="context length counts",
+    )
+    geometry_counts_value = value["geometry_counts"]
+    if not isinstance(geometry_counts_value, list) or not geometry_counts_value:
+        raise ProofV3Error(
+            "projection-corridor geometry count inventory is malformed"
+        )
+    geometry_counts = {}
+    for item in geometry_counts_value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"context_tokens", "decode_tokens", "count"}
+        ):
+            raise ProofV3Error(
+                "projection-corridor geometry count inventory is malformed"
+            )
+        key = (item["context_tokens"], item["decode_tokens"])
+        count = item["count"]
+        if (
+            any(isinstance(part, bool) or not isinstance(part, int) for part in key)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            or key in geometry_counts
+        ):
+            raise ProofV3Error(
+                "projection-corridor geometry count inventory is malformed"
+            )
+        geometry_counts[key] = count
+    required_geometries = tuple(
+        (context, decode)
+        for context in context_lengths
+        for decode in decode_lengths
+    )
+    if tuple(geometry_counts) != required_geometries:
+        raise ProofV3Error(
+            "projection-corridor geometry count inventory is not canonical"
+        )
+    maximum_geometry_count = value["maximum_geometry_case_count"]
+    cases = value["cases"]
+    if not isinstance(cases, list) or not cases:
+        raise ProofV3Error("projection-corridor honest cases are malformed")
+    case_ids = set()
+    derived_layer_counts = {
+        split: {layer: [0, set()] for layer in layers}
+        for split in ("calibration", "heldout")
+    }
+    derived_decode_counts: dict[int, int] = {}
+    derived_context_counts: dict[int, int] = {}
+    derived_geometry_counts: dict[tuple[int, int], int] = {}
+    derived_maximum_geometry_count = 0
+    for case in cases:
+        required_case_fields = {
+            "id",
+            "split",
+            "target_context_tokens",
+            "context_tokens",
+            "decode_tokens",
+            "selected_layer_indices",
+            "selection_plan_sha256",
+        }
+        if not isinstance(case, dict) or not required_case_fields.issubset(case):
+            raise ProofV3Error(
+                "projection-corridor honest case is malformed"
+            )
+        case_id = case["id"]
+        split = case["split"]
+        target_context = case["target_context_tokens"]
+        context = case["context_tokens"]
+        decode = case["decode_tokens"]
+        selected_layers = case["selected_layer_indices"]
+        plan_digest = case["selection_plan_sha256"]
+        if (
+            not isinstance(case_id, str)
+            or not case_id
+            or case_id in case_ids
+            or split not in derived_layer_counts
+            or isinstance(target_context, bool)
+            or not isinstance(target_context, int)
+            or not 2 <= target_context <= context_max
+            or isinstance(context, bool)
+            or not isinstance(context, int)
+            or not 2 <= context <= context_max
+            or isinstance(decode, bool)
+            or not isinstance(decode, int)
+            or not 1 <= decode <= decode_max
+            or not isinstance(selected_layers, list)
+            or len(selected_layers) != selected_layer_count
+            or any(
+                isinstance(layer, bool)
+                or not isinstance(layer, int)
+                or layer not in derived_layer_counts[split]
+                for layer in selected_layers
+            )
+            or len(set(selected_layers)) != len(selected_layers)
+            or not isinstance(plan_digest, str)
+            or len(plan_digest) != 64
+            or plan_digest.lower() != plan_digest
+            or any(char not in "0123456789abcdef" for char in plan_digest)
+        ):
+            raise ProofV3Error(
+                "projection-corridor honest case is malformed"
+            )
+        case_ids.add(case_id)
+        for layer in selected_layers:
+            layer_count, plans = derived_layer_counts[split][layer]
+            derived_layer_counts[split][layer][0] = layer_count + 1
+            plans.add(plan_digest)
+        derived_decode_counts[decode] = derived_decode_counts.get(decode, 0) + 1
+        derived_context_counts[target_context] = (
+            derived_context_counts.get(target_context, 0) + 1
+        )
+        geometry = (target_context, decode)
+        derived_geometry_counts[geometry] = (
+            derived_geometry_counts.get(geometry, 0) + 1
+        )
+        if decode == decode_max and target_context == context_max:
+            derived_maximum_geometry_count += 1
+
+    derived_calibration_counts = {
+        layer: (count, len(plans))
+        for layer, (count, plans) in derived_layer_counts["calibration"].items()
+    }
+    derived_heldout_counts = {
+        layer: (count, len(plans))
+        for layer, (count, plans) in derived_layer_counts["heldout"].items()
+    }
+    heldout_numeric_names = (
+        "heldout_maximum_required_sigma",
+        "heldout_maximum_chi2",
+        "heldout_maximum_required_fixed_quant_coeff",
+        "qualified_corridor_sigma",
+        "qualified_corridor_chi2",
+        "protocol_fixed_quant_coeff",
+    )
+    heldout_numeric = {}
+    for name in heldout_numeric_names:
+        item = value[name]
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            or float(item) < 0.0
+        ):
+            raise ProofV3Error(
+                "projection-corridor held-out gate is malformed"
+            )
+        heldout_numeric[name] = float(item)
+    if (
+        tuple(calibration_counts) != layers
+        or tuple(heldout_counts) != layers
+        or calibration_counts != derived_calibration_counts
+        or heldout_counts != derived_heldout_counts
+        or any(
+            count < calibration_minimum or plans < calibration_minimum
+            for count, plans in calibration_counts.values()
+        )
+        or any(
+            count < heldout_minimum or plans < heldout_minimum
+            for count, plans in heldout_counts.values()
+        )
+        or tuple(decode_counts) != decode_lengths
+        or tuple(context_counts) != context_lengths
+        or decode_counts != derived_decode_counts
+        or context_counts != derived_context_counts
+        or geometry_counts != derived_geometry_counts
+        or any(count < length_minimum for count in decode_counts.values())
+        or any(count < length_minimum for count in context_counts.values())
+        or any(count < length_minimum for count in geometry_counts.values())
+        or isinstance(maximum_geometry_count, bool)
+        or not isinstance(maximum_geometry_count, int)
+        or maximum_geometry_count < length_minimum
+        or maximum_geometry_count != derived_maximum_geometry_count
+        or (
+            isinstance(value.get("case_count"), int)
+            and not isinstance(value.get("case_count"), bool)
+            and value["case_count"] != len(cases)
+        )
+        or heldout_numeric["heldout_maximum_required_sigma"]
+        > heldout_numeric["qualified_corridor_sigma"]
+        or heldout_numeric["heldout_maximum_chi2"]
+        > heldout_numeric["qualified_corridor_chi2"]
+        or heldout_numeric["heldout_maximum_required_fixed_quant_coeff"]
+        > heldout_numeric["protocol_fixed_quant_coeff"]
+    ):
+        raise ProofV3Error(
+            "projection-corridor honest coverage did not meet its minimum"
+        )
 
 
 def required_projection_corridor_negative_cases_v3(

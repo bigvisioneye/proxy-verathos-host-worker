@@ -262,6 +262,7 @@ def apply_capture_kv_sections_v3(
         economic_ox8_head_row=None,
         anchor_roots_by_layer=None,
         anchor_kv_value=None,
+        anchor_kv_bounds=None,
         anchor_q13_head_row=None,
         anchor_gate_fx_head_row=None,
         anchor_integer_tolerance: int = 0,
@@ -357,6 +358,10 @@ def apply_capture_kv_sections_v3(
         raise ProofV3VerificationError(
             "attention bundle anchor mode does not match the signed "
             "selection ABI"
+        )
+    if anchor_kv_bounds is not None and anchor_kv_value is None:
+        raise ProofV3VerificationError(
+            "attention K/V bounds have no authenticated anchor"
         )
     sections = tuple(sections)
     if len(sections) != len(layers) or tuple(
@@ -603,7 +608,37 @@ def apply_capture_kv_sections_v3(
                             int(dim),
                         )
                     )
-                    if abs(claimed - expected) > tolerance:
+                    lower = upper = expected
+                    if anchor_kv_bounds is not None:
+                        bounds = anchor_kv_bounds(
+                            int(plan.layer),
+                            tag,
+                            int(native_leaf),
+                            int(sp),
+                            int(dim),
+                        )
+                        if (
+                            not isinstance(bounds, tuple)
+                            or len(bounds) != 2
+                            or any(
+                                isinstance(value, bool)
+                                or not isinstance(value, int)
+                                for value in bounds
+                            )
+                        ):
+                            raise ProofV3VerificationError(
+                                "attention K/V runtime bounds are malformed"
+                            )
+                        lower, upper = bounds
+                        if not lower <= expected <= upper:
+                            raise ProofV3VerificationError(
+                                "attention K/V runtime bounds exclude their "
+                                "canonical value"
+                            )
+                    if (
+                        claimed < lower - tolerance
+                        or claimed > upper + tolerance
+                    ):
                         raise ProofV3VerificationError(
                             "attention K/V PCS value is detached from the "
                             "pre-nonce raw QKV execution anchor "
@@ -813,6 +848,7 @@ def apply_capture_kv_bundle_wire_v3(
         economic_ox8_head_row=None,
         anchor_roots_by_layer=None,
         anchor_kv_value=None,
+        anchor_kv_bounds=None,
         anchor_q13_head_row=None,
         anchor_gate_fx_head_row=None,
         anchor_integer_tolerance: int = 0,
@@ -876,6 +912,7 @@ def apply_capture_kv_bundle_wire_v3(
         economic_ox8_head_row=economic_ox8_head_row,
         anchor_roots_by_layer=anchor_roots_by_layer,
         anchor_kv_value=anchor_kv_value,
+        anchor_kv_bounds=anchor_kv_bounds,
         anchor_q13_head_row=anchor_q13_head_row,
         anchor_gate_fx_head_row=anchor_gate_fx_head_row,
         anchor_integer_tolerance=anchor_integer_tolerance,

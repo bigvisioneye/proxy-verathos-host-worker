@@ -1104,7 +1104,7 @@ except Exception as e:
     # The wheel auto-detects the correct torch version at import time.
     #
     # Defensive cleanup: if any zkllm_native .so sits in the *source* tree
-    # (e.g. left over from a previous rsync of verathos-core, or from an
+    # (e.g. left over from a previous source-tree sync, or from an
     # aborted JIT build, or from a different Python version's build), it
     # will shadow the correctly-installed wheel in site-packages because
     # Python's implicit `sys.path[0]=""` puts the source tree first when

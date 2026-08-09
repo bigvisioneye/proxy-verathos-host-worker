@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from verallm.proof_v3.attention_runtime_semantics import (
     ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
+    ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3,
     AttentionNormBindingV3,
     AttentionRuntimeSemanticsV3,
     GEMMA_RMS_NORM_V3,
@@ -156,6 +157,7 @@ def qualify_attention_runtime_semantics_v3(
     rope_position_count: int,
     adapter_id: str = "qwen.paged_attention.v1",
     integer_tolerance: int = 0,
+    runtime_ulp_tolerance: int = 0,
 ) -> AttentionRuntimeSemanticsV3:
     """Derive the canonical runtime adapter artifact during qualification."""
 
@@ -189,10 +191,15 @@ def qualify_attention_runtime_semantics_v3(
             cache_layout_id=LOGICAL_PAGED_KV_V3,
             norm_encoding_id=rope_encoding,
             integer_tolerance=integer_tolerance,
+            runtime_ulp_tolerance=runtime_ulp_tolerance,
             rope_coefficient_row_count=rope_position_count,
             rope_coefficient_encoding_id=rope_encoding,
             rope_coefficient_bytes=rope_bytes,
-            version=ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
+            version=(
+                ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3
+                if runtime_ulp_tolerance
+                else ATTENTION_RUNTIME_SEMANTICS_VERSION_V3
+            ),
         )
 
     bindings = []
@@ -251,8 +258,13 @@ def qualify_attention_runtime_semantics_v3(
         norm_encoding_id=str(encoding),
         norm_bindings=tuple(bindings),
         integer_tolerance=integer_tolerance,
+        runtime_ulp_tolerance=runtime_ulp_tolerance,
         rope_coefficient_row_count=rope_position_count,
         rope_coefficient_encoding_id=rope_encoding,
         rope_coefficient_bytes=rope_bytes,
-        version=ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
+        version=(
+            ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3
+            if runtime_ulp_tolerance
+            else ATTENTION_RUNTIME_SEMANTICS_VERSION_V3
+        ),
     )

@@ -404,6 +404,43 @@ def _fixed_quantization_corridor_check(
     return delta / bound if bound > 0.0 else 0.0
 
 
+def _quantized_target_interval_delta(
+    *,
+    expected_lower: float,
+    expected_upper: float,
+    target_value: int,
+    target_scale: float,
+) -> tuple[float, float, float]:
+    """Return distance to an authenticated int8 output cell.
+
+    Interior values retain the historical center-plus-half-step treatment.
+    The two rails are one-sided intervals and therefore contribute no finite
+    output half-step.  The tuple is ``(delta, target_quant, center)``.
+    """
+
+    if (
+        isinstance(target_value, bool)
+        or not isinstance(target_value, int)
+        or not -128 <= target_value <= 127
+        or not math.isfinite(target_scale)
+        or target_scale <= 0.0
+        or not math.isfinite(expected_lower)
+        or not math.isfinite(expected_upper)
+        or expected_lower > expected_upper
+    ):
+        raise _fail("quantized target interval is malformed")
+    center = target_value * target_scale
+    if target_value == 127:
+        return max(126.5 * target_scale - expected_upper, 0.0), 0.0, center
+    if target_value == -128:
+        return max(expected_lower + 127.5 * target_scale, 0.0), 0.0, center
+    return (
+        max(expected_lower - center, center - expected_upper, 0.0),
+        0.5 * target_scale,
+        center,
+    )
+
+
 def _quantized_sum_corridor_check(
     *,
     output_i8: int,
@@ -466,8 +503,11 @@ def _swiglu_output_is_forced_to_quantization_rail_v3(
     The ordinary fixed-quantization corridor assumes an unsaturated output
     bin.  For a rail value, prove the stronger statement instead: every
     real gate/up value represented by the authenticated input bins maps to
-    that same output rail.  Saturated gate/up inputs are refused because
-    their represented interval is unbounded on one side.
+    that same output rail.  A saturated gate remains refused because SiLU
+    over its half-infinite input interval needs a separate transcendental
+    bound.  A saturated ``up`` value is safe to handle directly: it is a
+    one-sided linear interval, and a strictly signed finite SiLU interval
+    either proves the output rail or fails closed.
     """
 
     gate_i8 = int(gate_i8)
@@ -476,7 +516,6 @@ def _swiglu_output_is_forced_to_quantization_rail_v3(
     if (
         output_i8 not in (-128, 127)
         or gate_i8 in (-128, 127)
-        or up_i8 in (-128, 127)
         or not math.isfinite(gate_up_scale)
         or not math.isfinite(output_scale)
         or gate_up_scale <= 0.0
@@ -487,8 +526,15 @@ def _swiglu_output_is_forced_to_quantization_rail_v3(
     half = 0.5 * gate_up_scale
     gate_low = gate_i8 * gate_up_scale - half
     gate_high = gate_i8 * gate_up_scale + half
-    up_low = up_i8 * gate_up_scale - half
-    up_high = up_i8 * gate_up_scale + half
+    if up_i8 == -128:
+        up_low = -math.inf
+        up_high = -127.5 * gate_up_scale
+    elif up_i8 == 127:
+        up_low = 126.5 * gate_up_scale
+        up_high = math.inf
+    else:
+        up_low = up_i8 * gate_up_scale - half
+        up_high = up_i8 * gate_up_scale + half
     gate_candidates = [gate_low, gate_high]
     # SiLU has one finite stationary point.  Include it when the input bin
     # spans it so the interval remains rigorous for negative gate values.
@@ -496,13 +542,30 @@ def _swiglu_output_is_forced_to_quantization_rail_v3(
     if gate_low <= silu_stationary <= gate_high:
         gate_candidates.append(silu_stationary)
     silu_values = tuple(_silu(value) for value in gate_candidates)
-    products = tuple(
-        silu_value * up_value
-        for silu_value in silu_values
-        for up_value in (up_low, up_high)
-    )
-    output_low = min(products)
-    output_high = max(products)
+    silu_low = min(silu_values)
+    silu_high = max(silu_values)
+    if silu_low > 0.0 and up_low >= 0.0:
+        output_low = silu_low * up_low
+        output_high = math.inf
+    elif silu_high < 0.0 and up_high <= 0.0:
+        output_low = silu_high * up_high
+        output_high = math.inf
+    elif silu_low > 0.0 and up_high <= 0.0:
+        output_low = -math.inf
+        output_high = silu_low * up_high
+    elif silu_high < 0.0 and up_low >= 0.0:
+        output_low = -math.inf
+        output_high = silu_high * up_low
+    elif math.isfinite(up_low) and math.isfinite(up_high):
+        products = tuple(
+            silu_value * up_value
+            for silu_value in (silu_low, silu_high)
+            for up_value in (up_low, up_high)
+        )
+        output_low = min(products)
+        output_high = max(products)
+    else:
+        return False
     if output_i8 == -128:
         return output_high < -127.5 * output_scale
     return output_low > 126.5 * output_scale
@@ -823,7 +886,7 @@ def _rmsnorm_quantization_interval(
 
 def _rmsnorm_corridor_check(
     *,
-    got: float,
+    target_value: int,
     target_scale: float,
     source_row: tuple[int, ...] | list[int],
     source_scale: float,
@@ -849,11 +912,16 @@ def _rmsnorm_corridor_check(
         denominator_interval=denominator_interval,
         selected_source_interval=selected_source_interval,
     )
-    delta = max(lower - got, got - upper, 0.0)
+    delta, target_quant, got = _quantized_target_interval_delta(
+        expected_lower=lower,
+        expected_upper=upper,
+        target_value=target_value,
+        target_scale=target_scale,
+    )
     relative = _REL_COEFF * max(abs(lower), abs(upper), abs(got))
     return _fixed_quantization_corridor_check(
         delta=delta,
-        quant=0.5 * target_scale,
+        quant=target_quant,
         relative=relative,
         what=what,
         kind=kind,
@@ -863,7 +931,7 @@ def _rmsnorm_corridor_check(
 
 def _rmsnorm_exact_source_corridor_check(
     *,
-    got: float,
+    target_value: int,
     target_scale: float,
     source_values,
     norm_weight: int,
@@ -911,11 +979,16 @@ def _rmsnorm_exact_source_corridor_check(
         float(values[column]) * gain_high / denominator,
     )
     lower, upper = min(outputs), max(outputs)
-    delta = max(lower - got, got - upper, 0.0)
+    delta, target_quant, got = _quantized_target_interval_delta(
+        expected_lower=lower,
+        expected_upper=upper,
+        target_value=target_value,
+        target_scale=target_scale,
+    )
     relative = _REL_COEFF * max(abs(lower), abs(upper), abs(got))
     return _fixed_quantization_corridor_check(
         delta=delta,
-        quant=0.5 * target_scale,
+        quant=target_quant,
         relative=relative,
         what=what,
         kind=kind,
@@ -1695,6 +1768,7 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
             extract_execution_anchor_range_v3,
             required_execution_anchor_lanes_v3,
             runtime_attention_quantized_row_v3,
+            runtime_kv_head_quantization_bounds_v3,
             runtime_kv_head_quantized_v3,
         )
         from verallm.proof_v3.scored_attention_reference import (
@@ -1879,6 +1953,7 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
             )
 
         kv_head_cache = {}
+        kv_head_bounds_cache = {}
 
         def _anchor_kv(
             layer: int,
@@ -1976,6 +2051,10 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
                             encoding_id=anchor_encoding,
                         )
                     )
+                    kv_head_bounds_cache[cache_key] = (
+                        kv_head_cache[cache_key],
+                        kv_head_cache[cache_key],
+                    )
                 else:
                     kv_head_cache[cache_key] = runtime_kv_head_quantized_v3(
                         tag=tag,
@@ -1988,7 +2067,39 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
                         params_by_head=params_by_layer[int(layer)],
                         encoding_id=anchor_encoding,
                     )
+                    kv_head_bounds_cache[cache_key] = (
+                        runtime_kv_head_quantization_bounds_v3(
+                            tag=tag,
+                            raw_head_bytes=raw_head,
+                            layer=int(layer),
+                            position=position,
+                            kv_head=kv_head,
+                            geometry=geometry,
+                            semantics=semantics,
+                            params_by_head=params_by_layer[int(layer)],
+                            encoding_id=anchor_encoding,
+                        )
+                    )
             return int(kv_head_cache[cache_key][coordinate])
+
+        def _anchor_kv_bounds(
+            layer: int,
+            tag: str,
+            native_leaf: int,
+            sp: int,
+            dim: int,
+        ) -> tuple[int, int]:
+            kv_head, remainder = divmod(
+                int(native_leaf), int(sp) * int(dim)
+            )
+            position, coordinate = divmod(remainder, int(dim))
+            if kv_head >= n_kv or position >= key_count:
+                return 0, 0
+            _anchor_kv(layer, tag, native_leaf, sp, dim)
+            lower, upper = kv_head_bounds_cache[
+                (int(layer), tag, kv_head, position)
+            ]
+            return int(lower[coordinate]), int(upper[coordinate])
 
         anchor_kv_value = _anchor_kv
         anchor_q13_head_row = _anchor_q13_head_row
@@ -2014,6 +2125,9 @@ def _verify_rational_attention_bundle_v3(*, artifacts, envelope,
             economic_ox8_head_row=_economic_ox8_head_row,
             anchor_roots_by_layer=anchor_roots_by_layer,
             anchor_kv_value=anchor_kv_value,
+            anchor_kv_bounds=(
+                _anchor_kv_bounds if streaming else None
+            ),
             anchor_q13_head_row=anchor_q13_head_row,
             pcs_query_count=challenge.pcs_query_count,
             anchor_gate_fx_head_row=anchor_gate_fx_head_row,
@@ -5125,9 +5239,9 @@ def verify_economic_recompute_v3(
                         epsilon=rmsnorm_epsilon,
                     )
                 for col in norm_cols:
-                    got = target_rows[token][col] * target_scale
+                    target_value = target_rows[token][col]
                     check_kwargs = dict(
-                        got=got,
+                        target_value=target_value,
                         target_scale=target_scale,
                         norm_weight=norm_row[col],
                         norm_scale=norm_scale,
@@ -5149,11 +5263,23 @@ def verify_economic_recompute_v3(
                         )
                     elif col in direct_saturated_outputs:
                         lower, upper = direct_saturated_outputs[col]
+                        delta, target_quant, target_center = (
+                            _quantized_target_interval_delta(
+                                expected_lower=lower,
+                                expected_upper=upper,
+                                target_value=target_value,
+                                target_scale=target_scale,
+                            )
+                        )
                         _fixed_quantization_corridor_check(
-                            delta=max(lower - got, got - upper, 0.0),
-                            quant=0.5 * target_scale,
+                            delta=delta,
+                            quant=target_quant,
                             relative=_REL_COEFF
-                            * max(abs(lower), abs(upper), abs(got)),
+                            * max(
+                                abs(lower),
+                                abs(upper),
+                                abs(target_center),
+                            ),
                             what=check_kwargs["what"],
                             kind=check_kwargs["kind"],
                             failure=check_kwargs["failure"],
@@ -5425,7 +5551,7 @@ def verify_economic_recompute_v3(
                     qkvz_columns, qkvz_expected, strict=True
                 ):
                     actual = opened_y_rows["qkvz_y"][token][column]
-                    if actual != expected:
+                    if not _replay_capture_cell_matches_v3(actual, expected):
                         raise _fail_with_row_mismatch(
                             "lean GDN qkvz replay row is detached from its "
                             "registered projection",
@@ -5439,24 +5565,32 @@ def verify_economic_recompute_v3(
                 for column, expected in zip(
                     ba_columns, ba_expected, strict=True
                 ):
-                    if (
-                        opened_y_rows["ba_y"][token][column]
-                        != expected
-                    ):
-                        raise _fail(
+                    actual = opened_y_rows["ba_y"][token][column]
+                    if not _replay_capture_cell_matches_v3(actual, expected):
+                        raise _fail_with_row_mismatch(
                             "lean GDN BA replay row is detached from its "
-                            "registered projection"
+                            "registered projection",
+                            layer=layer,
+                            position=int(position),
+                            token=token,
+                            column=column,
+                            actual=actual,
+                            expected=expected,
                         )
                 for column, expected in zip(
                     gdn_o_columns, output_expected, strict=True
                 ):
-                    if (
-                        gdn_o_x_rows[token][column]
-                        != expected
-                    ):
-                        raise _fail(
+                    actual = gdn_o_x_rows[token][column]
+                    if not _replay_capture_cell_matches_v3(actual, expected):
+                        raise _fail_with_row_mismatch(
                             "lean GDN recurrence output is detached from its "
-                            "registered output projection"
+                            "registered output projection",
+                            layer=layer,
+                            position=int(position),
+                            token=token,
+                            column=column,
+                            actual=actual,
+                            expected=expected,
                         )
 
         # qkvz and BA are parallel registered projections of the identical
@@ -5876,9 +6010,9 @@ def verify_economic_recompute_v3(
                     )
                 )
                 for col in norm_cols:
-                    got = target_rows[token][col] * target_scale
+                    target_value = target_rows[token][col]
                     check_kwargs = dict(
-                        got=got,
+                        target_value=target_value,
                         target_scale=target_scale,
                         norm_weight=norm_row[col],
                         norm_scale=norm_scale,
@@ -6085,7 +6219,7 @@ def verify_economic_recompute_v3(
     for col in range(embed_hidden):
         if exact_final_source is not None:
             _rmsnorm_exact_source_corridor_check(
-                got=final_row[col] * final_scale,
+                target_value=final_row[col],
                 target_scale=final_scale,
                 source_values=exact_final_source,
                 norm_weight=final_norm_gains[col],
@@ -6107,9 +6241,14 @@ def verify_economic_recompute_v3(
             + norm_gain_offset
         )
         predicted = source_real[col] / rms * gain
-        got = final_row[col] * final_scale
+        delta, target_quant, got = _quantized_target_interval_delta(
+            expected_lower=predicted,
+            expected_upper=predicted,
+            target_value=final_row[col],
+            target_scale=final_scale,
+        )
         quant = (
-            0.5 * final_scale
+            target_quant
             + (abs(gain) / rms)
             * 0.5
             * last_scale
@@ -6120,7 +6259,7 @@ def verify_economic_recompute_v3(
             + abs(source_real[col] / rms) * 0.5 * final_norm_scale
         )
         _fixed_quantization_corridor_check(
-            delta=abs(got - predicted),
+            delta=delta,
             quant=quant,
             relative=_REL_COEFF * abs(predicted),
             what="final RMSNorm link",

@@ -29,9 +29,11 @@ import argparse
 import json
 import logging
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Callable, Optional
@@ -87,7 +89,186 @@ PROOF_V3_RELEASE_ENV = "VERATHOS_PROOF_V3_RELEASE"
 
 PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS = 60.0
 PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS = 5.0
-PROOF_V3_ARTIFACT_REFRESH_MAX_ACTIVE_DEFERRAL_SECONDS = 300.0
+
+_MANAGED_NGINX_CONFIG_PATHS = (
+    Path("/etc/nginx/sites-available/verathos-miner"),
+    Path("/etc/nginx/sites-enabled/verathos-miner"),
+    Path("/etc/nginx/nginx.conf"),
+)
+_MANAGED_NGINX_OLD_READ_TIMEOUT = "proxy_read_timeout 120s;"
+_MANAGED_NGINX_READ_TIMEOUT = "proxy_read_timeout 360s;"
+
+
+def _reconcile_managed_nginx_read_timeout(
+    *,
+    config_paths: tuple[Path, ...] = _MANAGED_NGINX_CONFIG_PATHS,
+    run_command: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    effective_uid: int | None = None,
+) -> bool:
+    """Align the stock HTTPS proxy with the signed hard-proof deadline.
+
+    The hard-proof response budget is 300 seconds.  Older versions of the
+    stock nginx template used a 120-second upstream read timeout, which could
+    terminate a valid long-decode proof before the validator deadline.  Only
+    byte-recognizable Verathos-managed server blocks are migrated; custom
+    reverse-proxy configurations are never rewritten.
+    """
+
+    managed_marker = "ssl_certificate /etc/nginx/ssl/miner.crt;"
+    backend_marker = "proxy_pass http://127.0.0.1:"
+    selected_uid = os.geteuid() if effective_uid is None else effective_uid
+    use_sudo = selected_uid != 0
+    changed: list[tuple[Path, str, int]] = []
+    seen: set[Path] = set()
+
+    def _install_text(path: Path, content: str, mode: int) -> bool:
+        if not use_sudo:
+            temporary = path.with_name(f".{path.name}.verathos-timeout.tmp")
+            try:
+                temporary.write_text(content)
+                temporary.chmod(mode)
+                os.replace(temporary, path)
+                return True
+            except OSError:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
+
+        temporary_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="verathos-nginx-timeout-",
+                delete=False,
+            ) as temporary:
+                temporary.write(content)
+                temporary_name = temporary.name
+            installed = run_command(
+                [
+                    "sudo",
+                    "-n",
+                    "install",
+                    "-m",
+                    f"{mode:o}",
+                    "--",
+                    temporary_name,
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return installed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        finally:
+            if temporary_name is not None:
+                try:
+                    Path(temporary_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    for candidate in config_paths:
+        try:
+            path = candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            original = path.read_text()
+        except (OSError, UnicodeError):
+            continue
+        if _MANAGED_NGINX_READ_TIMEOUT in original:
+            continue
+        if _MANAGED_NGINX_OLD_READ_TIMEOUT not in original:
+            continue
+        if managed_marker not in original or backend_marker not in original:
+            bt.logging.warning(
+                f"Custom nginx config {path} retains a 120s read timeout; "
+                "set the proof-v3 upstream timeout to at least 360s"
+            )
+            continue
+        if original.count(_MANAGED_NGINX_OLD_READ_TIMEOUT) != 1:
+            bt.logging.warning(
+                f"Managed nginx config {path} has an ambiguous read timeout; "
+                "set the proof-v3 upstream timeout to at least 360s"
+            )
+            continue
+        updated = original.replace(
+            _MANAGED_NGINX_OLD_READ_TIMEOUT,
+            _MANAGED_NGINX_READ_TIMEOUT,
+            1,
+        )
+        try:
+            mode = path.stat().st_mode & 0o7777
+        except OSError as exc:
+            bt.logging.warning(
+                f"Could not inspect managed nginx config {path}: {exc}; "
+                "set it to at least 360s manually"
+            )
+            continue
+        if not _install_text(path, updated, mode):
+            bt.logging.warning(
+                f"Could not update managed nginx timeout in {path}; "
+                "passwordless sudo is required for a non-root official install"
+            )
+            continue
+        changed.append((path, original, mode))
+
+    if not changed:
+        return True
+
+    def _run_nginx(*args: str) -> subprocess.CompletedProcess:
+        prefix = ["sudo", "-n"] if use_sudo else []
+        return run_command(
+            [*prefix, "nginx", *args],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    try:
+        checked = _run_nginx("-t")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        checked = subprocess.CompletedProcess(
+            ["nginx", "-t"], 1, "", str(exc)
+        )
+    if checked.returncode != 0:
+        rollback_results = [
+            _install_text(path, original, mode)
+            for path, original, mode in changed
+        ]
+        rollback_ok = all(rollback_results)
+        bt.logging.warning(
+            "Managed nginx timeout migration failed validation and was rolled "
+            f"back{'' if rollback_ok else ' incompletely'}: "
+            f"{(checked.stderr or checked.stdout).strip()}"
+        )
+        return False
+
+    try:
+        reloaded = _run_nginx("-s", "reload")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        reloaded = subprocess.CompletedProcess(
+            ["nginx", "-s", "reload"], 1, "", str(exc)
+        )
+    if reloaded.returncode != 0:
+        bt.logging.warning(
+            "Managed nginx timeout was updated but nginx reload failed: "
+            f"{(reloaded.stderr or reloaded.stdout).strip()}"
+        )
+        return False
+
+    bt.logging.info(
+        "Updated the managed nginx upstream read timeout to 360s for "
+        "proof-v3 hard responses"
+    )
+    return True
 
 
 def _configured_miner_proof_protocol_versions(
@@ -117,9 +298,9 @@ class ProofV3ArtifactRefreshWatcher:
 
     A cheap chain-context-checked index probe runs on the steady-state path.
     A candidate change is fully downloaded and authenticated before a restart
-    is scheduled.  Hard proofs and capacity audits are never interrupted;
-    ordinary requests receive a bounded idle-window opportunity so sustained
-    traffic cannot suppress a required security-profile adoption forever.
+    is scheduled. Live inference, hard proofs, and capacity audits are never
+    interrupted; the authenticated update remains pending until the endpoint
+    reaches an idle adoption window.
     """
 
     def __init__(
@@ -132,9 +313,6 @@ class ProofV3ArtifactRefreshWatcher:
         restart: Callable[[], None],
         interval_seconds: float = PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS,
         retry_seconds: float = PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS,
-        max_active_deferral_seconds: float = (
-            PROOF_V3_ARTIFACT_REFRESH_MAX_ACTIVE_DEFERRAL_SECONDS
-        ),
     ) -> None:
         if (
             type(current_release_sha256) is not bytes
@@ -146,7 +324,7 @@ class ProofV3ArtifactRefreshWatcher:
             for value in (probe_release, resolve_release, busy_state, restart)
         ):
             raise ValueError("proof-v3 artifact refresh callbacks are invalid")
-        if min(interval_seconds, retry_seconds, max_active_deferral_seconds) <= 0:
+        if min(interval_seconds, retry_seconds) <= 0:
             raise ValueError("proof-v3 artifact refresh timing is invalid")
         self.current_release_sha256 = current_release_sha256
         self.probe_release = probe_release
@@ -155,7 +333,6 @@ class ProofV3ArtifactRefreshWatcher:
         self.restart = restart
         self.interval_seconds = float(interval_seconds)
         self.retry_seconds = float(retry_seconds)
-        self.max_active_deferral_seconds = float(max_active_deferral_seconds)
         self._pending_release_sha256: bytes | None = None
         self._pending_since: float | None = None
         self._restart_triggered = False
@@ -201,28 +378,16 @@ class ProofV3ArtifactRefreshWatcher:
         )
         if proof_pending > 0 or hard_exclusive or capacity_active:
             return "deferred_proof_or_audit"
-        pending_since = self._pending_since
-        if (
-            active_requests > 0
-            and pending_since is not None
-            and selected_now - pending_since
-            < self.max_active_deferral_seconds
-        ):
+        if active_requests > 0:
             return "deferred_active_requests"
         if self._stop_event.is_set():
             return "stopped"
 
         self._restart_triggered = True
-        if active_requests > 0:
-            bt.logging.warning(
-                "Proof-v3 artifact adoption reached its bounded ordinary-request "
-                "deferral; restarting onto the authenticated release"
-            )
-        else:
-            bt.logging.info(
-                "Proof-v3 artifact adoption window is idle; restarting onto "
-                "the authenticated release"
-            )
+        bt.logging.info(
+            "Proof-v3 artifact adoption window is idle; restarting onto "
+            "the authenticated release"
+        )
         try:
             self.restart()
         except BaseException:
@@ -1227,9 +1392,23 @@ class MinerNeuron:
                 capacity_active,
             )
         except Exception:
-            # A live but unreadable server gets the ordinary bounded deferral;
-            # it cannot suppress adoption indefinitely by hiding health.
+            # A live but unreadable server is treated as busy. Validators
+            # independently enforce the authenticated release, so update
+            # adoption never needs to destroy an honest in-flight request.
             return 1, 0, False, capacity_active
+
+    def _auto_update_busy(self, endpoint: str) -> bool:
+        """Never restart through live inference, proof, or capacity work."""
+
+        active, proof_pending, hard_exclusive, capacity_active = (
+            self._proof_v3_refresh_busy_state(endpoint)
+        )
+        return bool(
+            active > 0
+            or proof_pending > 0
+            or hard_exclusive
+            or capacity_active
+        )
 
     def start_proof_v3_artifact_refresh(
         self,
@@ -2359,6 +2538,7 @@ def main():
 
     args, server_args = parse_args()
     setup_neuron_logging(args)
+    _reconcile_managed_nginx_read_timeout()
     _clear_stale_compile_caches()
 
     # The updater executing the first v1 -> v3 fast-forward is still the old
@@ -2910,9 +3090,13 @@ def main():
     if args.auto_update:
         from neurons.auto_update import AutoUpdater
 
+        def _miner_busy() -> bool:
+            return neuron._auto_update_busy(local_health_url)
+
         updater = AutoUpdater(
             role="miner",
             check_interval=args.auto_update_interval,
+            busy_check=_miner_busy,
             jitter_seconds=args.auto_update_jitter,
             jitter_seed=neuron.hotkey_seed,
         )

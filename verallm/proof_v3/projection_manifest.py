@@ -7,7 +7,7 @@ validator checks miner reveals against.  It is:
   the roots are not secret.
 * TRUSTED only if signed by the subnet-owner authority (EVM ECDSA, the
   same key set that owns the contracts).  The signature is the sole trust
-  anchor, so the manifest can be hosted anywhere (prod1 API, R2, HF) with
+  anchor, so the manifest can be hosted anywhere (HTTPS, object storage, HF) with
   NO contract change -- a tampered copy fails signature verification.
 
 This closes the one gap in the recompute audit: the weight root the

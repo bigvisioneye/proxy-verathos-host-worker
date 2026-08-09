@@ -689,7 +689,38 @@ class AutoUpdater:
         self.jitter_seed = bytes(jitter_seed) if jitter_seed else b""
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._update_state_lock = threading.Lock()
         self._update_pending = False  # Set when update deferred due to busy
+        self._update_applying = False
+
+    @property
+    def drain_requested(self) -> bool:
+        """Whether the caller should stop admitting new restart-sensitive work."""
+
+        with self._update_state_lock:
+            return bool(self._update_pending or self._update_applying)
+
+    def _defer_update(self) -> None:
+        with self._update_state_lock:
+            self._update_applying = False
+            self._update_pending = True
+
+    def _clear_update(self) -> None:
+        with self._update_state_lock:
+            self._update_pending = False
+            self._update_applying = False
+
+    def _begin_update(self, *, require_pending: bool = False) -> bool:
+        """Atomically claim the single installer/restart lane."""
+
+        with self._update_state_lock:
+            if self._update_applying:
+                return False
+            if require_pending and not self._update_pending:
+                return False
+            self._update_pending = False
+            self._update_applying = True
+            return True
 
     @staticmethod
     def _default_install_extras(role: str) -> str:
@@ -751,19 +782,41 @@ class AutoUpdater:
         If an update was deferred, applies it immediately instead of waiting
         for the next check cycle.
         """
-        if not self._update_pending:
+        if not self.drain_requested:
+            return
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Deferred update notification arrived while process is still "
+                "busy — retaining it for the next idle window"
+            )
+            return
+        if not self._begin_update(require_pending=True):
             return
         bt.logging.info("Deferred update ready — applying now")
-        self._update_pending = False
         if not pull_and_install(
             install_extras=self.install_extras,
             install_proof_cuda=self.install_proof_cuda,
         ):
             bt.logging.error("Deferred update failed — will retry next cycle")
+            self._clear_update()
             return
         bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
-        time.sleep(self.restart_delay)
+        self._wait(self.restart_delay)
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Process became busy during deferred-update restart delay — "
+                "retaining update for the next idle window"
+            )
+            self._defer_update()
+            return
         self._stagger_sleep()
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Process became busy during update stagger — retaining update "
+                "for the next idle window"
+            )
+            self._defer_update()
+            return
         restart_process()
 
     def _stagger_sleep(self) -> None:
@@ -797,15 +850,17 @@ class AutoUpdater:
         # Check if we're busy
         if self.busy_check and self.busy_check():
             bt.logging.info("Process is busy — update scheduled for next idle window")
-            self._update_pending = True
+            self._defer_update()
             return
 
-        self._update_pending = False
+        if not self._begin_update():
+            return
         if not pull_and_install(
             install_extras=self.install_extras,
             install_proof_cuda=self.install_proof_cuda,
         ):
             bt.logging.error("Update failed — will retry next cycle")
+            self._clear_update()
             return
 
         bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
@@ -813,8 +868,14 @@ class AutoUpdater:
 
         if self.busy_check and self.busy_check():
             bt.logging.info("Process became busy during restart delay — deferring")
-            self._update_pending = True
+            self._defer_update()
             return
 
         self._stagger_sleep()
+        if self.busy_check and self.busy_check():
+            bt.logging.info(
+                "Process became busy during update stagger — deferring restart"
+            )
+            self._defer_update()
+            return
         restart_process()

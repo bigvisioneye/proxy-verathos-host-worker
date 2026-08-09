@@ -496,6 +496,7 @@ class RemoteProofV3ReleaseResolution:
     failures: Mapping[str, str]
     index_source_url: str
     canary_policy_path: Path | None = None
+    index_sha256: bytes = b""
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -508,6 +509,10 @@ class RemoteProofV3ReleaseResolution:
             "failures",
             MappingProxyType(dict(self.failures)),
         )
+        if type(self.index_sha256) is not bytes or len(self.index_sha256) != 32:
+            raise ProofV3ArtifactStoreError(
+                "proof-v3 artifact index SHA-256 must be exactly 32 bytes"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -523,6 +528,20 @@ class ProofV3ReleaseIndexProbe:
     release_sha256: bytes
     descriptor_sha256: bytes
     index_source_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProofV3ArtifactIndexProbe:
+    """Bounded change detector for one context-validated remote index."""
+
+    index_sha256: bytes
+    index_source_url: str
+
+    def __post_init__(self) -> None:
+        if type(self.index_sha256) is not bytes or len(self.index_sha256) != 32:
+            raise ProofV3ArtifactStoreError(
+                "proof-v3 artifact index SHA-256 must be exactly 32 bytes"
+            )
 
 
 def normalize_proof_v3_artifact_base_urls(
@@ -869,6 +888,40 @@ def resolve_remote_proof_v3_releases(
         failures=failures,
         index_source_url=source_url,
         canary_policy_path=canary_policy_path,
+        index_sha256=hashlib.sha256(index.canonical_json_bytes()).digest(),
+    )
+
+
+def probe_remote_proof_v3_index(
+    base_urls: Iterable[str],
+    *,
+    chain_config,
+    cache_directory: str | Path | None = None,
+    timeout_seconds: float = DEFAULT_PROOF_V3_ARTIFACT_TIMEOUT_SECONDS,
+) -> ProofV3ArtifactIndexProbe:
+    """Fetch and context-check only the bounded release index.
+
+    Equality with a previously fully authenticated index lets a running
+    validator retain its in-memory release snapshot without reloading large
+    catalogs. A changed digest is only a signal to run the complete resolver;
+    the index itself remains discovery metadata, never a trust anchor.
+    """
+
+    sources = normalize_proof_v3_artifact_base_urls(base_urls)
+    cache = proof_v3_artifact_cache_directory(
+        cache_directory,
+        chain_id=chain_config.chain_id,
+        netuid=chain_config.netuid,
+    )
+    index, source_url = _load_remote_index(
+        sources,
+        cache_directory=cache,
+        chain_config=chain_config,
+        timeout_seconds=timeout_seconds,
+    )
+    return ProofV3ArtifactIndexProbe(
+        index_sha256=hashlib.sha256(index.canonical_json_bytes()).digest(),
+        index_source_url=source_url,
     )
 
 
@@ -963,6 +1016,7 @@ __all__ = [
     "PROOF_V3_ARTIFACT_BASE_URLS_ENV",
     "PROOF_V3_ARTIFACT_CACHE_DIR_ENV",
     "PROOF_V3_ARTIFACT_INDEX_FILENAME",
+    "ProofV3ArtifactIndexProbe",
     "PROOF_V3_ARTIFACT_INDEX_SCHEMA",
     "PROOF_V3_ARTIFACT_INDEX_SCHEMA_V1",
     "ProofV3ArtifactIndex",
@@ -977,6 +1031,7 @@ __all__ = [
     "normalize_proof_v3_artifact_base_urls",
     "proof_v3_artifact_cache_directory",
     "probe_remote_proof_v3_release",
+    "probe_remote_proof_v3_index",
     "resolve_remote_proof_v3_release",
     "resolve_remote_proof_v3_releases",
 ]

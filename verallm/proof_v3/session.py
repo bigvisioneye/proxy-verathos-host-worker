@@ -56,7 +56,9 @@ from verallm.proof_v3.verifier import (
 
 DEFAULT_PROOF_ARRIVAL_BUDGET_NS_V3 = 1_000_000_000
 DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 = 300_000_000_000
-MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 = 300_000_000_000
+MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 = 480_000_000_000
+HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3 = 4096
+HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3 = 8192
 MAX_NONCE_REVEAL_HOLD_BUDGET_NS_V3 = 930_000_000_000
 _MAX_PAIRED_TIER_NONCE_ATTEMPTS_V3 = 4096
 NONCE_REVEAL_FORMAT_VERSION_V3 = 1
@@ -130,9 +132,43 @@ def _hard_arrival_budget_ns(value: int) -> int:
     ):
         raise ProofV3VerificationError(
             "hard_proof_arrival_budget_ns must be between one nanosecond "
-            "and five minutes"
+            "and eight minutes"
         )
     return value
+
+
+def hard_proof_arrival_budget_for_decode_v3(decode_tokens: int) -> int:
+    """Return the bounded validator deadline for one authenticated geometry."""
+
+    if (
+        isinstance(decode_tokens, bool)
+        or not isinstance(decode_tokens, int)
+        or decode_tokens <= 0
+    ):
+        raise ProofV3VerificationError(
+            "hard-proof decode token count must be a positive integer"
+        )
+    if decode_tokens > HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3:
+        raise ProofV3VerificationError(
+            "hard-proof decode token count exceeds the qualified deadline geometry"
+        )
+    if decode_tokens <= HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3:
+        return DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
+    token_span = (
+        HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3
+        - HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3
+    )
+    extension_span = (
+        MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
+        - DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
+    )
+    extension_tokens = (
+        decode_tokens - HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3
+    )
+    extension_ns = (
+        extension_tokens * extension_span + token_span - 1
+    ) // token_span
+    return DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 + extension_ns
 
 
 def _nonce_reveal_hold_budget_ns(value: int | None) -> int | None:
@@ -906,8 +942,9 @@ class ProofV3ChallengeSession:
                 "proof-v3 session has no accepted precommit to select"
             )
         try:
-            selected = self._require_arrival_before_deadline_locked(
-                selected_monotonic_ns
+            selected = _monotonic_ns(
+                selected_monotonic_ns,
+                "selected_monotonic_ns",
             )
             if (
                 self._precommit_received_monotonic_ns is None
@@ -952,6 +989,19 @@ class ProofV3ChallengeSession:
                     "proof-v3 nonce-reveal hold deadline overflows"
                 )
             self._deadline_monotonic_ns = hold_deadline
+            self._require_arrival_before_deadline_locked(selected)
+        else:
+            # Tier selection is validator-local work after the peer has met
+            # its precommit deadline. Give the immediately following local
+            # nonce serialization its own bounded window instead of reusing
+            # the already-consumed peer arrival deadline.
+            reveal_deadline = selected + DEFAULT_PROOF_ARRIVAL_BUDGET_NS_V3
+            if reveal_deadline >= 1 << 63:
+                self._fail_locked(state=ChallengeSessionStateV3.FAILED)
+                raise ProofV3VerificationError(
+                    "proof-v3 local nonce-reveal deadline overflows"
+                )
+            self._deadline_monotonic_ns = reveal_deadline
         self._state = ChallengeSessionStateV3.HARD_SELECTED
         return decision
 
@@ -1194,6 +1244,8 @@ __all__ = [
     "ChallengeSessionStateV3",
     "DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3",
     "DEFAULT_PROOF_ARRIVAL_BUDGET_NS_V3",
+    "HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3",
+    "HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3",
     "MAX_NONCE_REVEAL_HOLD_BUDGET_NS_V3",
     "MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3",
     "MAX_NONCE_REVEAL_BYTES_V3",
@@ -1201,4 +1253,5 @@ __all__ = [
     "NonceRevealV3",
     "ProofV3ChallengeSession",
     "QualifiedExecutionProfileV3",
+    "hard_proof_arrival_budget_for_decode_v3",
 ]

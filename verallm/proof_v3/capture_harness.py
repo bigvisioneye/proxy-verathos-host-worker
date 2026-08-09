@@ -109,16 +109,6 @@ def _reduction_capture_mode_v3(
 
     qkv_buffer_mode = bool(qkv._use_buffer)
     output_buffer_mode = bool(output._use_buffer)
-    # A shared row-index tensor makes these bounded buffers a gather layout
-    # even when the wrappers use their graph-integrated buffer backend.  The
-    # backend flag describes how values cross the CUDA graph; it does not mean
-    # the destination contains every scheduler row.
-    if row_indices is not None:
-        if qkv_output_buffer is None or o_input_buffer is None:
-            raise RuntimeError(
-                "selected-row reduction capture is incomplete"
-            )
-        return "gather"
     selected_row_capture = (
         qkv_output_buffer is not None or o_input_buffer is not None
     )
@@ -142,6 +132,27 @@ def _reduction_capture_mode_v3(
         raise RuntimeError(
             "buffer-mode reduction capture lacks canonical buffers"
         )
+    # A backend may deliberately mix a whole-step QKV destination with a
+    # selected-row o-projection destination.  The shared index merely
+    # identifies gathered destinations; it does not make every registered
+    # buffer a gather layout.  Preserve the wrappers' actual layouts exactly
+    # as production server registration does, without GPU/quant branching.
+    qkv_selected = getattr(qkv, "_capture_row_indices", None) is not None
+    output_selected = (
+        getattr(output, "_capture_row_indices", None) is not None
+    )
+    if row_indices is not None:
+        if qkv_output_buffer is None or o_input_buffer is None:
+            raise RuntimeError(
+                "selected-row reduction capture is incomplete"
+            )
+        if not qkv_selected and not output_selected:
+            raise RuntimeError(
+                "selected-row reduction capture has no gathered buffer"
+            )
+        if qkv_selected and output_selected:
+            return "gather"
+        return "mixed"
     return "buffer"
 
 
@@ -430,21 +441,28 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
                     )
                 )
                 continue
-            if mode == "gather":
+            if mode in ("gather", "mixed"):
                 tr.register_capture_row_indices(row_indices)
+            qkv_whole_step = (
+                getattr(qkv, "_capture_row_indices", None) is None
+            )
+            o_whole_step = (
+                getattr(wrappers["o"], "_capture_row_indices", None)
+                is None
+            )
             reduction_buffers.extend(
                 (
                     (
                         layer,
                         "attention_qkv_output",
                         output,
-                        mode == "buffer",
+                        qkv_whole_step,
                     ),
                     (
                         layer,
                         "attention_o_input",
                         o_input,
-                        mode == "buffer",
+                        o_whole_step,
                     ),
                 )
             )
@@ -462,7 +480,7 @@ def build_capture_miner(model_path: str, *, gpu_mem: float = 0.55,
                     alias_layer,
                     alias_suffix,
                     alias_buffer,
-                    mode == "buffer",
+                    qkv_whole_step,
                 )
                 for alias_layer, alias_suffix, alias_buffer in kv_aliases
             )

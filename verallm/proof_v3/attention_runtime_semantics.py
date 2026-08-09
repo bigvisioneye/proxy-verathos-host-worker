@@ -19,9 +19,13 @@ from dataclasses import dataclass
 from verallm.proof_v3.errors import ProofV3Error, ProofV3VerificationError
 
 ATTENTION_RUNTIME_SEMANTICS_VERSION_V3 = 2
+ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3 = 3
 ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3 = 1
 ATTENTION_RUNTIME_SEMANTICS_ABI_V3 = (
     "attention.runtime_semantics.anchor_kv.v2"
+)
+ATTENTION_RUNTIME_SEMANTICS_ULP_ABI_V3 = (
+    "attention.runtime_semantics.anchor_kv.v3"
 )
 ATTENTION_RUNTIME_SEMANTICS_LEGACY_ABI_V3 = (
     "attention.runtime_semantics.anchor_kv.v1"
@@ -34,6 +38,7 @@ NEOX_ROPE_V3 = "neox.v1"
 LOGICAL_PAGED_KV_V3 = "paged_kv.logical.v1"
 
 _DOMAIN = b"VERATHOS/PROOF_V3/ATTENTION_RUNTIME_SEMANTICS/V2"
+_ULP_DOMAIN = b"VERATHOS/PROOF_V3/ATTENTION_RUNTIME_SEMANTICS/V3"
 _LEGACY_DOMAIN = b"VERATHOS/PROOF_V3/ATTENTION_RUNTIME_SEMANTICS/V1"
 _LAYOUTS = frozenset(
     {QKV_CONTIGUOUS_LAYOUT_V3, Q_GATE_INTERLEAVED_LAYOUT_V3}
@@ -44,6 +49,8 @@ __all__ = [
     "ATTENTION_RUNTIME_SEMANTICS_ABI_V3",
     "ATTENTION_RUNTIME_SEMANTICS_LEGACY_ABI_V3",
     "ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3",
+    "ATTENTION_RUNTIME_SEMANTICS_ULP_ABI_V3",
+    "ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3",
     "ATTENTION_RUNTIME_SEMANTICS_VERSION_V3",
     "AttentionRuntimeSemanticsV3",
     "AttentionNormBindingV3",
@@ -108,6 +115,7 @@ class AttentionRuntimeSemanticsV3:
     norm_encoding_id: str = "bf16.v1"
     norm_bindings: tuple[AttentionNormBindingV3, ...] = ()
     integer_tolerance: int = 0
+    runtime_ulp_tolerance: int = 0
     rope_coefficient_row_count: int = 0
     rope_coefficient_encoding_id: str = ""
     rope_coefficient_bytes: bytes = b""
@@ -118,6 +126,7 @@ class AttentionRuntimeSemanticsV3:
             self.version not in {
                 ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3,
                 ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
+                ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3,
             }
             or not isinstance(self.adapter_id, str)
             or not self.adapter_id
@@ -136,6 +145,9 @@ class AttentionRuntimeSemanticsV3:
             or isinstance(self.integer_tolerance, bool)
             or not isinstance(self.integer_tolerance, int)
             or not 0 <= self.integer_tolerance <= 2
+            or isinstance(self.runtime_ulp_tolerance, bool)
+            or not isinstance(self.runtime_ulp_tolerance, int)
+            or not 0 <= self.runtime_ulp_tolerance <= 2
         ):
             raise ProofV3Error("attention runtime semantics are malformed")
         coefficient_size = (
@@ -153,7 +165,16 @@ class AttentionRuntimeSemanticsV3:
                     "legacy attention runtime semantics carry RoPE "
                     "coefficients"
                 )
-        elif (
+        if (
+            self.version != ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3
+            and self.runtime_ulp_tolerance != 0
+        ):
+            raise ProofV3Error(
+                "legacy attention runtime semantics carry a ULP tolerance"
+            )
+        if (
+            self.version != ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3
+            and (
             isinstance(self.rope_coefficient_row_count, bool)
             or not isinstance(self.rope_coefficient_row_count, int)
             or self.rope_coefficient_row_count < 1
@@ -162,6 +183,7 @@ class AttentionRuntimeSemanticsV3:
             not in {"fp16.v1", "bf16.v1"}
             or not isinstance(self.rope_coefficient_bytes, bytes)
             or len(self.rope_coefficient_bytes) != coefficient_size
+            )
         ):
             raise ProofV3Error(
                 "attention runtime RoPE coefficient table is malformed"
@@ -219,11 +241,16 @@ class AttentionRuntimeSemanticsV3:
         legacy = (
             self.version == ATTENTION_RUNTIME_SEMANTICS_LEGACY_VERSION_V3
         )
+        ulp = self.version == ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3
         fields = (
             (
                 ATTENTION_RUNTIME_SEMANTICS_LEGACY_ABI_V3
                 if legacy
-                else ATTENTION_RUNTIME_SEMANTICS_ABI_V3
+                else (
+                    ATTENTION_RUNTIME_SEMANTICS_ULP_ABI_V3
+                    if ulp
+                    else ATTENTION_RUNTIME_SEMANTICS_ABI_V3
+                )
             ),
             self.adapter_id,
             self.qkv_layout_id,
@@ -253,7 +280,7 @@ class AttentionRuntimeSemanticsV3:
                 )
             )
         result = (
-            (_LEGACY_DOMAIN if legacy else _DOMAIN)
+            (_LEGACY_DOMAIN if legacy else (_ULP_DOMAIN if ulp else _DOMAIN))
             + struct.pack(
                 "<IIQQQI",
                 self.version,
@@ -270,6 +297,11 @@ class AttentionRuntimeSemanticsV3:
                 ),
                 _float_bits(self.rope_theta, "rope_theta", positive=True),
                 self.integer_tolerance,
+            )
+            + (
+                struct.pack("<I", self.runtime_ulp_tolerance)
+                if ulp
+                else b""
             )
             + b"".join(encoded)
             + b"".join(norm_payload)
@@ -306,6 +338,11 @@ def dump_attention_runtime_semantics_v3(
         "cache_layout_id": semantics.cache_layout_id,
         "digest": semantics.digest().hex(),
         "integer_tolerance": semantics.integer_tolerance,
+        **(
+            {"runtime_ulp_tolerance": semantics.runtime_ulp_tolerance}
+            if semantics.version == ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3
+            else {}
+        ),
         "k_norm_epsilon": semantics.k_norm_epsilon,
         "k_norm_id": semantics.k_norm_id,
         "q_norm_epsilon": semantics.q_norm_epsilon,
@@ -336,7 +373,10 @@ def dump_attention_runtime_semantics_v3(
                 ).decode("ascii"),
             }
             if semantics.version
-            == ATTENTION_RUNTIME_SEMANTICS_VERSION_V3
+            in {
+                ATTENTION_RUNTIME_SEMANTICS_VERSION_V3,
+                ATTENTION_RUNTIME_SEMANTICS_ULP_VERSION_V3,
+            }
             else {}
         ),
         "version": semantics.version,
@@ -385,6 +425,7 @@ def load_attention_runtime_semantics_v3(
                 for item in obj.get("norm_bindings", ())
             ),
             integer_tolerance=int(obj.get("integer_tolerance", 0)),
+            runtime_ulp_tolerance=int(obj.get("runtime_ulp_tolerance", 0)),
             rope_coefficient_row_count=int(
                 obj.get("rope_coefficient_row_count", 0)
             ),

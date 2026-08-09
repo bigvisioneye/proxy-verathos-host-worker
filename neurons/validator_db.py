@@ -840,6 +840,86 @@ class ValidatorStateDB:
             self._conn.commit()
             return cursor.rowcount
 
+    def reset_operational_probation_state(
+        self,
+        generation: int,
+        *,
+        effective_epoch: int,
+        hard_failure_strikes_json: str,
+    ) -> dict:
+        """Apply one monotonic, network-coordinated probation reset.
+
+        Scores and historical audit evidence are retained.  Pending capacity
+        consequences observed before this reset are consumed so they cannot
+        immediately recreate the cleared probation state.
+        """
+
+        target = int(generation)
+        reset_epoch = int(effective_epoch)
+        if target < 0:
+            raise ValueError("probation state generation must be non-negative")
+        if reset_epoch < 0:
+            raise ValueError("probation reset effective epoch must be non-negative")
+        now = time.time()
+        generation_key = "proof_v3_probation_state_generation_v1"
+        with self._lock:
+            raw_current = self._raw_get_meta(generation_key)
+            current = int(raw_current or 0)
+            if target <= current:
+                return {
+                    "applied": False,
+                    "previous_generation": current,
+                    "generation": current,
+                    "probation_entries_cleared": 0,
+                    "capacity_events_consumed": 0,
+                }
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                probation = self._conn.execute(
+                    """UPDATE miner_entries SET
+                           probation_entered_epoch = NULL,
+                           probation_consecutive_passes = 0,
+                           updated_at = ?
+                       WHERE probation_entered_epoch IS NOT NULL""",
+                    (now,),
+                ).rowcount or 0
+                capacity = self._conn.execute(
+                    """UPDATE capacity_audit_slots SET
+                           probation_applied_at = ?,
+                           updated_at = ?
+                       WHERE probation_required != 0
+                         AND probation_applied_at IS NULL""",
+                    (now, now),
+                ).rowcount or 0
+                for key, value in (
+                    (
+                        "proof_v3_hard_failure_strikes_v1",
+                        str(hard_failure_strikes_json),
+                    ),
+                    ("proof_v3_probation_recovery_source_epochs_v1", "{}"),
+                    (
+                        "proof_v3_probation_state_reset_effective_epoch_v1",
+                        str(reset_epoch),
+                    ),
+                    (generation_key, str(target)),
+                ):
+                    self._conn.execute(
+                        """INSERT OR REPLACE INTO validator_meta
+                               (key, value) VALUES (?, ?)""",
+                        (key, value),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return {
+            "applied": True,
+            "previous_generation": current,
+            "generation": target,
+            "probation_entries_cleared": int(probation),
+            "capacity_events_consumed": int(capacity),
+        }
+
     def get_active_entries(self) -> List[dict]:
         """Return all active miner-model entries as dicts."""
         with self._lock:

@@ -73,6 +73,15 @@ class NeuronConfig(ChainConfig):
     # Probation (proof failure penalty)
     probation_required_passes: int = 3  # consecutive clean epochs to exit probation
     probation_escalation_epochs: int = 5  # epochs on probation before reportOffline
+    # Owner runtime policy for proof-v3 hard-audit failures.  The hosted
+    # subnet config is authoritative; these conservative values are the
+    # local fallback when that config is unavailable.
+    proof_v3_failure_epochs_for_penalty: int = 1
+    proof_v3_failure_clean_epochs_for_reset: int = 3
+    # Monotonic, owner-controlled generation used for a one-time network-wide
+    # operational probation reset.  It is intentionally not exposed as an
+    # environment knob; only the owner-hosted subnet config may advance it.
+    proof_v3_probation_state_generation: int = 0
 
     # Demand bonus
     demand_bonus_enabled: bool = True  # enable per-model demand bonus
@@ -200,6 +209,8 @@ class NeuronConfig(ChainConfig):
             "canary_proof_sample_rate": "VERATHOS_CANARY_PROOF_SAMPLE_RATE",
             "probation_required_passes": "VERATHOS_PROBATION_PASSES",
             "probation_escalation_epochs": "VERATHOS_PROBATION_ESCALATION",
+            "proof_v3_failure_epochs_for_penalty": "VERATHOS_PROOF_V3_FAILURE_EPOCHS_FOR_PENALTY",
+            "proof_v3_failure_clean_epochs_for_reset": "VERATHOS_PROOF_V3_FAILURE_CLEAN_EPOCHS_FOR_RESET",
             "set_weights_epoch_blocks": "VERATHOS_SET_WEIGHTS_EPOCH",
             "demand_bonus_max": "VERATHOS_DEMAND_BONUS_MAX",
             "demand_bonus_enabled": "VERATHOS_DEMAND_BONUS_ENABLED",
@@ -293,6 +304,8 @@ class NeuronConfig(ChainConfig):
             "canary_full_context_count", "set_weights_epoch_blocks",
             "price_feed_cache_ttl",
             "probation_required_passes", "probation_escalation_epochs",
+            "proof_v3_failure_epochs_for_penalty",
+            "proof_v3_failure_clean_epochs_for_reset",
             "capacity_audit_ingest_port", "capacity_audit_cohort_min",
             "capacity_audit_cohort_max", "capacity_audit_windows_per_epoch",
             "capacity_audit_group_stress_min_size",

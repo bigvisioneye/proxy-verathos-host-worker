@@ -73,6 +73,15 @@ class ProofV3HardAuditorConfig:
 
 
 @dataclass(frozen=True)
+class ProofV3FailurePolicyConfig:
+    """Operational consequence policy for miner-attributable hard failures."""
+
+    failure_epochs_for_penalty: int = 1
+    clean_hard_audit_epochs_for_reset: int = 3
+    probation_state_generation: int = 0
+
+
+@dataclass(frozen=True)
 class RuntimeSubnetConfig:
     schema_version: int
     version: int
@@ -98,6 +107,7 @@ class RuntimeSubnetConfig:
     capacity_audit_proof_verify_workers: int
     proof_protocol_rollout: ProofProtocolRolloutConfig
     proof_v3_hard_auditor: ProofV3HardAuditorConfig
+    proof_v3_failure_policy: ProofV3FailurePolicyConfig
     maintenance_grace: MaintenanceGraceConfig
     payload: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
     source: str = ""
@@ -319,6 +329,63 @@ def _proof_v3_hard_auditor_to_dict(
     row: ProofV3HardAuditorConfig,
 ) -> dict[str, Any]:
     return dict(asdict(row))
+
+
+def _proof_v3_failure_policy_to_dict(
+    row: ProofV3FailurePolicyConfig,
+) -> dict[str, Any]:
+    return dict(asdict(row))
+
+
+def _parse_proof_v3_failure_policy(
+    payload: Mapping[str, Any],
+) -> ProofV3FailurePolicyConfig:
+    raw = payload.get("proof_v3_failure_policy")
+    if raw is None:
+        # An older hosted config must retain the historical immediate-penalty
+        # behavior rather than silently granting a neutral strike.
+        return ProofV3FailurePolicyConfig()
+    if not isinstance(raw, Mapping):
+        raise SubnetRuntimeConfigError(
+            "proof_v3_failure_policy must be an object"
+        )
+    unknown = set(raw).difference(
+        {
+            "failure_epochs_for_penalty",
+            "clean_hard_audit_epochs_for_reset",
+            "probation_state_generation",
+        }
+    )
+    if unknown:
+        raise SubnetRuntimeConfigError(
+            "proof_v3_failure_policy contains unsupported fields: "
+            + ", ".join(sorted(unknown))
+        )
+    generation = raw.get("probation_state_generation", 0)
+    _reject_bool(generation, "probation_state_generation")
+    if not isinstance(generation, int):
+        raise SubnetRuntimeConfigError(
+            "probation_state_generation must be an integer"
+        )
+    if not 0 <= generation <= 2**31 - 1:
+        raise SubnetRuntimeConfigError(
+            "probation_state_generation must be in [0, 2147483647]"
+        )
+    return ProofV3FailurePolicyConfig(
+        failure_epochs_for_penalty=_require_int(
+            raw,
+            "failure_epochs_for_penalty",
+            minimum=1,
+            maximum=10,
+        ),
+        clean_hard_audit_epochs_for_reset=_require_int(
+            raw,
+            "clean_hard_audit_epochs_for_reset",
+            minimum=1,
+            maximum=100,
+        ),
+        probation_state_generation=int(generation),
+    )
 
 
 def _parse_proof_v3_hard_auditor(
@@ -618,6 +685,9 @@ def build_default_subnet_config_payload(
         "proof_v3_hard_auditor": _proof_v3_hard_auditor_to_dict(
             proof_v3_hard_auditor_config_from_neuron_config(neuron_config)
         ),
+        "proof_v3_failure_policy": _proof_v3_failure_policy_to_dict(
+            proof_v3_failure_policy_config_from_neuron_config(neuron_config)
+        ),
         "maintenance_grace": _maintenance_grace_to_dict(
             maintenance_grace_config_from_neuron_config(neuron_config)
         ),
@@ -780,6 +850,7 @@ def validate_subnet_config_payload(
     proof_verify_workers = _require_int(audit_data, "proof_verify_workers", minimum=1)
     proof_protocol_rollout = _parse_proof_protocol_rollout(payload)
     proof_v3_hard_auditor = _parse_proof_v3_hard_auditor(payload)
+    proof_v3_failure_policy = _parse_proof_v3_failure_policy(payload)
     maintenance_grace = _parse_maintenance_grace(payload)
 
     normalized = build_default_subnet_config_payload(
@@ -849,6 +920,9 @@ def validate_subnet_config_payload(
     normalized["proof_v3_hard_auditor"] = _proof_v3_hard_auditor_to_dict(
         proof_v3_hard_auditor
     )
+    normalized["proof_v3_failure_policy"] = (
+        _proof_v3_failure_policy_to_dict(proof_v3_failure_policy)
+    )
     normalized["maintenance_grace"] = _maintenance_grace_to_dict(maintenance_grace)
 
     return RuntimeSubnetConfig(
@@ -876,6 +950,7 @@ def validate_subnet_config_payload(
         capacity_audit_proof_verify_workers=proof_verify_workers,
         proof_protocol_rollout=proof_protocol_rollout,
         proof_v3_hard_auditor=proof_v3_hard_auditor,
+        proof_v3_failure_policy=proof_v3_failure_policy,
         maintenance_grace=maintenance_grace,
         payload=normalized,
         source=source,
@@ -971,6 +1046,16 @@ def apply_runtime_config_to_neuron_config(
     config.proof_v3_hard_auditor_hotkey_ss58 = (
         hard_auditor.validator_hotkey_ss58
     )
+    failure_policy = runtime.proof_v3_failure_policy
+    config.proof_v3_failure_epochs_for_penalty = (
+        failure_policy.failure_epochs_for_penalty
+    )
+    config.proof_v3_failure_clean_epochs_for_reset = (
+        failure_policy.clean_hard_audit_epochs_for_reset
+    )
+    config.proof_v3_probation_state_generation = (
+        failure_policy.probation_state_generation
+    )
     grace = runtime.maintenance_grace
     config.maintenance_grace_enabled = grace.enabled
     config.maintenance_grace_open_ended = grace.open_ended
@@ -1045,6 +1130,22 @@ def proof_v3_hard_auditor_config_from_neuron_config(
                 "",
             )
             or ""
+        ),
+    )
+
+
+def proof_v3_failure_policy_config_from_neuron_config(
+    config: Any,
+) -> ProofV3FailurePolicyConfig:
+    return ProofV3FailurePolicyConfig(
+        failure_epochs_for_penalty=int(
+            getattr(config, "proof_v3_failure_epochs_for_penalty", 1)
+        ),
+        clean_hard_audit_epochs_for_reset=int(
+            getattr(config, "proof_v3_failure_clean_epochs_for_reset", 3)
+        ),
+        probation_state_generation=int(
+            getattr(config, "proof_v3_probation_state_generation", 0)
         ),
     )
 

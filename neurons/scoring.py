@@ -117,6 +117,12 @@ class EpochOutcome:
     # Proof verification outcomes (from own receipts where proof_requested=True)
     proof_tests: int = 0  # number of receipts where proof was requested
     proof_failures: int = 0  # number where proof was requested but failed
+    # Raw proof failures remain recorded above.  This bit is the separately
+    # configured operational decision for the current source epoch.
+    proof_failure_penalty_required: bool = True
+    # Failed hard receipts granted a neutral first strike must not make the
+    # exact obligation inventory malformed, and must not earn throughput.
+    neutral_hard_obligation_ids: Set[bytes] = field(default_factory=set)
 
     # TEE attestation outcomes (from own receipts where tee_attestation_verified is set)
     tee_tests: int = 0
@@ -344,6 +350,8 @@ def compute_epoch_entry_score(
             obligation_id = bytes(
                 getattr(receipt, "canary_obligation_id", b"") or b""
             )
+            if obligation_id in outcome.neutral_hard_obligation_ids:
+                continue
             if not receipt.is_canary:
                 continue
             expected_item = expected_obligations.get(obligation_id)
@@ -405,7 +413,11 @@ def compute_epoch_entry_score(
     # Use INFO not WARNING — the validator did its job correctly, the
     # miner is the one with the problem.  Operators don't need to be
     # paged for cheating / faulty miners.
-    if outcome.proof_tests > 0 and outcome.proof_failures > 0:
+    if (
+        outcome.proof_tests > 0
+        and outcome.proof_failures > 0
+        and outcome.proof_failure_penalty_required
+    ):
         action = "score update suppressed" if suppress_hard_failures else "score=0"
         bt.logging.info(f"Proof verification failure for {_who} model_index={outcome.model_index}: {outcome.proof_failures}/{outcome.proof_tests} proofs failed -> {action}")
         return None if suppress_hard_failures else 0.0
@@ -1178,6 +1190,14 @@ class ProbationTracker:
         if stale_keys:
             self._save()
         return len(stale_keys)
+
+    def clear_all(self) -> int:
+        """Clear all operational probation entries and persist once."""
+
+        count = len(self._probation)
+        self._probation.clear()
+        self._save()
+        return count
 
     def _save(self) -> None:
         """Persist probation state to disk (atomic write)."""
