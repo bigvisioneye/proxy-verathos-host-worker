@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 from typing import Any, AsyncIterator, Optional
 from urllib.parse import urlencode
@@ -39,6 +40,35 @@ _health_cache_at: float = 0.0
 _health_cache_data: Optional[dict] = None
 _health_cache_lock: Optional[asyncio.Lock] = None
 
+# --- Local load balancer -------------------------------------------------
+# The central balancer /pick sits on one VPS, so every forwarded request paid a
+# WAN round trip just to learn which upstream to use (measured: 46ms from EU,
+# 590ms from Vietnam). httpx's keepalive_expiry is 5s but canaries arrive ~215s
+# apart, so 98% of those picks also paid a cold TCP handshake.
+#
+# With the local balancer the proxy keeps its own view: the endpoint registry is
+# refreshed from the central monitor in the background (off the request path),
+# per-upstream load comes from each upstream's own /health, and selection happens
+# in-process. Set PROXY_LOCAL_BALANCER=0 to fall back to the central /pick.
+LOCAL_LB_ENABLED = str(os.environ.get("PROXY_LOCAL_BALANCER", "1")).strip() not in ("0", "false", "no", "")
+# How often to re-read the upstream list from the central monitor.
+REGISTRY_REFRESH_S = float(os.environ.get("PROXY_LB_REGISTRY_S", "60") or 60)
+# How often to re-probe each upstream's /health for load + RTT.
+HEALTH_PROBE_S = float(os.environ.get("PROXY_LB_PROBE_S", "5") or 5)
+# An upstream whose last successful probe is older than this is not selectable.
+STALE_AFTER_S = float(os.environ.get("PROXY_LB_STALE_S", "45") or 45)
+# RTT weighting: ms of latency treated as equivalent to one queued request. Keeps
+# a near-but-busy server from always losing to a far-but-idle one.
+RTT_MS_PER_SLOT = float(os.environ.get("PROXY_LB_RTT_PER_SLOT", "120") or 120)
+
+_registry: dict[str, dict] = {}
+_registry_at: float = 0.0
+_lb_tasks_started: bool = False
+_last_pick_api_key: str = ""
+_lb_rr: int = 0
+
+_upstream_client: Optional[httpx.AsyncClient] = None
+
 
 def _aux() -> httpx.AsyncClient:
     global _aux_client
@@ -46,9 +76,35 @@ def _aux() -> httpx.AsyncClient:
         _aux_client = httpx.AsyncClient(
             verify=proxy_state.verify_upstream_ssl,
             timeout=10.0,
-            limits=httpx.Limits(max_keepalive_connections=8, max_connections=32),
+            limits=httpx.Limits(
+                max_keepalive_connections=8,
+                max_connections=32,
+                keepalive_expiry=300.0,
+            ),
         )
     return _aux_client
+
+
+def _upstream() -> httpx.AsyncClient:
+    """Pooled client for forwarded inference requests.
+
+    This used to be constructed per request, which meant a fresh TCP handshake to
+    the inference GPU on every call (27ms same-continent, ~200ms cross-ocean).
+    The pool is process-lived — callers must close the *response*, never this
+    client.
+    """
+    global _upstream_client
+    if _upstream_client is None or _upstream_client.is_closed:
+        _upstream_client = httpx.AsyncClient(
+            verify=proxy_state.verify_upstream_ssl,
+            timeout=None,
+            limits=httpx.Limits(
+                max_keepalive_connections=32,
+                max_connections=256,
+                keepalive_expiry=300.0,
+            ),
+        )
+    return _upstream_client
 
 
 def _health_lock() -> asyncio.Lock:
@@ -340,6 +396,166 @@ def _validator_hotkey(request: Optional[Request]) -> str:
     return str(request.headers.get("X-Validator-Hotkey", "") or "").strip()
 
 
+async def _refresh_registry() -> None:
+    """Re-read the upstream list from the central monitor.
+
+    The monitor stays the source of truth for *which* GPUs exist; only the
+    per-request selection moves local. Runs off the request path, so its latency
+    never reaches a validator.
+    """
+    global _registry, _registry_at
+    if not proxy_state.balancer_base:
+        return
+    url = f"{proxy_state.balancer_base}/gpus-dashboard"
+    resp = await _aux().get(url, headers=_balancer_headers(), timeout=10.0)
+    resp.raise_for_status()
+    data = resp.json() or {}
+    rows = data.get("rows") or data.get("gpus") or []
+    seen: set[str] = set()
+    for row in rows:
+        endpoint = str(row.get("endpoint") or "").rstrip("/")
+        if not endpoint:
+            continue
+        seen.add(endpoint)
+        entry = _registry.setdefault(endpoint, {})
+        entry["endpoint"] = endpoint
+        entry.setdefault("rtt_ms", 0.0)
+        entry.setdefault("active", 0)
+        entry.setdefault("ok", False)
+        entry.setdefault("last_ok", 0.0)
+    for endpoint in list(_registry):
+        if endpoint not in seen:
+            _registry.pop(endpoint, None)
+    _registry_at = time.monotonic()
+
+
+async def _probe_upstream(endpoint: str) -> None:
+    """Probe one upstream's /health for load, model identity and RTT."""
+    entry = _registry.get(endpoint)
+    if entry is None:
+        return
+    started = time.monotonic()
+    try:
+        # Send the proxy key: /health is public but rate-limited per source IP
+        # (60/min), and behind Docker NAT every proxy shares one IP. The keyed
+        # path is treated as a trusted proxy and skips the public limiter.
+        headers: dict[str, str] = {}
+        if proxy_state.proxy_llm_key:
+            headers[PROXY_LLM_HEADER] = proxy_state.proxy_llm_key
+        resp = await _aux().get(
+            f"{endpoint}/health", timeout=HEALTH_FETCH_TIMEOUT_S, headers=headers,
+        )
+        resp.raise_for_status()
+        body = resp.json() or {}
+    except Exception:
+        entry["ok"] = False
+        return
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    prev = float(entry.get("rtt_ms") or 0.0)
+    # EWMA so one slow probe doesn't swing routing.
+    entry["rtt_ms"] = elapsed_ms if prev <= 0 else (0.7 * prev + 0.3 * elapsed_ms)
+    entry["model"] = str(body.get("model") or "")
+    entry["active"] = int(body.get("active_requests") or 0)
+    entry["max_requests"] = int(body.get("max_requests") or 0)
+    entry["can_accept"] = bool(body.get("can_accept_max_context", True))
+    entry["ok"] = str(body.get("status") or "") == "ok"
+    if entry["ok"]:
+        entry["last_ok"] = time.monotonic()
+
+
+async def _lb_loop() -> None:
+    """Background maintenance: registry refresh + health probes."""
+    last_registry = 0.0
+    while True:
+        try:
+            now = time.monotonic()
+            if now - last_registry >= REGISTRY_REFRESH_S or not _registry:
+                try:
+                    await _refresh_registry()
+                    last_registry = now
+                except Exception as exc:
+                    logger.debug("proxy lb registry refresh failed: %s", exc)
+            if _registry:
+                await asyncio.gather(
+                    *(_probe_upstream(ep) for ep in list(_registry)),
+                    return_exceptions=True,
+                )
+        except Exception as exc:  # never let the loop die
+            logger.debug("proxy lb loop error: %s", exc)
+        await asyncio.sleep(HEALTH_PROBE_S)
+
+
+def _ensure_lb_started() -> None:
+    global _lb_tasks_started
+    if _lb_tasks_started or not LOCAL_LB_ENABLED or not proxy_state.balancer_base:
+        return
+    try:
+        asyncio.get_running_loop().create_task(_lb_loop())
+        _lb_tasks_started = True
+        logger.info(
+            "proxy local balancer enabled: registry=%.0fs probe=%.0fs rtt_per_slot=%.0fms",
+            REGISTRY_REFRESH_S, HEALTH_PROBE_S, RTT_MS_PER_SLOT,
+        )
+    except RuntimeError:
+        pass  # no loop yet; retried on the next request
+
+
+def _lb_candidates() -> list[dict]:
+    now = time.monotonic()
+    want = (proxy_state.model_id or "").strip()
+    out = []
+    for entry in _registry.values():
+        if not entry.get("ok") or now - float(entry.get("last_ok") or 0.0) > STALE_AFTER_S:
+            continue
+        # Match on the upstream's self-reported model, not the monitor's
+        # normalized label — the monitor shortens the id and drops the org.
+        if want and entry.get("model") and entry["model"] != want:
+            continue
+        out.append(entry)
+    return out
+
+
+def _local_pick() -> Optional[dict[str, Any]]:
+    """Select an upstream in-process. Returns None to fall back to central /pick.
+
+    Uses power-of-two-choices rather than global least-loaded: every proxy sees
+    the same health data, so a strict argmin would make all of them stampede the
+    same GPU. Sampling two and taking the better one decorrelates the fleet
+    without needing any coordination, and costs no network round trip.
+    """
+    global _lb_rr
+    candidates = _lb_candidates()
+    if not candidates:
+        return None
+
+    def cost(entry: dict) -> float:
+        active = float(entry.get("active") or 0)
+        rtt = float(entry.get("rtt_ms") or 0.0)
+        return active + (rtt / RTT_MS_PER_SLOT if RTT_MS_PER_SLOT > 0 else 0.0)
+
+    if len(candidates) == 1:
+        chosen = candidates[0]
+    else:
+        # Sample two *independently at random*, then take the cheaper. The
+        # power-of-two-choices bound depends on the samples being independent
+        # across proxies — a deterministic rotation correlates them and measured
+        # 12/24 proxies landing on one GPU in a simultaneous burst.
+        _lb_rr += 1
+        a, b = random.sample(candidates, 2)
+        chosen = a if cost(a) <= cost(b) else b
+
+    # Optimistically count our own in-flight request so back-to-back picks on
+    # this proxy spread out before the next health probe lands.
+    chosen["active"] = int(chosen.get("active") or 0) + 1
+    return {
+        "endpoint": chosen["endpoint"],
+        "api_key": _last_pick_api_key or proxy_state.proxy_llm_key,
+        "worker_id": "",
+        "_local": True,
+        "_rtt_ms": round(float(chosen.get("rtt_ms") or 0.0), 1),
+    }
+
+
 async def _pick_upstream(*, log_pick: bool = True) -> dict[str, Any]:
     if not proxy_state.balancer_base:
         raise RuntimeError("proxy balancer URL not configured")
@@ -358,6 +574,10 @@ async def _pick_upstream(*, log_pick: bool = True) -> dict[str, Any]:
     endpoint = str(data.get("endpoint") or "").rstrip("/")
     if not endpoint:
         raise RuntimeError(f"balancer /pick missing endpoint: {data}")
+    global _last_pick_api_key
+    api_key = str(data.get("api_key") or "").strip()
+    if api_key:
+        _last_pick_api_key = api_key
     if log_pick:
         logger.info(
             "proxy balancer pick ok: upstream=%s worker_id=%s",
@@ -404,20 +624,27 @@ async def proxy_json_post(
     body: dict[str, Any],
     request: Optional[Request] = None,
 ) -> Any:
-    try:
-        pick = await _pick_upstream()
-    except Exception as exc:
-        logger.warning("proxy pick failed: path=%s err=%s", path, exc)
-        return JSONResponse(
-            status_code=503,
-            content={"error": "no upstream available", "detail": str(exc)},
+    _ensure_lb_started()
+    pick = _local_pick() if LOCAL_LB_ENABLED else None
+    if pick is not None:
+        logger.info(
+            "proxy local pick: upstream=%s rtt=%sms", pick["endpoint"], pick.get("_rtt_ms"),
         )
+    else:
+        try:
+            pick = await _pick_upstream()
+        except Exception as exc:
+            logger.warning("proxy pick failed: path=%s err=%s", path, exc)
+            return JSONResponse(
+                status_code=503,
+                content={"error": "no upstream available", "detail": str(exc)},
+            )
     endpoint = str(pick["endpoint"]).rstrip("/")
     url = f"{endpoint}{path}"
     validator_hotkey = _validator_hotkey(request)
     hotkey_suffix = f" validator={validator_hotkey[:12]}..." if validator_hotkey else ""
     logger.info("proxy forwarding %s -> %s%s", path, url, hotkey_suffix)
-    client = httpx.AsyncClient(verify=proxy_state.verify_upstream_ssl, timeout=None)
+    client = _upstream()
     try:
         req = client.build_request(
             "POST",
@@ -427,7 +654,6 @@ async def proxy_json_post(
         )
         resp = await client.send(req, stream=True)
     except _UPSTREAM_ERRORS as exc:
-        await client.aclose()
         logger.warning(
             "proxy upstream connect failed: path=%s upstream=%s%s err=%s",
             path, url, hotkey_suffix, exc,
@@ -459,7 +685,6 @@ async def proxy_json_post(
             return JSONResponse(status_code=502, content={"error": "upstream read failed", "detail": str(exc)})
         finally:
             await resp.aclose()
-            await client.aclose()
 
     content_type = resp.headers.get("content-type", "")
     if "text/event-stream" in content_type:
@@ -481,7 +706,6 @@ async def proxy_json_post(
                 )
             finally:
                 await resp.aclose()
-                await client.aclose()
 
         return StreamingResponse(
             sse_iter(),
@@ -510,7 +734,6 @@ async def proxy_json_post(
         return JSONResponse(status_code=502, content={"error": "upstream read failed", "detail": str(exc)})
     finally:
         await resp.aclose()
-        await client.aclose()
 
 
 def proxy_startup_minimal(state, args) -> None:

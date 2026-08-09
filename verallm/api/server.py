@@ -887,6 +887,15 @@ def _capacity_audit_gate() -> Optional[JSONResponse]:
 @app.on_event("startup")
 async def _on_startup():
     """Start the background engine step loop if batch mode is enabled."""
+    # Warm the proxy's local balancer here rather than on the first forwarded
+    # request. Canaries can be 10+ minutes apart, so lazy start left the picker
+    # unverifiable until traffic arrived and made every post-restart request
+    # fall back to the central /pick.
+    if proxy_state.enabled:
+        from verallm.api.proxy_forward import _ensure_lb_started
+
+        _ensure_lb_started()
+
     if state.batch_mode and state.batch_engine is not None:
         state._step_loop_task = asyncio.create_task(_engine_step_loop())
         bt.logging.info("Started background engine step loop (batch mode)")
