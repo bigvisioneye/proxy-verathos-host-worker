@@ -149,6 +149,12 @@ def _mirror_health_fields() -> tuple[str, ...]:
         "can_accept_max_context",
         "proof_pending",
         "proof_max_pending",
+        # A proxy proves nothing itself: the upstream inference server holds the
+        # authenticated release and answers the hard proof. Advertising the
+        # locally-computed set would report v1 (no local runtime), which the
+        # owner allowlist now intersects to empty -- so validators would see a
+        # miner that supports no protocol at all.
+        "proof_protocol_versions",
     )
 
 

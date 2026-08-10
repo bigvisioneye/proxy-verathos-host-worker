@@ -627,6 +627,11 @@ class MinerState:
         # Proof-v3 remains unavailable until all authenticated artifacts,
         # graph-integrated capture and the hard-opening coordinator are ready.
         self.proof_v3_runtime = None
+        # Additional prover instances keyed by miner identity digest, so one
+        # loaded model can serve several registered miners (proxy fan-in).
+        # Every entry shares this server's batch engine, tracker, weight store
+        # and coordinator -- only the bound hotkey identity differs.
+        self.proof_v3_runtimes: dict[bytes, object] = {}
         self.proof_v3_coordinator = None
         self.allowed_proof_protocol_versions = (1, 3)
 
@@ -753,6 +758,32 @@ def _proof_v2_batch_capture_available() -> bool:
         and state.batch_engine is not None
         and state.activation_tracker is not None
     )
+
+
+def _proof_v3_runtime_for(precommit_context) -> object:
+    """Return the prover bound to the miner this request is addressed to.
+
+    The validator stamps ``miner_identity_digest`` into the precommit context
+    before execution, so the identity is known per request.  With a single
+    served hotkey this always resolves to the primary runtime; with several it
+    selects the matching one.  An unknown identity is refused rather than
+    silently proved under the wrong miner, which would fail verification later
+    anyway and waste a full inference.
+    """
+
+    runtimes = getattr(state, "proof_v3_runtimes", None) or {}
+    if len(runtimes) <= 1 or precommit_context is None:
+        return state.proof_v3_runtime
+    digest = getattr(precommit_context, "miner_identity_digest", None)
+    runtime = runtimes.get(digest)
+    if runtime is None:
+        from verallm.proof_v3.errors import ProofV3Error
+
+        raise ProofV3Error(
+            "proof-v3 request is addressed to a miner identity this server "
+            "does not serve"
+        )
+    return runtime
 
 
 def _advertised_proof_protocol_versions() -> list[int]:
@@ -900,7 +931,11 @@ async def _on_startup():
         state._step_loop_task = asyncio.create_task(_engine_step_loop())
         bt.logging.info("Started background engine step loop (batch mode)")
         if state.proof_v3_runtime is not None:
-            state.proof_v3_runtime.bind_serving_loop()
+            for _rt in (
+                (state.proof_v3_runtimes or {}).values()
+                or [state.proof_v3_runtime]
+            ):
+                _rt.bind_serving_loop()
 
         # Batch-mode warmup: the synchronous LLM.generate() warmup in startup()
         # compiles Triton kernels for the sync code path, but batch mode uses
@@ -1594,7 +1629,7 @@ async def run_inference(body: InferenceRequestBody, request: Request = None):
         try:
             proof_v3_context = body.proof_v3_preexecution_context_value
             proof_v3_tracker_options = (
-                state.proof_v3_runtime.validate_initial_request(
+                _proof_v3_runtime_for(proof_v3_context).validate_initial_request(
                     precommit_context=proof_v3_context,
                     authenticated_validator_hotkey=_vhk,
                     prompt_token_ids=prompt_token_ids,
@@ -1911,7 +1946,7 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
                     body.proof_v3_preexecution_context_value
                 )
                 proof_v3_tracker_options = (
-                    state.proof_v3_runtime.validate_initial_request(
+                    _proof_v3_runtime_for(proof_v3_context).validate_initial_request(
                         precommit_context=proof_v3_context,
                         authenticated_validator_hotkey=_vali_hotkey,
                         prompt_token_ids=prompt_token_ids,
@@ -4049,7 +4084,9 @@ async def _stream_inference_batched(
             if output.finished:
                 if proof_protocol_version == PROOF_PROTOCOL_V3:
                     activation_finalize_future = asyncio.create_task(
-                        state.proof_v3_runtime.finalize_initial_request(
+                        _proof_v3_runtime_for(
+                            proof_v3_precommit_context
+                        ).finalize_initial_request(
                             request_id=request_id,
                             precommit_context=proof_v3_precommit_context,
                             prompt_token_ids=output.prompt_token_ids,
@@ -5257,17 +5294,57 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
             )
         ),
     )
-    runtime = EconomicProofV3LiveRuntime(
-        runtime_release=release,
-        weight_store=weight_store,
-        coordinator=coordinator,
-        batch_engine=state.batch_engine,
-        tracker=state.activation_tracker,
-        miner_hotkey_ss58=miner_hotkey,
-        admission=state.admission,
-    )
+    def _build_runtime(hotkey_ss58: str):
+        return EconomicProofV3LiveRuntime(
+            runtime_release=release,
+            weight_store=weight_store,
+            coordinator=coordinator,
+            batch_engine=state.batch_engine,
+            tracker=state.activation_tracker,
+            miner_hotkey_ss58=hotkey_ss58,
+            admission=state.admission,
+        )
+
+    runtime = _build_runtime(miner_hotkey)
     state.proof_v3_coordinator = coordinator
     state.proof_v3_runtime = runtime
+
+    # One loaded model, several miner identities.  The proof binds a miner via
+    # ``miner_identity_digest``, which the validator already supplies per
+    # request in the precommit context -- but the runtime fixes that identity at
+    # construction, so a single instance can only answer for one miner.  Build
+    # one lightweight instance per served hotkey over the SAME engine/tracker/
+    # weights and dispatch on the digest that arrives with each request.
+    from verallm.proof_v3.request import miner_hotkey_identity_digest_v3
+
+    state.proof_v3_runtimes = {
+        miner_hotkey_identity_digest_v3(miner_hotkey): runtime
+    }
+    extra_raw = str(
+        getattr(args, "proof_v3_served_miner_hotkeys", None)
+        or os.environ.get("VERATHOS_PROOF_V3_SERVED_MINER_HOTKEYS", "")
+    ).strip()
+    for extra_hotkey in (h.strip() for h in extra_raw.split(",")):
+        if not extra_hotkey or extra_hotkey == miner_hotkey:
+            continue
+        try:
+            digest = miner_hotkey_identity_digest_v3(extra_hotkey)
+            if digest in state.proof_v3_runtimes:
+                continue
+            state.proof_v3_runtimes[digest] = _build_runtime(extra_hotkey)
+            bt.logging.info(
+                f"Proof-v3 additional served miner identity: {extra_hotkey}"
+            )
+        except Exception as exc:
+            # A bad hotkey must not take down serving for the valid ones.
+            bt.logging.error(
+                f"Proof-v3 served miner hotkey rejected ({extra_hotkey}): {exc}"
+            )
+    if len(state.proof_v3_runtimes) > 1:
+        bt.logging.info(
+            "Proof-v3 serving %d miner identities from one loaded model"
+            % len(state.proof_v3_runtimes)
+        )
     bt.logging.info(
         "Proof-v3 authenticated runtime ready: "
         f"profile={release.profile.digest().hex()[:16]}... "
@@ -7032,6 +7109,14 @@ def parse_args():
         "--miner-hotkey-ss58",
         default=os.environ.get("VERATHOS_MINER_HOTKEY_SS58") or None,
         help="Serving miner hotkey identity bound into proof-v3 requests",
+    )
+    parser.add_argument(
+        "--proof-v3-served-miner-hotkeys",
+        default=os.environ.get("VERATHOS_PROOF_V3_SERVED_MINER_HOTKEYS") or None,
+        help=(
+            "Comma-separated additional miner hotkey SS58s this server may "
+            "prove for, so one loaded model can back several proxy miners"
+        ),
     )
     parser.add_argument(
         "--evm-rpc-url",
