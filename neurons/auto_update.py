@@ -692,6 +692,12 @@ class AutoUpdater:
         self._update_state_lock = threading.Lock()
         self._update_pending = False  # Set when update deferred due to busy
         self._update_applying = False
+        # A pull/install may finish before the process reaches a safe restart
+        # window.  Preserve that phase explicitly: after git HEAD advances,
+        # the running process still imports the old version and a later remote
+        # check cannot reliably rediscover the pending restart.
+        self._update_installed = False
+        self._update_stagger_completed = False
 
     @property
     def drain_requested(self) -> bool:
@@ -709,6 +715,20 @@ class AutoUpdater:
         with self._update_state_lock:
             self._update_pending = False
             self._update_applying = False
+            self._update_installed = False
+            self._update_stagger_completed = False
+
+    def _mark_update_installed(self) -> None:
+        with self._update_state_lock:
+            self._update_installed = True
+
+    def _mark_stagger_completed(self) -> None:
+        with self._update_state_lock:
+            self._update_stagger_completed = True
+
+    def _pending_update_phase(self) -> tuple[bool, bool]:
+        with self._update_state_lock:
+            return self._update_installed, self._update_stagger_completed
 
     def _begin_update(self, *, require_pending: bool = False) -> bool:
         """Atomically claim the single installer/restart lane."""
@@ -766,11 +786,16 @@ class AutoUpdater:
 
         while not self._stop_event.is_set():
             try:
-                self._check_and_update()
+                if self.drain_requested:
+                    self.notify_not_busy()
+                else:
+                    self._check_and_update()
             except Exception as e:
                 bt.logging.error(f"Auto-update check failed: {e}")
 
-            self._wait(self.check_interval)
+            # Once an update is pending, poll for the first safe idle window.
+            # The ordinary remote-version cadence remains unchanged.
+            self._wait(min(5, self.check_interval) if self.drain_requested else self.check_interval)
 
     def _wait(self, seconds: int) -> None:
         """Interruptible sleep."""
@@ -792,27 +817,39 @@ class AutoUpdater:
             return
         if not self._begin_update(require_pending=True):
             return
-        bt.logging.info("Deferred update ready — applying now")
-        if not pull_and_install(
-            install_extras=self.install_extras,
-            install_proof_cuda=self.install_proof_cuda,
-        ):
-            bt.logging.error("Deferred update failed — will retry next cycle")
-            self._clear_update()
-            return
-        bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
-        self._wait(self.restart_delay)
-        if self.busy_check and self.busy_check():
+        installed, stagger_completed = self._pending_update_phase()
+        if not installed:
+            bt.logging.info("Deferred update ready — applying now")
+            if not pull_and_install(
+                install_extras=self.install_extras,
+                install_proof_cuda=self.install_proof_cuda,
+            ):
+                bt.logging.error("Deferred update failed — will retry next cycle")
+                self._clear_update()
+                return
+            self._mark_update_installed()
+            bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
+            self._wait(self.restart_delay)
+            if self.busy_check and self.busy_check():
+                bt.logging.info(
+                    "Process became busy during deferred-update restart delay — "
+                    "retaining installed update for the next idle window"
+                )
+                self._defer_update()
+                return
+        else:
             bt.logging.info(
-                "Process became busy during deferred-update restart delay — "
-                "retaining update for the next idle window"
+                "Installed update reached an idle restart window"
             )
-            self._defer_update()
-            return
-        self._stagger_sleep()
+        if not stagger_completed:
+            self._stagger_sleep()
+            # Fleet staggering is paid once.  If work arrives during it, the
+            # installed update waits for the next idle window without sleeping
+            # or reinstalling again.
+            self._mark_stagger_completed()
         if self.busy_check and self.busy_check():
             bt.logging.info(
-                "Process became busy during update stagger — retaining update "
+                "Process became busy during update stagger — retaining installed update "
                 "for the next idle window"
             )
             self._defer_update()
@@ -862,6 +899,7 @@ class AutoUpdater:
             bt.logging.error("Update failed — will retry next cycle")
             self._clear_update()
             return
+        self._mark_update_installed()
 
         bt.logging.info(f"Update applied, restarting in {self.restart_delay}s...")
         self._wait(self.restart_delay)
@@ -872,6 +910,7 @@ class AutoUpdater:
             return
 
         self._stagger_sleep()
+        self._mark_stagger_completed()
         if self.busy_check and self.busy_check():
             bt.logging.info(
                 "Process became busy during update stagger — deferring restart"

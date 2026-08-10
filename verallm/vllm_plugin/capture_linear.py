@@ -716,6 +716,8 @@ class CaptureDecoderLayerWrapper(nn.Module):
         root_max_tokens: int = 0,
         row_indices: torch.Tensor | None = None,
         root_stage_suffixes: frozenset[str] | None = None,
+        response_stamp_max_tokens: int = 0,
+        response_stamp_row_indices: torch.Tensor | None = None,
     ):
         super().__init__()
         self.original = original
@@ -727,6 +729,11 @@ class CaptureDecoderLayerWrapper(nn.Module):
         self.register_buffer(
             "_capture_row_indices",
             row_indices,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_capture_response_stamp_row_indices",
+            response_stamp_row_indices,
             persistent=False,
         )
         capture_device = None
@@ -755,6 +762,23 @@ class CaptureDecoderLayerWrapper(nn.Module):
                 if buffer_device is not None
                 else None,
             )
+        self.register_buffer(
+            "_capture_response_stamp_buf",
+            torch.zeros(
+                response_stamp_max_tokens,
+                hidden_dim,
+                dtype=dtype,
+                device=capture_device,
+            )
+            if (
+                capture_device is not None
+                and response_stamp_row_indices is not None
+                and response_stamp_max_tokens > 0
+                and hidden_dim > 0
+            )
+            else None,
+            persistent=False,
+        )
         for name in (
             "_capture_residual_in_root_buf",
             "_capture_residual_after_attention_root_buf",
@@ -908,6 +932,23 @@ class CaptureDecoderLayerWrapper(nn.Module):
                 ("residual_out", self._capture_residual_out_buf),
             )
             if buffer is not None
+        )
+
+    def proof_capture_response_stamp_buffer(self):
+        """Expose the concurrency-scaled layer-zero response-stamp arena."""
+
+        if (
+            self._capture_response_stamp_buf is None
+            or self._capture_response_stamp_row_indices is None
+        ):
+            return ()
+        return (
+            (
+                self._layer_idx,
+                "residual_in",
+                self._capture_response_stamp_buf,
+                self._capture_response_stamp_row_indices,
+            ),
         )
 
     def proof_capture_root_buffers(self):
@@ -1080,6 +1121,35 @@ class CaptureDecoderLayerWrapper(nn.Module):
             self._capture_residual_out_root_buf,
             self._capture_residual_out_root_stage_buf,
         )
+        if self._capture_response_stamp_buf is not None:
+            indices = self._capture_response_stamp_row_indices
+            if indices is None:
+                raise RuntimeError(
+                    "response-stamp capture indices are unavailable"
+                )
+            if capture_residual_in.is_cuda:
+                torch.ops.verallm.buffer_gather_rows(
+                    self._capture_response_stamp_buf,
+                    capture_residual_in,
+                    indices,
+                )
+            else:
+                valid = (indices >= 0) & (
+                    indices < capture_residual_in.shape[0]
+                )
+                if bool(valid.any()):
+                    positions = torch.nonzero(
+                        valid,
+                        as_tuple=False,
+                    ).flatten()
+                    self._capture_response_stamp_buf.index_copy_(
+                        0,
+                        positions,
+                        capture_residual_in.index_select(
+                            0,
+                            indices.index_select(0, positions),
+                        ),
+                    )
         if self._capture_root_batch_destination is not None:
             torch.ops.verallm.activation_staged_row_roots(
                 self._capture_root_batch_destination,

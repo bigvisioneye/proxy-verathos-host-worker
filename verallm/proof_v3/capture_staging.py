@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 
 from verallm.proof_v3.errors import ProofV3Error
+from verallm.proof_v3.economic_challenge import (
+    PROMPT_CANDIDATE_ROWS_V3,
+)
 from verallm.proof_v3.projection_manifest import ProjectionManifestV3
 from verallm.proof_v3.runtime_architecture import (
     manifest_projection_suffixes_v3,
@@ -20,6 +23,7 @@ __all__ = [
     "MAX_CAPTURE_STAGING_ROWS_V3",
     "dense_capture_bytes_per_row_v3",
     "recommended_dense_capture_staging_rows_v3",
+    "response_stamp_capture_rows_v3",
 ]
 
 
@@ -98,3 +102,32 @@ def recommended_dense_capture_staging_rows_v3(
             "capture staging budget cannot hold one scheduler row"
         )
     return 1 << (affordable.bit_length() - 1)
+
+
+def response_stamp_capture_rows_v3(
+    *,
+    max_requests: int,
+    max_batched_tokens: int,
+) -> int:
+    """Bound the layer-zero stamp arena at scheduler admission capacity.
+
+    Every co-batched request can contribute at most the canonical prompt-tail
+    width in one prefill step. The scheduler token cap is a tighter bound when
+    fewer total rows can run together. Unlike the full-model replay gather,
+    this arena contains one layer-zero input only and therefore scales safely
+    with admitted request concurrency.
+    """
+
+    if (
+        isinstance(max_requests, bool)
+        or not isinstance(max_requests, int)
+        or max_requests <= 0
+        or isinstance(max_batched_tokens, bool)
+        or not isinstance(max_batched_tokens, int)
+        or max_batched_tokens <= 0
+    ):
+        raise ProofV3Error("response-stamp scheduler capacity is malformed")
+    return min(
+        max_batched_tokens,
+        max_requests * PROMPT_CANDIDATE_ROWS_V3,
+    )

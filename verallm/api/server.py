@@ -172,6 +172,42 @@ from verallm.api.proof_protocol import (
 )
 
 
+def _engine_scheduler_max_num_seqs(engine: object) -> int:
+    """Return vLLM's real request-width ceiling across supported layouts."""
+
+    candidates = (
+        getattr(engine, "scheduler_config", None),
+        getattr(getattr(engine, "vllm_config", None), "scheduler_config", None),
+    )
+    for scheduler_config in candidates:
+        raw = getattr(scheduler_config, "max_num_seqs", None)
+        if isinstance(raw, bool):
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    raise RuntimeError("vLLM scheduler max_num_seqs is unavailable")
+
+
+def _bounded_server_request_admission(
+    requested_max_requests: int,
+    scheduler_max_num_seqs: int,
+) -> int:
+    """Keep HTTP admission inside the engine/capture concurrency envelope."""
+
+    if (
+        isinstance(requested_max_requests, bool)
+        or isinstance(scheduler_max_num_seqs, bool)
+        or int(requested_max_requests) <= 0
+        or int(scheduler_max_num_seqs) <= 0
+    ):
+        raise ValueError("request admission limits must be positive integers")
+    return min(int(requested_max_requests), int(scheduler_max_num_seqs))
+
+
 # ============================================================================
 # Pydantic models for request validation
 # ============================================================================
@@ -3995,8 +4031,10 @@ async def _stream_inference_batched(
         final_output = None
         t_first_token = None
         t_last_token = None
+        t_inference_finished = None
         pending_reveal = None
         activation_finalize_future = None
+        prepared_v3_precommit = None
         proof_v2_prepare_ms = 0.0
         prev_token_count = 0
 
@@ -4053,6 +4091,7 @@ async def _stream_inference_batched(
                     t_first_token = time.perf_counter()
                 t_last_token = time.perf_counter()
             if output.finished:
+                t_inference_finished = time.perf_counter()
                 final_output = output
                 miner.input_token_ids[session_id] = [
                     int(value) for value in output.prompt_token_ids
@@ -4069,6 +4108,46 @@ async def _stream_inference_batched(
                             _finalize_activations_for_proof,
                         )
                     )
+                if proof_protocol_version == PROOF_PROTOCOL_V3:
+                    # The authenticated output and graph-native capture are
+                    # frozen before this final token is exposed. Finish the
+                    # nonce-free precommit against that immutable state before
+                    # handing off the final token. The wire still publishes
+                    # token, precommit, done in that order, while a wide
+                    # co-batch cannot consume the signed post-token deadline
+                    # in Python worker scheduling.
+                    try:
+                        prepared_v3_precommit = await (
+                            _proof_v3_runtime_for(
+                                proof_v3_precommit_context
+                            ).finalize_initial_request(
+                                request_id=request_id,
+                                precommit_context=proof_v3_precommit_context,
+                                prompt_token_ids=output.prompt_token_ids,
+                                output_token_ids=output.outputs[0].token_ids,
+                                emitted_text_utf8=cur_text.encode("utf-8"),
+                                finish_reason=str(
+                                    output.outputs[0].finish_reason or ""
+                                ),
+                                sampling_params=proof_v3_replay_sampling_params,
+                            )
+                        )
+                    except Exception as exc:
+                        bt.logging.error(
+                            "Proof-v3 precommit failed before final-token "
+                            f"delivery for {request_id}: {exc}"
+                        )
+                        batch_engine.clear_finished(request_id)
+                        if tracker is not None:
+                            tracker.unregister_request(request_id)
+                        if moe_mgr:
+                            moe_mgr.clear_request(request_id)
+                        _cleanup_inference_session(miner, session_id)
+                        yield (
+                            "event: error\n"
+                            f"data: {json.dumps({'error': f'Post-inference error: {exc}'})}\n\n"
+                        )
+                        return
             if delta or (
                 proof_protocol_version == PROOF_PROTOCOL_V3 and token_delta
             ):
@@ -4082,25 +4161,11 @@ async def _stream_inference_batched(
             prev_token_count = len(current_token_ids)
 
             if output.finished:
-                if proof_protocol_version == PROOF_PROTOCOL_V3:
-                    activation_finalize_future = asyncio.create_task(
-                        _proof_v3_runtime_for(
-                            proof_v3_precommit_context
-                        ).finalize_initial_request(
-                            request_id=request_id,
-                            precommit_context=proof_v3_precommit_context,
-                            prompt_token_ids=output.prompt_token_ids,
-                            output_token_ids=output.outputs[0].token_ids,
-                            emitted_text_utf8=cur_text.encode("utf-8"),
-                            finish_reason=str(
-                                output.outputs[0].finish_reason or ""
-                            ),
-                            sampling_params=proof_v3_replay_sampling_params,
-                        )
-                    )
                 break
 
-        inference_ms = (time.perf_counter() - t_infer) * 1000
+        inference_ms = (
+            (t_inference_finished or time.perf_counter()) - t_infer
+        ) * 1000
         ttft_ms = ((t_first_token - t_infer) * 1000) if t_first_token else 0
 
         if final_output is None:
@@ -4171,11 +4236,11 @@ async def _stream_inference_batched(
 
         try:
             if proof_protocol_version == PROOF_PROTOCOL_V3:
-                if activation_finalize_future is None:
+                if prepared_v3_precommit is None:
                     raise RuntimeError(
-                        "proof-v3 capture finalization was not scheduled"
+                        "proof-v3 capture finalization did not complete"
                     )
-                prepared = await activation_finalize_future
+                prepared = prepared_v3_precommit
                 last_token_to_precommit_ms = max(
                     0.0,
                     (time.perf_counter() - t_last_token) * 1000,
@@ -5041,6 +5106,26 @@ def _prepare_proof_v3_graph_capture(args, *, expected_model_id: str):
     return manifest
 
 
+def _proof_v3_coordinator_record_capacity(
+    *,
+    configured_max_records: int,
+    max_admitted_requests: int,
+) -> int:
+    """Reserve one completed-proof retry slot beyond live admission.
+
+    A successfully returned hard proof remains cached for the bounded HTTP
+    retry window.  Counting that record against the same ceiling as live
+    precommits otherwise makes the next full-width scheduler batch fail after
+    inference, even though capture and request admission both had capacity.
+    """
+
+    configured = int(configured_max_records)
+    admitted = int(max_admitted_requests)
+    if configured <= 0 or admitted <= 0:
+        raise ValueError("proof-v3 record capacities must be positive")
+    return max(configured, admitted + 1)
+
+
 def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
     """Authenticate and install one explicit economic proof-v3 release."""
 
@@ -5117,6 +5202,7 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
     from verallm.miner.economic_proof_v3_weights import (
         EconomicProofV3WeightStore,
         prepare_economic_proof_v3_weight_startup_v3,
+        validate_compact_projection_catalog_runtime_v3,
     )
     from verallm.proof_v3.document import (
         load_signed_execution_profile_document_v3,
@@ -5280,9 +5366,24 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
         weight_store=weight_store,
         projection_names=challenge_names,
     )
+    compatibility_operation_count = 0
+    if compact_static_weights:
+        compatibility_operation_count = (
+            validate_compact_projection_catalog_runtime_v3(
+                weight_store=weight_store,
+                projection_catalog=release.artifacts.lean_projection_catalog,
+                projection_names=challenge_names,
+            )
+        )
     base_seconds = time.perf_counter() - base_started
+    coordinator_record_capacity = _proof_v3_coordinator_record_capacity(
+        configured_max_records=int(
+            getattr(args, "proof_v3_max_records", 64)
+        ),
+        max_admitted_requests=int(state.admission.max_requests),
+    )
     coordinator = EconomicProofV3ServingCoordinator(
-        max_records=int(getattr(args, "proof_v3_max_records", 64)),
+        max_records=coordinator_record_capacity,
         max_retained_bytes=int(
             getattr(args, "proof_v3_max_retained_bytes", 8 << 30)
         ),
@@ -5350,6 +5451,8 @@ def _configure_proof_v3_runtime(args, miner, model_spec) -> None:
         f"profile={release.profile.digest().hex()[:16]}... "
         f"layers={len(layer_kinds)} base_setup={base_seconds:.2f}s "
         f"challenge_weights={challenge_material_count} "
+        f"catalog_runtime_rows={compatibility_operation_count} "
+        f"retained_records={coordinator_record_capacity} "
         f"cache_reclaimed="
         f"{reclaimed_weight_cache_bytes / (1 << 30):.2f}GiB "
         f"lm_head_compute={lm_head_compute_bytes / (1 << 20):.1f}MiB"
@@ -6463,8 +6566,8 @@ def startup(args):
                 state.batch_engine.set_step_output_callback(
                     state.activation_tracker.snapshot_trace_step_buffers
                 )
-                state.batch_engine.set_finished_output_callback(
-                    state.activation_tracker.snapshot_capture_buffers
+                state.batch_engine.set_finished_outputs_callback(
+                    state.activation_tracker.snapshot_capture_buffers_batch
                 )
 
             # Install lm_head hook for decode-integrity capture.
@@ -6516,11 +6619,16 @@ def startup(args):
         )
         # Read the actual fitted max_model_len from vLLM (handles auto-fit)
         max_context = miner.llm.llm_engine.model_config.max_model_len
-        max_requests = getattr(
+        scheduler_max_requests = _engine_scheduler_max_num_seqs(engine)
+        requested_max_requests = getattr(
             args, "max_concurrent", None
         ) or auto_detect_max_requests_with_ram(
             hidden_dim=model_spec.hidden_dim,
             intermediate_dim=model_spec.intermediate_dim,
+        )
+        max_requests = _bounded_server_request_admission(
+            int(requested_max_requests),
+            scheduler_max_requests,
         )
 
         estimated_mb = estimate_per_request_ram_mb(
@@ -6549,6 +6657,10 @@ def startup(args):
                     intermediate_dim=model_spec.intermediate_dim,
                     per_request_ram_mb=safe_mb,
                 )
+                new_max = _bounded_server_request_admission(
+                    new_max,
+                    scheduler_max_requests,
+                )
                 current = state.admission.max_requests
                 if new_max != current:
                     direction = "increasing" if new_max > current else "reducing"
@@ -6574,6 +6686,7 @@ def startup(args):
         else:
             bt.logging.info(
                 f"Batch mode: KV pool={total_kv_tokens} tokens, max_context={max_context}, max_requests={max_requests}, "
+                f"scheduler_max_num_seqs={scheduler_max_requests}, "
                 f"proof_threads={state.proof_pipeline.max_concurrent}, proof_max_pending={state.proof_pipeline.max_pending}"
             )
 

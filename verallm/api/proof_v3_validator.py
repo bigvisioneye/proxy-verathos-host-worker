@@ -8,6 +8,7 @@ hard/light verdict to its caller.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -56,6 +57,25 @@ _FAILED_HARD_BUNDLE_COUNT = 8
 _FAILED_HARD_BUNDLE_BYTES = 512 << 20
 _FAILED_HARD_BUNDLE_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
+
+
+def _peer_error_summary(data: Mapping[str, object]) -> str:
+    """Return a bounded, single-line diagnostic for a miner SSE error.
+
+    The peer payload is untrusted and must never replace the stable public
+    verifier error.  Keeping only its error/code fields in operator logs makes
+    production failures diagnosable without reflecting arbitrary payload data
+    to API clients.
+    """
+
+    parts: list[str] = []
+    for key in ("code", "error"):
+        value = data.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            normalized = " ".join(str(value).split())
+            if normalized:
+                parts.append(f"{key}={normalized[:384]}")
+    return " ".join(parts) or "unspecified"
 
 
 def _retain_failed_hard_bundle(encoded_bundle: bytes) -> Path:
@@ -130,6 +150,10 @@ def _retain_failed_hard_bundle(encoded_bundle: bytes) -> Path:
 
 class ProofV3PeerFailure(ProofV3VerificationError):
     """The selected miner failed a v3 protocol obligation."""
+
+
+class ProofV3PeerServiceFailure(ProofV3PeerFailure):
+    """The selected miner reported an inference-service failure."""
 
 
 class ProofV3PostcommitFailure(ProofV3PeerFailure):
@@ -465,7 +489,11 @@ class ProofV3ValidatorExchange:
             elif event_type == "done":
                 self._observe_done(payload, received_monotonic_ns)
             elif event_type == "error":
-                raise ProofV3VerificationError(
+                logger.warning(
+                    "Proof-v3 miner emitted an error event: %s",
+                    _peer_error_summary(payload),
+                )
+                raise ProofV3PeerServiceFailure(
                     "miner returned an error during proof-v3 inference"
                 )
             else:
@@ -868,6 +896,8 @@ def _raise_exchange_failure(
         raise ProofV3UnavailableError(
             "proof-v3 local verifier failed after nonce disclosure"
         ) from exc
+    if isinstance(exc, ProofV3PeerServiceFailure):
+        raise exc
     if isinstance(exc, ProofV3Error):
         raise ProofV3PeerFailure(str(exc)) from exc
     if (
@@ -1112,11 +1142,26 @@ async def run_proof_v3_exchange_async(
             response.raise_for_status()
             async for event_type, data in _iter_sse_events_async(response):
                 received = time.monotonic_ns()
-                exchange.observe_sse_event(
-                    event_type=event_type,
-                    data=data,
-                    received_monotonic_ns=received,
-                )
+                if event_type in ("proof_precommit", "done"):
+                    # Canonical envelope parsing and the complete done-event
+                    # admission path are CPU work.  Running them on the
+                    # shared asyncio loop serializes otherwise-independent
+                    # streams and can make already-arrived precommits appear
+                    # late under a wide co-batch.  Timestamp receipt first,
+                    # then validate off-loop; ordering within this exchange
+                    # remains strict because this coroutine awaits each call.
+                    await asyncio.to_thread(
+                        exchange.observe_sse_event,
+                        event_type=event_type,
+                        data=data,
+                        received_monotonic_ns=received,
+                    )
+                else:
+                    exchange.observe_sse_event(
+                        event_type=event_type,
+                        data=data,
+                        received_monotonic_ns=received,
+                    )
                 if event_type == "token" and stream_callback is not None:
                     callback_result = stream_callback(str(data.get("text", "")))
                     if inspect.isawaitable(callback_result):
@@ -1174,6 +1219,8 @@ async def run_proof_v3_exchange_async(
             raise ProofV3UnavailableError(
                 "proof-v3 local verifier failed after nonce disclosure"
             ) from exc
+        if isinstance(exc, ProofV3PeerServiceFailure):
+            raise
         if isinstance(exc, ProofV3Error):
             raise ProofV3PeerFailure(str(exc)) from exc
         if (
@@ -1194,6 +1241,7 @@ __all__ = [
     "MAX_PROOF_V3_SSE_EVENT_BYTES",
     "ProofV3ExchangeResult",
     "ProofV3PeerFailure",
+    "ProofV3PeerServiceFailure",
     "ProofV3PostcommitFailure",
     "ProofV3ValidatorExchange",
     "finalize_proof_v3_exchange_sync",
