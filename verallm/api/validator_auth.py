@@ -27,6 +27,22 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
+# ss58 addresses on this network are base58, 47-48 chars. This is a shape
+# check, not an authenticity check -- the proxy already verified the signature.
+# It exists so a blank or garbage header can never reach the proof context and
+# get bound into a proof.
+_SS58_ALPHABET = set(
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+)
+
+
+def _plausible_ss58(value: str) -> bool:
+    return (
+        type(value) is str
+        and 46 <= len(value) <= 50
+        and not (set(value) - _SS58_ALPHABET)
+    )
+
 # Historical fallback when a miner has no configured data directory.
 DEFAULT_VALIDATORS_PATH = "/tmp/verathos_validators.json"
 
@@ -199,10 +215,42 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
 
             if proxy_llm_key_from_env() and verify_proxy_llm_request(request):
                 client_ip = request.client.host if request.client else "unknown"
+                # The proxy miner already ran this same middleware against its
+                # own validator allowlist and verified the sr25519 signature
+                # over (method, path, body) before forwarding. This server
+                # cannot repeat that check -- it holds no allowlist, and the
+                # proxy re-serialises the body, so the signed bytes are gone.
+                # It can only carry the identity the proxy authenticated.
+                #
+                # Without this, request.state.validator_hotkey stays unset and
+                # every proof-v3 precommit dies on
+                # "network hotkey must be non-empty text" (409), which is
+                # exactly what made proxy miners unable to serve at all.
+                forwarded = str(
+                    request.headers.get("x-validator-hotkey", "") or ""
+                ).strip()
+                if _plausible_ss58(forwarded):
+                    request.state.validator_hotkey = forwarded
+                    request.state.proof_v3_hard_auditor_authorized = bool(
+                        forwarded == self._proof_v3_hard_auditor_ss58
+                    )
+                else:
+                    # Refuse rather than prove under an unknown identity: a
+                    # bound proof carrying a blank or malformed validator is
+                    # worse than a clean rejection.
+                    if forwarded:
+                        logger.warning(
+                            "Proxy-forwarded %s carried an implausible "
+                            "validator hotkey; refusing",
+                            request.url.path,
+                        )
+                    request.state.validator_hotkey = ""
+                    request.state.proof_v3_hard_auditor_authorized = False
                 logger.info(
-                    "Accepted proxy-forwarded %s from %s",
+                    "Accepted proxy-forwarded %s from %s (validator=%s)",
                     request.url.path,
                     client_ip,
+                    forwarded or "<none>",
                 )
                 return await call_next(request)
         except Exception:
