@@ -1680,6 +1680,11 @@ async def run_inference(body: InferenceRequestBody, request: Request = None):
             from verallm.proof_v3.errors import ProofV3Error
 
             if isinstance(exc, ProofV3Error):
+                bt.logging.warning(
+                    "Proof-v3 precommit rejected (409) on /inference for "
+                    f"validator={getattr(request.state, 'validator_hotkey', '')} "
+                    f"reason={type(exc).__name__}: {exc}"
+                )
                 return JSONResponse(
                     status_code=409,
                     content={"error": str(exc)},
@@ -1997,6 +2002,16 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
                 from verallm.proof_v3.errors import ProofV3Error
 
                 if isinstance(exc, ProofV3Error):
+                    # A bare 409 with no server-side record makes a rejected
+                    # precommit undiagnosable from the miner side -- the caller
+                    # sees only the status code. Record which validator and
+                    # request it was, and why.
+                    bt.logging.warning(
+                        "Proof-v3 precommit rejected (409) for "
+                        f"request_id={request_id} "
+                        f"validator={getattr(request.state, 'validator_hotkey', '')} "
+                        f"reason={type(exc).__name__}: {exc}"
+                    )
                     await state.admission.release(request_id)
                     return JSONResponse(
                         status_code=409,
