@@ -825,9 +825,18 @@ async def proxy_raw_post(
     # which shows the retention but no challenge. Retry once on a fresh
     # connection; the failed attempt was never processed, so this cannot double
     # up a hard opening.
+    # A hard opening is ~10MB of proof bytes. On a high-RTT proxy->upstream link
+    # that transfer is dropped mid-body ("peer closed connection without sending
+    # complete message body", observed truncating at 0.7/1.0/3.5MB of 10.0MB on
+    # uid 243 at ~870ms RTT, while uid 78 at ~450ms relayed all 10,070,571 bytes).
+    # The upstream re-runs answer_hard_reveal on each attempt and keeps the
+    # challenge pending until it is delivered, so retrying is safe; each attempt
+    # costs a replay, so keep the count modest and stay inside the validator's
+    # 300s hard-canary budget.
+    attempts = max(1, int(os.environ.get("PROXY_RAW_POST_ATTEMPTS", "3") or 3))
     resp = None
     last_exc = None
-    for attempt in (1, 2):
+    for attempt in range(1, attempts + 1):
         try:
             resp = await client.post(
                 url,
@@ -838,9 +847,11 @@ async def proxy_raw_post(
         except _UPSTREAM_ERRORS as exc:
             last_exc = exc
             logger.warning(
-                "proxy raw upstream connect failed (attempt %d): path=%s upstream=%s err=%s",
-                attempt, path, url, exc,
+                "proxy raw upstream connect failed (attempt %d/%d): path=%s upstream=%s err=%s",
+                attempt, attempts, path, url, exc,
             )
+            if attempt < attempts:
+                await asyncio.sleep(0.5 * attempt)
     if resp is None:
         return JSONResponse(
             status_code=502,
