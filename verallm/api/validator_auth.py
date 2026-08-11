@@ -231,8 +231,20 @@ class ValidatorAuthMiddleware(BaseHTTPMiddleware):
                 ).strip()
                 if _plausible_ss58(forwarded):
                     request.state.validator_hotkey = forwarded
+                    # An inference upstream is not a registered miner, so
+                    # nothing writes a validators file for it and its own
+                    # hard-auditor policy is empty (and expires after 15
+                    # minutes even if seeded). Left to itself it answers every
+                    # hard opening and precommit hold with 403, which is what
+                    # kept proxy miners from completing a canary. The proxy
+                    # checked the sr25519 signature against its own fresh
+                    # policy, so honour the decision it already made -- this is
+                    # reached only after the shared proxy key verified.
                     request.state.proof_v3_hard_auditor_authorized = bool(
-                        forwarded == self._proof_v3_hard_auditor_ss58
+                        str(
+                            request.headers.get("x-validator-hard-auditor", "")
+                        ).strip() == "1"
+                        or forwarded == self._proof_v3_hard_auditor_ss58
                     )
                 else:
                     # Refuse rather than prove under an unknown identity: a

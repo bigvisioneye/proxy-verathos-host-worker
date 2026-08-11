@@ -116,6 +116,27 @@ class EconomicProofV3RetentionBody(BaseModel):
         return values
 
 
+async def _maybe_proxy_forward(path: str, body, request):
+    """Relay a proof-v3 call to the inference upstream on a proxy miner.
+
+    A proxy serves no model, so it builds no serving coordinator and would
+    answer every proof-v3 call with 503 -- which is exactly what stopped proxy
+    miners completing a canary. The precommit these calls refer to was created
+    upstream while relaying ``/chat``, so the upstream is the only server that
+    holds the state needed to answer them.
+
+    Returns ``None`` on a normal (non-proxy) miner so the local handler runs.
+    """
+    try:
+        from verallm.api.proxy_forward import proxy_raw_post, proxy_state
+    except Exception:  # pragma: no cover - proxy support is optional
+        return None
+    if not getattr(proxy_state, "enabled", False):
+        return None
+    payload = body.dict() if hasattr(body, "dict") else body.model_dump()
+    return await proxy_raw_post(path, payload, request)
+
+
 def register_economic_proof_v3_routes(
     app,
     *,
@@ -140,6 +161,11 @@ def register_economic_proof_v3_routes(
         body: EconomicProofV3NonceRevealBody,
         request: Request,
     ):
+        relayed = await _maybe_proxy_forward(
+            ECONOMIC_PROOF_V3_CHALLENGE_PATH, body, request
+        )
+        if relayed is not None:
+            return relayed
         coordinator = get_coordinator()
         if coordinator is None:
             return JSONResponse(
@@ -208,6 +234,11 @@ def register_economic_proof_v3_routes(
         body: EconomicProofV3RetentionBody,
         request: Request,
     ):
+        relayed = await _maybe_proxy_forward(
+            ECONOMIC_PROOF_V3_RETENTION_PATH, body, request
+        )
+        if relayed is not None:
+            return relayed
         coordinator = get_coordinator()
         if coordinator is None:
             return JSONResponse(

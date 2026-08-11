@@ -13,11 +13,17 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from verallm.api.proxy_auth import PROXY_LLM_HEADER
 
 logger = logging.getLogger(__name__)
+
+# Carries this server's hard-auditor decision to the inference upstream.
+# The upstream is not a registered miner, so it has no validator allowlist and
+# no proof-v3 hard-auditor policy of its own; without this it refuses every
+# hard opening with 403.
+PROXY_HARD_AUDITOR_HEADER = "X-Validator-Hard-Auditor"
 
 # Seconds to reuse a mirrored upstream /health snapshot. Validators poll the
 # proxy's /health often; without this, every poll cost a balancer /pick plus an
@@ -610,6 +616,12 @@ def _upstream_headers(pick: dict[str, Any], request: Optional[Request]) -> dict[
             value = request.headers.get(name)
             if value:
                 headers[name] = value
+        # This server verified the validator's sr25519 signature against its own
+        # freshly-written allowlist and evaluated the hard-auditor policy while
+        # doing so. The upstream cannot repeat either check, so carry the result
+        # rather than let it fail closed on a policy file it never receives.
+        if bool(getattr(request.state, "proof_v3_hard_auditor_authorized", False)):
+            headers[PROXY_HARD_AUDITOR_HEADER] = "1"
     return headers
 
 
@@ -695,8 +707,34 @@ async def proxy_json_post(
     content_type = resp.headers.get("content-type", "")
     if "text/event-stream" in content_type:
         async def sse_iter():
+            # A 200 from upstream only means the HEADERS were fine. The validator
+            # scores the *stream*: it needs the token events AND the terminal
+            # precommit/done frames. A stream that ends cleanly but short looks
+            # identical to success from the status code alone, which is why a
+            # proxy could log 200 for every request while the validator recorded
+            # "Inference request failed." for every one. Count what we actually
+            # relay so the two views can be compared.
+            n_bytes = 0
+            n_chunks = 0
+            n_events = 0
+            saw_token = False
+            saw_precommit = False
+            saw_done = False
+            saw_error = False
+            t0 = time.monotonic()
             try:
                 async for chunk in resp.aiter_bytes():
+                    n_bytes += len(chunk)
+                    n_chunks += 1
+                    n_events += chunk.count(b"event:")
+                    if b"event: token" in chunk:
+                        saw_token = True
+                    if b"precommit" in chunk:
+                        saw_precommit = True
+                    if b"event: done" in chunk:
+                        saw_done = True
+                    if b"event: error" in chunk:
+                        saw_error = True
                     yield chunk
             except _UPSTREAM_ERRORS as exc:
                 # Upstream inference GPU dropped the stream mid-body (crash/OOM,
@@ -704,13 +742,21 @@ async def proxy_json_post(
                 # we cannot change the status — stop cleanly; the validator sees a
                 # truncated stream and fails that request, which is correct.
                 logger.warning(
-                    "proxy upstream SSE ended early: path=%s upstream=%s%s err=%s",
-                    path,
-                    endpoint,
-                    hotkey_suffix,
-                    exc,
+                    "proxy upstream SSE ended early: path=%s upstream=%s%s err=%s "
+                    "bytes=%d chunks=%d events=%d token=%s precommit=%s done=%s",
+                    path, endpoint, hotkey_suffix, exc,
+                    n_bytes, n_chunks, n_events, saw_token, saw_precommit, saw_done,
                 )
             finally:
+                complete = saw_done and saw_precommit and not saw_error
+                logger.info(
+                    "proxy SSE relayed: path=%s upstream=%s%s bytes=%d chunks=%d "
+                    "events=%d token=%s precommit=%s done=%s error=%s "
+                    "elapsed=%.2fs COMPLETE=%s",
+                    path, endpoint, hotkey_suffix, n_bytes, n_chunks, n_events,
+                    saw_token, saw_precommit, saw_done, saw_error,
+                    time.monotonic() - t0, complete,
+                )
                 await resp.aclose()
 
         return StreamingResponse(
@@ -740,6 +786,65 @@ async def proxy_json_post(
         return JSONResponse(status_code=502, content={"error": "upstream read failed", "detail": str(exc)})
     finally:
         await resp.aclose()
+
+
+async def proxy_raw_post(
+    path: str,
+    body: dict[str, Any],
+    request: Optional[Request] = None,
+) -> Response:
+    """Forward a POST upstream and relay the response bytes verbatim.
+
+    ``proxy_json_post`` re-decodes the upstream body as JSON. That is fine for
+    ``/chat`` but destroys a proof-v3 hard opening, which returns raw proof
+    bytes: they would come back through ``decode(errors="replace")`` with every
+    non-UTF-8 byte silently replaced, so the validator would reject a corrupted
+    proof rather than see an error. Status, content-type and body are passed
+    through unchanged here.
+    """
+    _ensure_lb_started()
+    pick = _local_pick() if LOCAL_LB_ENABLED else None
+    if pick is None:
+        try:
+            pick = await _pick_upstream()
+        except Exception as exc:
+            logger.warning("proxy raw pick failed: path=%s err=%s", path, exc)
+            return JSONResponse(
+                status_code=503,
+                content={"error": "no upstream available", "detail": str(exc)},
+            )
+    endpoint = str(pick["endpoint"]).rstrip("/")
+    url = f"{endpoint}{path}"
+    validator_hotkey = _validator_hotkey(request)
+    client = _upstream()
+    try:
+        resp = await client.post(
+            url,
+            headers=_upstream_headers(pick, request),
+            json=body,
+        )
+    except _UPSTREAM_ERRORS as exc:
+        logger.warning(
+            "proxy raw upstream connect failed: path=%s upstream=%s err=%s",
+            path, url, exc,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={"error": "upstream connect failed", "detail": str(exc)},
+        )
+    logger.info(
+        "proxy raw relayed: path=%s upstream=%s status=%s bytes=%d validator=%s",
+        path, endpoint, resp.status_code, len(resp.content),
+        (validator_hotkey or "<none>")[:12],
+    )
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type"),
+        headers={
+            k: v for k, v in resp.headers.items() if k.lower() == "cache-control"
+        },
+    )
 
 
 def proxy_startup_minimal(state, args) -> None:
