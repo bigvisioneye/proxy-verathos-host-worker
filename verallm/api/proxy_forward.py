@@ -817,20 +817,34 @@ async def proxy_raw_post(
     url = f"{endpoint}{path}"
     validator_hotkey = _validator_hotkey(request)
     client = _upstream()
-    try:
-        resp = await client.post(
-            url,
-            headers=_upstream_headers(pick, request),
-            json=body,
-        )
-    except _UPSTREAM_ERRORS as exc:
-        logger.warning(
-            "proxy raw upstream connect failed: path=%s upstream=%s err=%s",
-            path, url, exc,
-        )
+    # The upstream closes idle keep-alive sockets after ~5s while this pool holds
+    # them for 300s, so a proof call arriving a few seconds after the previous one
+    # can be written to a socket the peer has already closed. That surfaces as
+    # "peer closed connection without sending complete message body" and the
+    # request never reaches the upstream at all -- confirmed by its access log,
+    # which shows the retention but no challenge. Retry once on a fresh
+    # connection; the failed attempt was never processed, so this cannot double
+    # up a hard opening.
+    resp = None
+    last_exc = None
+    for attempt in (1, 2):
+        try:
+            resp = await client.post(
+                url,
+                headers=_upstream_headers(pick, request),
+                json=body,
+            )
+            break
+        except _UPSTREAM_ERRORS as exc:
+            last_exc = exc
+            logger.warning(
+                "proxy raw upstream connect failed (attempt %d): path=%s upstream=%s err=%s",
+                attempt, path, url, exc,
+            )
+    if resp is None:
         return JSONResponse(
             status_code=502,
-            content={"error": "upstream connect failed", "detail": str(exc)},
+            content={"error": "upstream connect failed", "detail": str(last_exc)},
         )
     logger.info(
         "proxy raw relayed: path=%s upstream=%s status=%s bytes=%d validator=%s",
