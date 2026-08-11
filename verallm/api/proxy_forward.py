@@ -63,6 +63,12 @@ REGISTRY_REFRESH_S = float(os.environ.get("PROXY_LB_REGISTRY_S", "60") or 60)
 HEALTH_PROBE_S = float(os.environ.get("PROXY_LB_PROBE_S", "5") or 5)
 # An upstream whose last successful probe is older than this is not selectable.
 STALE_AFTER_S = float(os.environ.get("PROXY_LB_STALE_S", "45") or 45)
+# How long a validator stays pinned to the upstream that served its /chat, so the
+# stateful proof-v3 handshake (chat -> challenge -> retention) reaches the same
+# server that holds the precommit. Without this, a second LLM upstream makes the
+# hard challenge round-robin to a server with no pending challenge -> 409 -> the
+# proof fails -> probation. Sized to the validator's 300s hard-canary budget.
+AFFINITY_TTL_S = float(os.environ.get("PROXY_AFFINITY_TTL_S", "300") or 300)
 # RTT weighting: ms of latency treated as equivalent to one queued request. Keeps
 # a near-but-busy server from always losing to a far-but-idle one.
 RTT_MS_PER_SLOT = float(os.environ.get("PROXY_LB_RTT_PER_SLOT", "120") or 120)
@@ -527,6 +533,49 @@ def _lb_candidates() -> list[dict]:
     return out
 
 
+# validator hotkey -> (upstream endpoint, monotonic expiry). One canary from one
+# validator runs its handshake sequentially (chat, then challenge, then
+# retention) and canaries are minutes apart, so pinning per validator keeps each
+# handshake on one server without needing to parse the commitment digest.
+_affinity: dict[str, tuple[str, float]] = {}
+
+
+def _affinity_set(validator_hotkey: str, endpoint: str) -> None:
+    """Pin a validator to the upstream that just served its /chat precommit."""
+    if not validator_hotkey or not endpoint:
+        return
+    _affinity[validator_hotkey] = (endpoint, time.monotonic() + AFFINITY_TTL_S)
+    # Bound memory: there are ~7 validators, but drop anything expired on write.
+    if len(_affinity) > 64:
+        now = time.monotonic()
+        for k in [k for k, (_, exp) in _affinity.items() if exp <= now]:
+            _affinity.pop(k, None)
+
+
+def _affinity_get(validator_hotkey: str) -> Optional[str]:
+    """Return the pinned upstream for this validator, or None.
+
+    Only returns a pin that is unexpired AND still a live upstream candidate; a
+    pin to a server that has gone stale/away falls through to a normal pick,
+    which is no worse than having no affinity at all.
+    """
+    if not validator_hotkey:
+        return None
+    rec = _affinity.get(validator_hotkey)
+    if rec is None:
+        return None
+    endpoint, expiry = rec
+    if time.monotonic() >= expiry:
+        _affinity.pop(validator_hotkey, None)
+        return None
+    live = {str(c.get("endpoint") or "").rstrip("/") for c in _lb_candidates()}
+    # When the local balancer has no health view yet (LOCAL_LB disabled or not
+    # warmed), trust the pin rather than lose affinity.
+    if live and endpoint.rstrip("/") not in live:
+        return None
+    return endpoint
+
+
 def _local_pick() -> Optional[dict[str, Any]]:
     """Select an upstream in-process. Returns None to fall back to central /pick.
 
@@ -660,6 +709,11 @@ async def proxy_json_post(
     endpoint = str(pick["endpoint"]).rstrip("/")
     url = f"{endpoint}{path}"
     validator_hotkey = _validator_hotkey(request)
+    # /chat and /inference create the proof-v3 precommit on this upstream. Pin the
+    # validator here so its follow-up hard challenge and retention hold reach the
+    # same server (see proxy_raw_post). Safe to set on every forwarded call; the
+    # latest precommit for a validator is the one its next challenge refers to.
+    _affinity_set(validator_hotkey, endpoint)
     hotkey_suffix = f" validator={validator_hotkey[:12]}..." if validator_hotkey else ""
     logger.info("proxy forwarding %s -> %s%s", path, url, hotkey_suffix)
     client = _upstream()
@@ -801,21 +855,34 @@ async def proxy_raw_post(
     non-UTF-8 byte silently replaced, so the validator would reject a corrupted
     proof rather than see an error. Status, content-type and body are passed
     through unchanged here.
+
+    These calls (/proof/v3/challenge, /proof/v3/retention) refer to a precommit
+    created during /chat on one specific upstream, so they MUST reach that same
+    server. Prefer the validator's pinned upstream; only fall back to a fresh
+    pick when there is no live pin.
     """
     _ensure_lb_started()
-    pick = _local_pick() if LOCAL_LB_ENABLED else None
-    if pick is None:
-        try:
-            pick = await _pick_upstream()
-        except Exception as exc:
-            logger.warning("proxy raw pick failed: path=%s err=%s", path, exc)
-            return JSONResponse(
-                status_code=503,
-                content={"error": "no upstream available", "detail": str(exc)},
-            )
+    validator_hotkey = _validator_hotkey(request)
+    pinned = _affinity_get(validator_hotkey)
+    if pinned is not None:
+        pick = {
+            "endpoint": pinned,
+            "api_key": _last_pick_api_key or proxy_state.proxy_llm_key,
+            "_affinity": True,
+        }
+    else:
+        pick = _local_pick() if LOCAL_LB_ENABLED else None
+        if pick is None:
+            try:
+                pick = await _pick_upstream()
+            except Exception as exc:
+                logger.warning("proxy raw pick failed: path=%s err=%s", path, exc)
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "no upstream available", "detail": str(exc)},
+                )
     endpoint = str(pick["endpoint"]).rstrip("/")
     url = f"{endpoint}{path}"
-    validator_hotkey = _validator_hotkey(request)
     client = _upstream()
     # The upstream closes idle keep-alive sockets after ~5s while this pool holds
     # them for 300s, so a proof call arriving a few seconds after the previous one
