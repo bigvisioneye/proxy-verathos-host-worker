@@ -39,11 +39,16 @@ Examples::
 
 Bump workflow
 -------------
-1. Edit the relevant role version constants below.
-2. Commit and push.
-3. Miners/validators with ``--auto-update`` will pull and restart
-   **only if their role's version increased**.
-4. If either role version changed, the subnet owner must also update the
+1. Choose the next monotonic formal release version, greater than every
+   published release tag and role version.
+2. Set every role changed by that release to the release version. Leave an
+   untouched role at its existing version; role-version drift is intentional
+   and prevents unnecessary restarts.
+3. The derived ``spec_version`` and formal Git tag must both equal that release
+   version. Production code releases are always tagged.
+4. Miners/validators with ``--auto-update`` pull and restart **only if their
+   role's version increased**.
+5. If either role version changed, the subnet owner must also update the
    on-chain ``weights_version`` to the derived ``spec_version``::
 
        subtensor.sudo_set_weights_version_key(
@@ -78,7 +83,7 @@ def _decode(version: int) -> tuple[int, int, int]:
 
 MINER_MAJOR = 0
 MINER_MINOR = 1
-MINER_PATCH = 8
+MINER_PATCH = 36
 
 miner_version: int = _encode(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
@@ -92,7 +97,7 @@ miner_version_str: str = _version_str(MINER_MAJOR, MINER_MINOR, MINER_PATCH)
 
 VALIDATOR_MAJOR = 0
 VALIDATOR_MINOR = 1
-VALIDATOR_PATCH = 32
+VALIDATOR_PATCH = 36
 
 validator_version: int = _encode(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)
 validator_version_str: str = _version_str(VALIDATOR_MAJOR, VALIDATOR_MINOR, VALIDATOR_PATCH)

@@ -67,6 +67,11 @@ class ValidatorSharedState:
     # Per-model scores: address -> {model_index (str) -> ema_score}.
     # Prior format (address -> float) is auto-migrated on read.
     miner_scores: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    # Recent validator-observed decode throughput and TTFT per miner/model.
+    # Values are derived from accepted validator-owned receipts; miners never
+    # supply these routing or display signals directly.
+    miner_tps: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    miner_ttft_ms: Dict[str, Dict[str, float]] = field(default_factory=dict)
     # Miners on probation: address -> list of model_indices.
     # Proxy should exclude these from organic traffic routing.
     probation_miners: Dict[str, List[int]] = field(default_factory=dict)
@@ -115,6 +120,8 @@ def write_shared_state(
         "epoch_number": state.epoch_number,
         "epoch_start_block": state.epoch_start_block,
         "miner_scores": state.miner_scores,
+        "miner_tps": state.miner_tps,
+        "miner_ttft_ms": state.miner_ttft_ms,
         "probation_miners": state.probation_miners,
         "miner_endpoints": [
             {"address": m.address, "endpoint": m.endpoint,
@@ -201,6 +208,32 @@ def read_shared_state(
             epoch_number=data.get("epoch_number", 0),
             epoch_start_block=data.get("epoch_start_block", 0),
             miner_scores=miner_scores,
+            miner_tps={
+                str(addr).lower(): {
+                    str(index): float(value)
+                    for index, value in values.items()
+                    if float(value) > 0.0
+                }
+                for addr, values in (
+                    data.get("miner_tps", {})
+                    if isinstance(data.get("miner_tps", {}), dict)
+                    else {}
+                ).items()
+                if isinstance(values, dict)
+            },
+            miner_ttft_ms={
+                str(addr).lower(): {
+                    str(index): float(value)
+                    for index, value in values.items()
+                    if float(value) >= 0.0
+                }
+                for addr, values in (
+                    data.get("miner_ttft_ms", {})
+                    if isinstance(data.get("miner_ttft_ms", {}), dict)
+                    else {}
+                ).items()
+                if isinstance(values, dict)
+            },
             probation_miners=data.get("probation_miners", {}),
             miner_endpoints=miner_endpoints,
             audit_drains=audit_drains,

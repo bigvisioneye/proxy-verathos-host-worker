@@ -385,6 +385,7 @@ class CapacityAuditRuntimeConfig:
     hard_proof_misses_for_zero_score: int = 2
     invalid_proof_misses_for_zero_score: int = 1
     allow_timing_only_score_gate: bool = True
+    uid_escalation_enabled: bool = False
     uid_escalation_min_entries: int = 2
     uid_escalation_fraction: float = 0.10
     uid_escalation_max_entries: int = 10

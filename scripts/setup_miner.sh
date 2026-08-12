@@ -24,6 +24,41 @@
 set -e
 set -o pipefail
 
+resolve_miner_runtime_stack() {
+    local gpu_sm="${1:-}"
+    local driver_major="${2:-0}"
+
+    if ! [[ "$gpu_sm" =~ ^[0-9]+$ ]] ||
+        ! [[ "$driver_major" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: GPU compute capability and driver major must be integers." >&2
+        return 2
+    fi
+
+    if [ "$gpu_sm" -lt 89 ]; then
+        printf '%s\n' 'ampere-cu128|0.19.1|2.10.0+cu128|12.8|cu128'
+    elif { [ "$gpu_sm" -eq 90 ] || [ "$gpu_sm" -ge 120 ]; } &&
+        [ "$driver_major" -ge 580 ]; then
+        # vLLM 0.20.2's published binary is CUDA 13-linked. Hopper and
+        # Blackwell hosts on a CUDA 13-capable driver must therefore use the
+        # coherent torch/vLLM CUDA 13 stack instead of forcing cu128 and then
+        # falling into an unnecessary source rebuild.
+        printf '%s\n' 'hopper-blackwell-cu130|0.20.2|2.11.0+cu130|13.0|cu130'
+    else
+        printf '%s\n' 'ada-hopper-cu128|0.20.2|2.11.0+cu128|12.8|cu128'
+    fi
+}
+
+# Deterministic diagnostic used by the installer regression suite. It runs no
+# setup actions and keeps the architecture policy executable in one place.
+if [ "${1:-}" = "--resolve-runtime-selection" ]; then
+    if [ "$#" -ne 3 ]; then
+        echo "Usage: $0 --resolve-runtime-selection <sm> <driver-major>" >&2
+        exit 2
+    fi
+    resolve_miner_runtime_stack "$2" "$3"
+    exit $?
+fi
+
 # ── Parse arguments ──────────────────────────────────────────────────────────
 
 SKIP_INSTALL=false
@@ -182,6 +217,10 @@ fi
 GPU_SM=$(nvidia-smi -i 0 --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '.')
 GPU_DRIVER=$(nvidia-smi -i 0 --query-gpu=driver_version --format=csv,noheader 2>/dev/null)
 GPU_DRIVER_MAJOR=$(echo "$GPU_DRIVER" | cut -d. -f1)
+RUNTIME_SELECTION=$(resolve_miner_runtime_stack "$GPU_SM" "${GPU_DRIVER_MAJOR:-0}")
+IFS='|' read -r VLLM_RUNTIME_STACK VLLM_RUNTIME_VERSION \
+    TORCH_RUNTIME_VERSION TORCH_CUDA_VERSION TORCH_CUDA_TAG \
+    <<< "$RUNTIME_SELECTION"
 echo "  GPU: $GPU_NAME (${GPU_VRAM}MB, sm_${GPU_SM}, driver ${GPU_DRIVER})"
 # Early check: RTX 5090 requires NVIDIA driver >= 575.
 #
@@ -207,10 +246,10 @@ if [ "${GPU_SM:-0}" -ge 120 ] && [ "${GPU_DRIVER_MAJOR:-0}" -lt 575 ]; then
 fi
 
 # ── vLLM version policy & known issues ──────────────────────────────────────
-# Default install: vLLM 0.19.x (pinned in pyproject.toml [vllm] extra).
-# Ships torch 2.10 + cu128.  Production-tested on sm_80/86/89/90/120
-# (Ampere/Ada/Hopper/Blackwell) — UID 94 (H100), UID 91 (RTX 5090),
-# UID 140 (RTX 4090) all run on this stack.
+# The default install selects a qualified architecture/runtime pair below:
+# Ampere uses vLLM 0.19.1 + torch 2.10/cu128; Ada and older-driver Hopper use
+# vLLM 0.20.2 + torch 2.11/cu128; CUDA-13-capable Hopper/Blackwell uses vLLM
+# 0.20.2 + torch 2.11/cu130. Do not mix torch and vLLM across those pairs.
 #
 # KNOWN ISSUE: A small number of sm_89 operators (RTX 4090 / L4 / L40S
 # / RTX 6000 Ada) hit `cudaErrorIllegalAddress` during model load
@@ -295,6 +334,131 @@ print(':'.join(d for d in dirs if os.path.isdir(d)))
 }
 
 fix_ld_library_path
+
+# vLLM's Qwen3.6 GDN path compiles a small FlashInfer kernel during the first
+# production warmup.  CUDA runtime wheels are sufficient for torch/vLLM, but
+# they do not provide nvcc.  On the qualified CUDA 13 Hopper/Blackwell lane,
+# keep the compiler in the miner venv so a clean cloud image needs no manual
+# system-toolkit installation.
+configure_runtime_cuda_compiler() {
+    if [ "$VLLM_RUNTIME_STACK" != "hopper-blackwell-cu130" ]; then
+        return 0
+    fi
+
+    local candidate=""
+    local compiler_cuda=""
+    local root
+    for root in "${CUDA_HOME:-}" /usr/local/cuda /usr/local/cuda-*; do
+        if [ -n "$root" ] && [ -x "$root/bin/nvcc" ]; then
+            compiler_cuda=$(
+                "$root/bin/nvcc" --version 2>/dev/null |
+                    sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
+                    head -1
+            )
+            if [ "$compiler_cuda" = "$TORCH_CUDA_VERSION" ]; then
+                candidate="$root"
+                break
+            fi
+        fi
+    done
+
+    if [ -z "$candidate" ]; then
+        candidate=$($PYTHON - <<'PY'
+import pathlib
+import site
+
+for site_root in site.getsitepackages():
+    cuda_root = pathlib.Path(site_root) / "nvidia" / "cu13"
+    if (cuda_root / "bin" / "nvcc").is_file():
+        print(cuda_root)
+        break
+PY
+        )
+    fi
+
+    if [ -z "$candidate" ]; then
+        echo "  Installing the CUDA ${TORCH_CUDA_VERSION} compiler required by production warmup..."
+        $PYTHON -m pip install --no-cache-dir \
+            "nvidia-cuda-nvcc==${TORCH_CUDA_VERSION}.*" \
+            "nvidia-cuda-cccl==${TORCH_CUDA_VERSION}.*" \
+            "nvidia-nvvm==${TORCH_CUDA_VERSION}.*" \
+            "nvidia-cuda-crt==${TORCH_CUDA_VERSION}.*" 2>&1 | tail -10
+        candidate=$($PYTHON - <<'PY'
+import pathlib
+import site
+
+for site_root in site.getsitepackages():
+    cuda_root = pathlib.Path(site_root) / "nvidia" / "cu13"
+    if (cuda_root / "bin" / "nvcc").is_file():
+        print(cuda_root)
+        break
+PY
+        )
+    fi
+
+    if [ -z "$candidate" ] || [ ! -x "$candidate/bin/nvcc" ]; then
+        echo "  ERROR: CUDA ${TORCH_CUDA_VERSION} nvcc is required for the qualified H100/Blackwell warmup path."
+        return 1
+    fi
+
+    compiler_cuda=$(
+        "$candidate/bin/nvcc" --version 2>/dev/null |
+            sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
+            head -1
+    )
+    if [ "$compiler_cuda" != "$TORCH_CUDA_VERSION" ]; then
+        echo "  ERROR: CUDA compiler $compiler_cuda does not match torch CUDA $TORCH_CUDA_VERSION."
+        return 1
+    fi
+
+    export CUDA_HOME="$candidate"
+    export PATH="$CUDA_HOME/bin:$PATH"
+    if [ -d "$CUDA_HOME/lib" ]; then
+        # The venv CUDA packages expose versioned runtime SONAMEs.  Extension
+        # linkers request the unversioned development names.
+        local library soname
+        for library in libcudart libcublas libcublasLt; do
+            if [ ! -e "$CUDA_HOME/lib/${library}.so" ]; then
+                soname=$(
+                    find "$CUDA_HOME/lib" -maxdepth 1 -type f \
+                        -name "${library}.so.*" -printf '%f\n' \
+                        2>/dev/null | sort -V | head -1
+                )
+                if [ -n "$soname" ]; then
+                    ln -s "$soname" "$CUDA_HOME/lib/${library}.so"
+                fi
+            fi
+        done
+        export LD_LIBRARY_PATH="$CUDA_HOME/lib:${LD_LIBRARY_PATH:-}"
+        export LIBRARY_PATH="$CUDA_HOME/lib:${LIBRARY_PATH:-}"
+    elif [ -d "$CUDA_HOME/lib64" ]; then
+        export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+        export LIBRARY_PATH="$CUDA_HOME/lib64:${LIBRARY_PATH:-}"
+    fi
+    echo "  CUDA compiler: $($CUDA_HOME/bin/nvcc --version | tail -1)"
+}
+
+warm_hopper_gdn_kernel() {
+    if [ "$GPU_SM" != "90" ] ||
+        [ "$VLLM_RUNTIME_STACK" != "hopper-blackwell-cu130" ]; then
+        return 0
+    fi
+
+    echo "  Warming the FlashInfer H100 GDN kernel..."
+    if ! timeout 600 env MAX_JOBS="${MAX_JOBS:-$(nproc)}" "$PYTHON" - <<'PY'
+import torch
+from flashinfer.gdn_prefill import get_gdn_prefill_module
+
+module = get_gdn_prefill_module()
+assert hasattr(module, "gdn_prefill"), "FlashInfer GDN kernel is incomplete"
+torch.cuda.synchronize()
+print("  FlashInfer H100 GDN kernel: OK")
+PY
+    then
+        echo "  ERROR: the production H100 GDN warmup could not compile and load."
+        return 1
+    fi
+}
 
 ensure_proof_cuda12_libraries() {
     local missing_packages
@@ -859,9 +1023,10 @@ if [ "$SKIP_INSTALL" = false ]; then
     #
     # Net selection:
     #  - sm < 89 (Ampere): vLLM 0.19.1 + torch 2.10.0 + cu128
-    #  - sm >= 120 with driver >= 580: vLLM 0.20.2 + torch 2.11.0 + cu130
+    #  - sm 90 or sm >= 120 with driver >= 580: vLLM 0.20.2 + torch
+    #    2.11.0 + cu130
     #  - sm >= 89 otherwise: vLLM 0.20.2 + torch 2.11.0 + cu128
-    if [ "${GPU_SM:-0}" -lt 89 ] 2>/dev/null; then
+    if [ "$VLLM_RUNTIME_STACK" = "ampere-cu128" ]; then
         VLLM_SOURCE_TAG="v0.19.1"
         echo "  Ampere GPU (sm_${GPU_SM}): installing vLLM 0.19.1 + torch 2.10.0+cu128..."
         TORCH_CONSTRAINT="$(mktemp)"
@@ -889,19 +1054,19 @@ if [ "$SKIP_INSTALL" = false ]; then
         else
             $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps 'vllm==0.19.1' 2>&1 | tail -5
         fi
-    elif [ "${GPU_SM:-0}" -ge 120 ] 2>/dev/null && [ "${GPU_DRIVER_MAJOR:-0}" -ge 580 ] 2>/dev/null; then
+    elif [ "$VLLM_RUNTIME_STACK" = "hopper-blackwell-cu130" ]; then
         VLLM_SOURCE_TAG="v0.20.2"
-        echo "  Blackwell GPU (sm_${GPU_SM}) on driver ${GPU_DRIVER}: installing vLLM 0.20.2 + torch 2.11.0+cu130..."
+        echo "  Hopper/Blackwell GPU (sm_${GPU_SM}) on driver ${GPU_DRIVER}: installing vLLM 0.20.2 + torch 2.11.0+cu130..."
         $PYTHON -m pip install --no-cache-dir \
             "vllm==0.20.2" "${VLLM_RUNTIME_DEPS[@]}" 2>&1 | tail -20
-        echo "  Verifying Blackwell torch/vLLM pins..."
+        echo "  Verifying Hopper/Blackwell torch/vLLM pins..."
         if torch_pin_ready "2.11.0+cu130" "13."; then
             echo "  torch 2.11.0+cu130 already installed"
         else
             $PYTHON -m pip install --no-cache-dir --force-reinstall \
                 "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" 2>&1 | tail -10
             if ! torch_pin_ready "2.11.0+cu130" "13."; then
-                echo "  ERROR: expected torch 2.11.0+cu130 on Blackwell/CUDA 13, but verification failed."
+                echo "  ERROR: expected torch 2.11.0+cu130 on Hopper/Blackwell CUDA 13, but verification failed."
                 echo "  Use a CUDA 13-capable image/driver or retry on a newer host."
                 exit 1
             fi
@@ -941,6 +1106,13 @@ if [ "$SKIP_INSTALL" = false ]; then
         if [ "${GPU_DRIVER_MAJOR:-0}" -lt 580 ] 2>/dev/null; then
             echo "  Driver ${GPU_DRIVER} is < 580: using cu128 torch and validating the vLLM wheel before any rebuild."
         fi
+    fi
+
+    if ! configure_runtime_cuda_compiler; then
+        exit 1
+    fi
+    if ! warm_hopper_gdn_kernel; then
+        exit 1
     fi
 
     echo "  Installing Verathos API deps..."
@@ -1311,8 +1483,10 @@ ENV_FILE="${REPO_DIR}/.env.sh"
 cat > "$ENV_FILE" <<ENVEOF
 # Auto-generated by setup_miner.sh — source from .bashrc for persistent env
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
+export LIBRARY_PATH="${LIBRARY_PATH:-}"
+export CUDA_HOME="${CUDA_HOME:-}"
 export HF_HOME="${HF_HOME}"
-export PATH="${REPO_DIR}/.venv-vllm/bin:\${PATH}"
+export PATH="${REPO_DIR}/.venv-vllm/bin${CUDA_HOME:+:${CUDA_HOME}/bin}:\${PATH}"
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export TORCHINDUCTOR_COMPILE_THREADS="\${TORCHINDUCTOR_COMPILE_THREADS:-\${VERATHOS_TORCHINDUCTOR_COMPILE_THREADS:-4}}"
 # Runtime cache paths are persisted from setup-time detection.  On normal

@@ -62,6 +62,7 @@ import logging
 import bittensor as bt
 import os
 import struct
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -1059,6 +1060,7 @@ class ProbationTracker:
         self.required_passes = required_passes
         self.escalation_epochs = escalation_epochs
         self._state_path = state_path
+        self._lock = threading.RLock()
         # Key: (miner_address, model_index) → ProbationState
         self._probation: Dict[Tuple[str, int], ProbationState] = {}
         self._load()
@@ -1066,53 +1068,57 @@ class ProbationTracker:
     def enter_probation(self, key: Tuple[str, int], epoch: int,
                         endpoint: str = "") -> None:
         """Put a miner-model entry on probation (or reset if already on)."""
-        if key in self._probation:
-            # Already on probation — reset consecutive passes
-            self._probation[key].consecutive_passes = 0
-            if endpoint:
-                self._probation[key].endpoint = endpoint
-            bt.logging.info(f"Probation RESET for {key[0][:10]} model_index={key[1]} (new failure during probation)")
-        else:
-            self._probation[key] = ProbationState(
-                entered_at_epoch=epoch,
-                required_passes=self.required_passes,
-                escalation_epochs=self.escalation_epochs,
-                endpoint=endpoint,
-            )
-            bt.logging.info(f"Probation ENTERED for {key[0][:10]} model_index={key[1]} at epoch {epoch} endpoint={endpoint} (must pass {self.required_passes} consecutive epochs to exit)")
-        self._save()
+        with self._lock:
+            if key in self._probation:
+                # Already on probation — reset consecutive passes
+                self._probation[key].consecutive_passes = 0
+                if endpoint:
+                    self._probation[key].endpoint = endpoint
+                bt.logging.info(f"Probation RESET for {key[0][:10]} model_index={key[1]} (new failure during probation)")
+            else:
+                self._probation[key] = ProbationState(
+                    entered_at_epoch=epoch,
+                    required_passes=self.required_passes,
+                    escalation_epochs=self.escalation_epochs,
+                    endpoint=endpoint,
+                )
+                bt.logging.info(f"Probation ENTERED for {key[0][:10]} model_index={key[1]} at epoch {epoch} endpoint={endpoint} (must pass {self.required_passes} consecutive epochs to exit)")
+            self._save()
 
     def record_pass(self, key: Tuple[str, int]) -> bool:
         """Record a clean epoch (all proofs passed) for a probation entry.
 
         Returns True if probation is lifted (enough consecutive passes).
         """
-        if key not in self._probation:
-            return False
+        with self._lock:
+            if key not in self._probation:
+                return False
 
-        state = self._probation[key]
-        state.consecutive_passes += 1
+            state = self._probation[key]
+            state.consecutive_passes += 1
 
-        if state.consecutive_passes >= state.required_passes:
-            del self._probation[key]
-            bt.logging.info(f"Probation LIFTED for {key[0][:10]} model_index={key[1]} after {state.consecutive_passes} consecutive passes")
+            if state.consecutive_passes >= state.required_passes:
+                del self._probation[key]
+                bt.logging.info(f"Probation LIFTED for {key[0][:10]} model_index={key[1]} after {state.consecutive_passes} consecutive passes")
+                self._save()
+                return True
+
+            bt.logging.info(f"Probation pass {state.consecutive_passes}/{state.required_passes} for {key[0][:10]} model_index={key[1]}")
             self._save()
-            return True
-
-        bt.logging.info(f"Probation pass {state.consecutive_passes}/{state.required_passes} for {key[0][:10]} model_index={key[1]}")
-        self._save()
-        return False
+            return False
 
     def record_failure(self, key: Tuple[str, int]) -> None:
         """Record a proof failure during probation — resets consecutive passes."""
-        if key in self._probation:
-            self._probation[key].consecutive_passes = 0
-            bt.logging.info(f"Probation pass counter RESET for {key[0][:10]} model_index={key[1]} (proof failure)")
-            self._save()
+        with self._lock:
+            if key in self._probation:
+                self._probation[key].consecutive_passes = 0
+                bt.logging.info(f"Probation pass counter RESET for {key[0][:10]} model_index={key[1]} (proof failure)")
+                self._save()
 
     def is_on_probation(self, key: Tuple[str, int]) -> bool:
         """Check if a miner-model entry is on probation."""
-        return key in self._probation
+        with self._lock:
+            return key in self._probation
 
     def migrate_index(self, address: str, new_index: int,
                       new_endpoint: str = "") -> bool:
@@ -1130,117 +1136,125 @@ class ProbationTracker:
 
         Returns True if a migration occurred.
         """
-        new_key = (address, new_index)
-        if new_key in self._probation:
-            return False  # already correct
+        with self._lock:
+            new_key = (address, new_index)
+            if new_key in self._probation:
+                return False  # already correct
 
-        # Find existing probation entry for this address with a different index
-        old_key = None
-        for k in self._probation:
-            if k[0] == address and k[1] != new_index:
-                old_key = k
-                break
+            # Find existing probation entry for this address with a different index
+            old_key = None
+            for k in self._probation:
+                if k[0] == address and k[1] != new_index:
+                    old_key = k
+                    break
 
-        if old_key is None:
-            return False
+            if old_key is None:
+                return False
 
-        old_state = self._probation[old_key]
-        old_endpoint = old_state.endpoint
+            old_state = self._probation[old_key]
+            old_endpoint = old_state.endpoint
 
-        # Only migrate if same endpoint (same server, new index)
-        if old_endpoint and new_endpoint and old_endpoint != new_endpoint:
-            bt.logging.info(
-                f"Probation NOT migrated for {address[:10]}: "
-                f"index {old_key[1]} ({old_endpoint}) != "
-                f"index {new_index} ({new_endpoint}) — different endpoints"
-            )
-            return False
+            # Only migrate if same endpoint (same server, new index)
+            if old_endpoint and new_endpoint and old_endpoint != new_endpoint:
+                bt.logging.info(
+                    f"Probation NOT migrated for {address[:10]}: "
+                    f"index {old_key[1]} ({old_endpoint}) != "
+                    f"index {new_index} ({new_endpoint}) — different endpoints"
+                )
+                return False
 
-        # Same endpoint (or unknown endpoints for old probation entries
-        # that predate the endpoint field) — migrate
-        self._probation[new_key] = self._probation.pop(old_key)
-        bt.logging.info(f"Probation migrated for {address[:10]}: model_index {old_key[1]} -> {new_index}")
-        self._save()
-        return True
+            # Same endpoint (or unknown endpoints for old probation entries
+            # that predate the endpoint field) — migrate
+            self._probation[new_key] = self._probation.pop(old_key)
+            bt.logging.info(f"Probation migrated for {address[:10]}: model_index {old_key[1]} -> {new_index}")
+            self._save()
+            return True
 
     def should_escalate(self, key: Tuple[str, int], current_epoch: int) -> bool:
         """Check if probation has lasted long enough to escalate to reportOffline."""
-        if key not in self._probation:
-            return False
-        state = self._probation[key]
-        return (current_epoch - state.entered_at_epoch) >= state.escalation_epochs
+        with self._lock:
+            if key not in self._probation:
+                return False
+            state = self._probation[key]
+            return (current_epoch - state.entered_at_epoch) >= state.escalation_epochs
 
     def get_probation_entries(self) -> Set[Tuple[str, int]]:
         """Get all (miner_address, model_index) pairs currently on probation."""
-        return set(self._probation.keys())
+        with self._lock:
+            return set(self._probation.keys())
 
     def get_probation_addresses(self) -> Dict[str, List[int]]:
         """Get probation entries grouped by address (for shared state)."""
-        result: Dict[str, List[int]] = {}
-        for addr, model_index in self._probation:
-            result.setdefault(addr, []).append(model_index)
-        return result
+        with self._lock:
+            result: Dict[str, List[int]] = {}
+            for addr, model_index in self._probation:
+                result.setdefault(addr, []).append(model_index)
+            return result
 
     def clear_address(self, address: str) -> int:
         """Drop probation state for an identity that no longer owns its UID."""
-        address_lower = str(address).lower()
-        stale_keys = [key for key in self._probation if key[0].lower() == address_lower]
-        for key in stale_keys:
-            del self._probation[key]
-        if stale_keys:
-            self._save()
-        return len(stale_keys)
+        with self._lock:
+            address_lower = str(address).lower()
+            stale_keys = [key for key in self._probation if key[0].lower() == address_lower]
+            for key in stale_keys:
+                del self._probation[key]
+            if stale_keys:
+                self._save()
+            return len(stale_keys)
 
     def clear_all(self) -> int:
         """Clear all operational probation entries and persist once."""
 
-        count = len(self._probation)
-        self._probation.clear()
-        self._save()
-        return count
+        with self._lock:
+            count = len(self._probation)
+            self._probation.clear()
+            self._save()
+            return count
 
     def _save(self) -> None:
         """Persist probation state to disk (atomic write)."""
-        data = []
-        for (addr, model_index), state in self._probation.items():
-            data.append({
-                "address": addr,
-                "model_index": model_index,
-                "entered_at_epoch": state.entered_at_epoch,
-                "consecutive_passes": state.consecutive_passes,
-                "required_passes": state.required_passes,
-                "escalation_epochs": state.escalation_epochs,
-                "endpoint": state.endpoint,
-            })
-        tmp_path = self._state_path + ".tmp"
-        try:
-            with open(tmp_path, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp_path, self._state_path)
-        except Exception as exc:
-            bt.logging.warning(f"Failed to save probation state: {exc}")
+        with self._lock:
+            data = []
+            for (addr, model_index), state in self._probation.items():
+                data.append({
+                    "address": addr,
+                    "model_index": model_index,
+                    "entered_at_epoch": state.entered_at_epoch,
+                    "consecutive_passes": state.consecutive_passes,
+                    "required_passes": state.required_passes,
+                    "escalation_epochs": state.escalation_epochs,
+                    "endpoint": state.endpoint,
+                })
+            tmp_path = self._state_path + ".tmp"
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+                with open(tmp_path, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp_path, self._state_path)
+            except Exception as exc:
+                bt.logging.warning(f"Failed to save probation state: {exc}")
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _load(self) -> None:
         """Load probation state from disk (if it exists)."""
-        try:
-            with open(self._state_path) as f:
-                data = json.load(f)
-            for entry in data:
-                key = (entry["address"], entry["model_index"])
-                self._probation[key] = ProbationState(
-                    entered_at_epoch=entry["entered_at_epoch"],
-                    consecutive_passes=entry.get("consecutive_passes", 0),
-                    required_passes=entry.get("required_passes", self.required_passes),
-                    escalation_epochs=entry.get("escalation_epochs", self.escalation_epochs),
-                    endpoint=entry.get("endpoint", ""),
-                )
-            if self._probation:
-                bt.logging.info(f"Loaded {len(self._probation)} probation entries from {self._state_path}")
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            bt.logging.warning(f"Failed to load probation state: {exc}")
+        with self._lock:
+            try:
+                with open(self._state_path) as f:
+                    data = json.load(f)
+                for entry in data:
+                    key = (entry["address"], entry["model_index"])
+                    self._probation[key] = ProbationState(
+                        entered_at_epoch=entry["entered_at_epoch"],
+                        consecutive_passes=entry.get("consecutive_passes", 0),
+                        required_passes=entry.get("required_passes", self.required_passes),
+                        escalation_epochs=entry.get("escalation_epochs", self.escalation_epochs),
+                        endpoint=entry.get("endpoint", ""),
+                    )
+                if self._probation:
+                    bt.logging.info(f"Loaded {len(self._probation)} probation entries from {self._state_path}")
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                bt.logging.warning(f"Failed to load probation state: {exc}")

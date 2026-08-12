@@ -1293,6 +1293,15 @@ async def health():
     if state.batch_mode and state.admission is not None:
         s = state.admission.status()
         result["active_requests"] = s.active_requests
+        # Admission reservations and live vLLM requests must agree after a
+        # disconnected stream has been cleaned up.  Expose the engine-side
+        # count separately so routing and operators can detect an orphaned
+        # generation instead of treating the endpoint as idle.
+        result["engine_active_requests"] = (
+            state.batch_engine.num_active
+            if state.batch_engine is not None
+            else 0
+        )
         result["max_requests"] = state.admission.max_requests
         result["kv_pool_tokens"] = s.total_kv_tokens
         result["kv_used_tokens"] = s.used_tokens
@@ -1491,6 +1500,33 @@ def _resolve_sampling_params(
         "top_p": body.top_p if body.top_p is not None else 1.0,
         "min_p": body.min_p if body.min_p is not None else 0.0,
     }
+
+
+def _private_vllm_sampling_seed(
+    canonical_seed: bytes | None = None,
+) -> int:
+    """Return a private per-request seed for vLLM's CUDA sampler.
+
+    vLLM uses the process-global CUDA generator whenever any sampled request
+    has no seed. A failed CUDA-graph capture can leave that generator in
+    PyTorch's capture state, causing every later unseeded sample to fail even
+    though the engine itself remains usable. Giving every stochastic request
+    its own generator avoids that process-global failure mode. The canonical
+    proof seed remains unchanged and is only domain-separated for vLLM's
+    internal draw; unaudited stochastic requests receive fresh private
+    entropy without adding proof capture work.
+    """
+
+    if canonical_seed is None:
+        material = os.urandom(32)
+    else:
+        if not isinstance(canonical_seed, bytes) or len(canonical_seed) != 32:
+            raise ValueError("canonical sampling seed must contain 32 bytes")
+        material = canonical_seed
+    digest = hashlib.sha256(
+        b"verathos.vllm.private_sampling_seed.v1\x00" + material
+    ).digest()
+    return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
 
 
 def _chat_template_kwargs(tokenizer, enable_thinking: bool = True) -> dict:
@@ -2980,9 +3016,10 @@ async def _stream_inference(
         )
         moe_hook_mgr.install_hooks()
 
-    sampling_params = SamplingParams(
-        **_resolve_sampling_params(body, state.model_name),
-    )
+    _resolved_sp = _resolve_sampling_params(body, state.model_name)
+    if body.do_sample:
+        _resolved_sp["seed"] = _private_vllm_sampling_seed()
+    sampling_params = SamplingParams(**_resolved_sp)
 
     engine = miner.llm.llm_engine
     t_infer = time.perf_counter()
@@ -3899,6 +3936,7 @@ async def _stream_inference_batched(
             yield f"event: error\ndata: {error_data}\n\n"
             return
 
+    engine_request_active = False
     try:
         # Register with activation tracker (before first engine step).
         # Capture logits for high-assurance v1 checks, canonical sampled
@@ -3999,6 +4037,8 @@ async def _stream_inference_batched(
 
         # Resolve sampling params and build canonical sampler if do_sample=True.
         _resolved_sp = _resolve_sampling_params(body, state.model_name)
+        if body.do_sample:
+            _resolved_sp["seed"] = _private_vllm_sampling_seed(_seed_bytes)
 
         sampling_params = SamplingParams(**_resolved_sp)
         # vLLM owns the object passed to add_request.  Keep an independent,
@@ -4040,6 +4080,7 @@ async def _stream_inference_batched(
                 else None
             ),
         )
+        engine_request_active = True
 
         # Stream tokens from per-request queue
         prev_text = ""
@@ -4075,6 +4116,7 @@ async def _stream_inference_batched(
             except asyncio.TimeoutError:
                 yield f"event: error\ndata: {json.dumps({'error': 'Inference timeout'})}\n\n"
                 batch_engine.abort_request(request_id)
+                engine_request_active = False
                 if tracker is not None:
                     tracker.unregister_request(request_id)
                 if moe_mgr:
@@ -4082,6 +4124,9 @@ async def _stream_inference_batched(
                 return
 
             if isinstance(output, BatchEngineRequestError):
+                # The shared step loop already aborted every affected engine
+                # request before publishing this bounded error.
+                engine_request_active = False
                 yield (
                     "event: error\n"
                     f"data: {json.dumps({'error': str(output)})}\n\n"
@@ -4106,6 +4151,9 @@ async def _stream_inference_batched(
                     t_first_token = time.perf_counter()
                 t_last_token = time.perf_counter()
             if output.finished:
+                # BatchAwareEngine removes a finished request before putting
+                # this terminal output on the request queue.
+                engine_request_active = False
                 t_inference_finished = time.perf_counter()
                 final_output = output
                 miner.input_token_ids[session_id] = [
@@ -4145,6 +4193,7 @@ async def _stream_inference_batched(
                                     output.outputs[0].finish_reason or ""
                                 ),
                                 sampling_params=proof_v3_replay_sampling_params,
+                                requested_decode_tokens=body.max_new_tokens,
                             )
                         )
                     except Exception as exc:
@@ -4592,6 +4641,22 @@ async def _stream_inference_batched(
             tracker.unregister_request(request_id)
 
     finally:
+        # Closing an SSE response cancels this generator.  Admission cleanup
+        # alone is insufficient: without an explicit abort, vLLM can continue
+        # an invisible generation after the client has gone away, consuming
+        # scheduler/KV capacity while /health reports the reservation free.
+        if engine_request_active:
+            try:
+                batch_engine.abort_request(request_id)
+            except Exception:
+                bt.logging.exception(
+                    f"Failed to abort disconnected request {request_id}"
+                )
+            if tracker is not None:
+                tracker.unregister_request(request_id)
+            if moe_mgr:
+                moe_mgr.clear_request(request_id)
+            _cleanup_inference_session(miner, session_id)
         # Always release token budget, even on error/timeout
         await admission.release(request_id)
 

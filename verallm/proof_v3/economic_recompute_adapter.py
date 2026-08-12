@@ -121,6 +121,31 @@ _CORRIDOR_REPORT = None
 _REPLAY_CAPTURE_MAX_LSB_DELTA_V3 = 1
 
 
+def _execution_anchor_row_for_absolute_position_v3(
+    *,
+    absolute_position: int,
+    prefix_cached_tokens: int,
+) -> int | None:
+    """Map a request position into the executed-suffix anchor domain.
+
+    Prefix-cache execution-anchor trees contain only rows executed by the
+    current request.  Positions inside the reused prefix therefore have no
+    row in that tree; positions in the executed suffix are indexed from zero.
+    """
+    if (
+        isinstance(absolute_position, bool)
+        or not isinstance(absolute_position, int)
+        or absolute_position < 0
+        or isinstance(prefix_cached_tokens, bool)
+        or not isinstance(prefix_cached_tokens, int)
+        or prefix_cached_tokens < 0
+    ):
+        raise ValueError("execution-anchor position is malformed")
+    if absolute_position < prefix_cached_tokens:
+        return None
+    return absolute_position - prefix_cached_tokens
+
+
 def _replay_capture_cell_matches_v3(
     actual: int,
     expected: int,
@@ -177,8 +202,10 @@ def _replay_capture_row_matches_v3(
         delta = actual_values - expected_values
         if not bool(np.all(np.abs(delta) <= max_lsb_delta)):
             return False
+        if max_row_sq_delta is None:
+            return True
         row_sq_delta = sum(int(value) * int(value) for value in delta)
-        return max_row_sq_delta is None or row_sq_delta <= max_row_sq_delta
+        return row_sq_delta <= max_row_sq_delta
     except ImportError:  # pragma: no cover - production dependency.
         deltas = tuple(
             int(actual_value) - int(expected_value)
@@ -5153,8 +5180,20 @@ def verify_economic_recompute_v3(
             input_stage_id = f"l{previous_layer}.residual_out"
             for token in layer_tokens:
                 position = lean_positions_by_layer[layer][token]
+                anchor_position = (
+                    _execution_anchor_row_for_absolute_position_v3(
+                        absolute_position=position,
+                        prefix_cached_tokens=prefix_cached_tokens,
+                    )
+                )
+                if anchor_position is None:
+                    # The exact BF16/FP16 predecessor was reused from the
+                    # authenticated cache and is not part of this request's
+                    # executed-suffix anchor tree.  Retain the existing
+                    # conservative quantized RMSNorm check for that row.
+                    continue
                 try:
-                    input_raw = anchor_rows[input_stage_id][position]
+                    input_raw = anchor_rows[input_stage_id][anchor_position]
                 except KeyError:
                     # Some all-attention corridors open only their signed
                     # endpoints.  They retain the pre-existing conservative
@@ -5826,19 +5865,25 @@ def verify_economic_recompute_v3(
                 input_values, post_values, input_raw, post_raw = (
                     norm_source_rows_by_token[token]
                 )
-                if tuple(rin_rows[token]) != quantize_execution_anchor_row_v3(
-                    row_bytes=input_raw,
-                    scale=rin_scale,
-                    encoding_id=anchor_encoding,
+                if not _replay_capture_row_matches_v3(
+                    tuple(rin_rows[token]),
+                    quantize_execution_anchor_row_v3(
+                        row_bytes=input_raw,
+                        scale=rin_scale,
+                        encoding_id=anchor_encoding,
+                    ),
                 ):
                     raise _fail(
                         f"lean GDN coupling l{layer} input norm source is "
                         "detached from its projection row"
                     )
-                if tuple(mid_rows[token]) != quantize_execution_anchor_row_v3(
-                    row_bytes=post_raw,
-                    scale=mid_scale,
-                    encoding_id=anchor_encoding,
+                if not _replay_capture_row_matches_v3(
+                    tuple(mid_rows[token]),
+                    quantize_execution_anchor_row_v3(
+                        row_bytes=post_raw,
+                        scale=mid_scale,
+                        encoding_id=anchor_encoding,
+                    ),
                 ):
                     raise _fail(
                         f"lean GDN coupling l{layer} post norm source is "

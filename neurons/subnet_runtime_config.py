@@ -663,6 +663,9 @@ def build_default_subnet_config_payload(
             "allow_timing_only_score_gate": bool(
                 neuron_config.capacity_audit_allow_timing_only_score_gate
             ),
+            "uid_escalation_enabled": bool(
+                neuron_config.capacity_audit_uid_escalation_enabled
+            ),
             "uid_escalation_min_entries": int(
                 neuron_config.capacity_audit_uid_escalation_min_entries
             ),
@@ -767,6 +770,7 @@ def validate_subnet_config_payload(
     audit_data_with_defaults = dict(audit_data)
     audit_data_with_defaults.setdefault("max_proof_payload_bytes", 32 * 1024 * 1024)
     audit_data_with_defaults.setdefault("invalid_proof_misses_for_zero_score", 1)
+    audit_data_with_defaults.setdefault("uid_escalation_enabled", False)
     audit_data_with_defaults.setdefault("uid_escalation_min_entries", 2)
     audit_data_with_defaults.setdefault("uid_escalation_fraction", 0.10)
     audit_data_with_defaults.setdefault("uid_escalation_max_entries", 10)
@@ -823,6 +827,9 @@ def validate_subnet_config_payload(
         ),
         allow_timing_only_score_gate=_require_bool(
             audit_data, "allow_timing_only_score_gate"
+        ),
+        uid_escalation_enabled=_require_bool(
+            audit_data_with_defaults, "uid_escalation_enabled"
         ),
         uid_escalation_min_entries=_require_int(
             audit_data_with_defaults, "uid_escalation_min_entries", minimum=1
@@ -906,6 +913,7 @@ def validate_subnet_config_payload(
             capacity_audit.invalid_proof_misses_for_zero_score
         ),
         "allow_timing_only_score_gate": capacity_audit.allow_timing_only_score_gate,
+        "uid_escalation_enabled": capacity_audit.uid_escalation_enabled,
         "uid_escalation_min_entries": capacity_audit.uid_escalation_min_entries,
         "uid_escalation_fraction": capacity_audit.uid_escalation_fraction,
         "uid_escalation_max_entries": capacity_audit.uid_escalation_max_entries,
@@ -1023,6 +1031,7 @@ def apply_runtime_config_to_neuron_config(
     config.capacity_audit_allow_timing_only_score_gate = (
         audit.allow_timing_only_score_gate
     )
+    config.capacity_audit_uid_escalation_enabled = audit.uid_escalation_enabled
     config.capacity_audit_uid_escalation_min_entries = (
         audit.uid_escalation_min_entries
     )
@@ -1190,6 +1199,9 @@ def capacity_audit_config_from_neuron_config(config: Any) -> CapacityAuditRuntim
         ),
         allow_timing_only_score_gate=bool(
             getattr(config, "capacity_audit_allow_timing_only_score_gate", True)
+        ),
+        uid_escalation_enabled=bool(
+            getattr(config, "capacity_audit_uid_escalation_enabled", False)
         ),
         uid_escalation_min_entries=int(
             getattr(config, "capacity_audit_uid_escalation_min_entries", 2)

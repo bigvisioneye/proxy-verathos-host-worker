@@ -5283,6 +5283,7 @@ class AsyncValidatorClient(ValidatorClient):
         min_p: float = 0.0,
         stream_callback=None,
         proof_challenge_id: bytes | None = None,
+        first_token_timeout_seconds: float | None = None,
     ):
         """Run one qualified greedy proof-v3 chat exchange asynchronously."""
 
@@ -5312,6 +5313,7 @@ class AsyncValidatorClient(ValidatorClient):
             request_body=request_body,
             exchange=exchange,
             stream_callback=stream_callback,
+            first_token_timeout_seconds=first_token_timeout_seconds,
         )
 
     async def run_chat(

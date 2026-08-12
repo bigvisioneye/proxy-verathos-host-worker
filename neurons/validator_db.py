@@ -20,6 +20,7 @@ import math
 import bittensor as bt
 import os
 import sqlite3
+import statistics
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -1988,6 +1989,9 @@ class ValidatorStateDB:
                    SET timing_status = 'missing_final',
                        verdict = 'no_show',
                        failure_reason = COALESCE(failure_reason, 'missing_final_receipt'),
+                       probation_required = CASE
+                           WHEN ? != 0 THEN 1 ELSE probation_required
+                       END,
                        updated_at = ?
                    WHERE verdict IN ('pending', 'pass0_seen')
                      AND audit_id IN (
@@ -2000,7 +2004,7 @@ class ValidatorStateDB:
                        FROM capacity_audit_windows w
                        WHERE w.audit_id = capacity_audit_slots.audit_id
                      ) + deadline_s + transport_grace_s""",
-                (ts, ts),
+                (1 if probation_required else 0, ts, ts),
             )
             updated = cur.rowcount or 0
             if require_proof_payload:
@@ -2557,6 +2561,7 @@ class ValidatorStateDB:
         since_epoch: int,
         verdicts: Tuple[str, ...] = ("timing_miss", "hard_proof_miss", "no_show"),
         require_chain_confirmed: bool = False,
+        require_consequence_eligible: bool = False,
     ) -> int:
         placeholders = ",".join("?" for _ in verdicts)
         confirmation_clause = ""
@@ -2573,6 +2578,9 @@ class ValidatorStateDB:
                 " )"
                 " AND w.chain_status != 'reorged'"
             )
+        eligibility_clause = (
+            " AND s.probation_required != 0" if require_consequence_eligible else ""
+        )
         with self._lock:
             identity_clause, identity_params = self._capacity_address_identity_filter_locked(
                 address
@@ -2586,6 +2594,7 @@ class ValidatorStateDB:
                       AND w.epoch_number >= ?
                       AND s.verdict IN ({placeholders})
                       AND {identity_clause}
+                      {eligibility_clause}
                       {confirmation_clause}""",
                 (
                     address.lower(), int(model_index), int(since_epoch),
@@ -2601,6 +2610,7 @@ class ValidatorStateDB:
         *,
         since_epoch: int,
         require_chain_confirmed: bool = False,
+        require_consequence_eligible: bool = False,
     ) -> int:
         confirmation_clause = ""
         if require_chain_confirmed:
@@ -2616,6 +2626,9 @@ class ValidatorStateDB:
                 " )"
                 " AND w.chain_status != 'reorged'"
             )
+        eligibility_clause = (
+            " AND s.probation_required != 0" if require_consequence_eligible else ""
+        )
         with self._lock:
             identity_clause, identity_params = self._capacity_address_identity_filter_locked(
                 address
@@ -2640,6 +2653,7 @@ class ValidatorStateDB:
                         )
                       )
                       AND {identity_clause}
+                      {eligibility_clause}
                       {confirmation_clause}""",
                 (
                     address.lower(), int(model_index), int(since_epoch),
@@ -2691,6 +2705,7 @@ class ValidatorStateDB:
         *,
         since_epoch: int,
         require_chain_confirmed: bool = False,
+        require_consequence_eligible: bool = False,
     ) -> Dict[Tuple[str, int], dict]:
         """Return finalized failure counts grouped by the registered endpoint slot."""
         confirmation_clause = ""
@@ -2707,6 +2722,9 @@ class ValidatorStateDB:
                 " )"
                 " AND w.chain_status != 'reorged'"
             )
+        eligibility_clause = (
+            " AND s.probation_required != 0" if require_consequence_eligible else ""
+        )
         with self._lock:
             identity_clause, identity_params = self._capacity_uid_identity_filter_locked(uid)
             rows = self._conn.execute(
@@ -2741,6 +2759,7 @@ class ValidatorStateDB:
                     WHERE w.epoch_number >= ?
                       AND ({identity_clause})
                       AND s.verdict IN ('hard_proof_miss', 'no_show', 'timing_miss')
+                      {eligibility_clause}
                       {confirmation_clause}
                     GROUP BY s.miner_address, s.model_index""",
                 (int(since_epoch), *identity_params),
@@ -3363,6 +3382,7 @@ class ValidatorStateDB:
                          AND e.model_index = s.model_index
                         WHERE w.epoch_number >= ?
                           AND COALESCE(s.miner_uid, e.bittensor_uid) IS NOT NULL
+                          AND s.probation_required != 0
                           AND s.verdict IN ('hard_proof_miss', 'no_show', 'timing_miss')
                           {confirmation_clause}
                         ORDER BY w.epoch_number ASC""",
@@ -4029,12 +4049,20 @@ class ValidatorStateDB:
 
                 evidence_entry_count = len([k for k in gate_counts if k[0] == uid])
                 entry_count = max(active_count_by_uid.get(uid, 0), evidence_entry_count)
+                uid_gate_enabled = bool(
+                    gate_enabled
+                    and getattr(capacity_audit_cfg, "uid_escalation_enabled", False)
+                )
                 quorum = (
                     capacity_audit_uid_escalation_threshold(entry_count, capacity_audit_cfg)
-                    if gate_enabled and entry_count > 0
+                    if uid_gate_enabled and entry_count > 0
                     else 0
                 )
-                uid_gate_active = bool(gate_enabled and entry_count > 1 and len(convicted) >= quorum)
+                uid_gate_active = bool(
+                    uid_gate_enabled
+                    and entry_count > 1
+                    and len(convicted) >= quorum
+                )
                 uid_next_clear_epoch = None
                 if uid_gate_active and quorum > 0:
                     clear_epochs = sorted(
@@ -4177,8 +4205,15 @@ class ValidatorStateDB:
                     },
                     "network": network,
                     "uid_gate": {
-                        "configured": gate_configured,
-                        "enabled": gate_enabled,
+                        "configured": bool(
+                            gate_configured
+                            and getattr(
+                                capacity_audit_cfg,
+                                "uid_escalation_enabled",
+                                False,
+                            )
+                        ),
+                        "enabled": uid_gate_enabled,
                         "suppression_reason": (
                             str(capacity_audit_gate_suppression_reason or "")
                             if gate_configured and not gate_enabled else ""
@@ -4260,6 +4295,46 @@ class ValidatorStateDB:
                 score = 0.01  # active but not yet scored — allow routing
             miner_scores[addr][idx_str] = score
 
+        # Use only this validator's accepted receipts.  This is the same
+        # validator-observed timing source used by scoring, without trusting a
+        # miner-reported TPS value.  Very short completions are excluded
+        # because setup/TTFT dominates them and makes decode speed noisy.
+        recent_tps: Dict[Tuple[str, int], List[float]] = {}
+        recent_ttft: Dict[Tuple[str, int], List[float]] = {}
+        with self._lock:
+            tps_rows = self._conn.execute(
+                """SELECT LOWER(miner_address) AS miner_address,
+                          model_index, tokens_generated,
+                          generation_time_ms, ttft_ms
+                   FROM network_receipts
+                   WHERE epoch_number BETWEEN ? AND ?
+                     AND is_own = 1
+                     AND tokens_generated >= 32
+                     AND generation_time_ms > ttft_ms
+                     AND (proof_requested = 0 OR proof_verified = 1)""",
+                (max(0, int(epoch) - 2), int(epoch)),
+            ).fetchall()
+        for row in tps_rows:
+            key = (str(row["miner_address"]).lower(), int(row["model_index"]))
+            output_tokens = int(row["tokens_generated"])
+            decode_ms = float(row["generation_time_ms"]) - float(row["ttft_ms"])
+            if output_tokens <= 1 or decode_ms <= 0.0:
+                continue
+            recent_tps.setdefault(key, []).append(
+                (output_tokens - 1) / (decode_ms / 1000.0)
+            )
+            recent_ttft.setdefault(key, []).append(float(row["ttft_ms"]))
+        miner_tps: Dict[str, Dict[str, float]] = {}
+        for (addr, model_index), values in recent_tps.items():
+            miner_tps.setdefault(addr, {})[str(model_index)] = float(
+                statistics.median(values)
+            )
+        miner_ttft_ms: Dict[str, Dict[str, float]] = {}
+        for (addr, model_index), values in recent_ttft.items():
+            miner_ttft_ms.setdefault(addr, {})[str(model_index)] = float(
+                statistics.median(values)
+            )
+
         # Build miner_endpoints from active entries only — inactive miners
         # should not be listed as routable endpoints.
         miner_endpoints: List[MinerEntry] = []
@@ -4291,6 +4366,8 @@ class ValidatorStateDB:
             epoch_number=epoch,
             epoch_start_block=start_block,
             miner_scores=miner_scores,
+            miner_tps=miner_tps,
+            miner_ttft_ms=miner_ttft_ms,
             probation_miners=probation,
             miner_endpoints=miner_endpoints,
             audit_drains=audit_drains,
@@ -4535,45 +4612,47 @@ class ValidatorStateDB:
 
     def backup_and_cleanup_canary_results(self, retain_days: int = 7, backup_dir: str = "") -> int:
         """Export old canary_results to .jsonl.gz, then delete from live DB."""
-        import gzip
-        import json as _json
-
-        cutoff = time.time() - (retain_days * 86400)
-        if not backup_dir:
-            backup_dir = os.path.join(
-                os.environ.get("VERALLM_DATA_DIR", os.path.expanduser("~/.verathos")), "backups",
-            )
-        os.makedirs(backup_dir, exist_ok=True)
-
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM canary_results WHERE created_at < ?", (cutoff,),
-            ).fetchall()
-            if not rows:
-                return 0
-
-            from datetime import datetime
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = os.path.join(backup_dir, f"canary_results_{ts}.jsonl.gz")
-            col_names = [desc[0] for desc in self._conn.execute(
-                "SELECT * FROM canary_results LIMIT 0"
-            ).description]
-
-            with gzip.open(backup_path, "wt") as f:
-                for row in rows:
-                    f.write(_json.dumps(dict(zip(col_names, row)), default=str) + "\n")
-
-            self._conn.execute(
-                "DELETE FROM canary_results WHERE created_at < ?", (cutoff,),
-            )
-            self._conn.commit()
-            bt.logging.info(f"Canary results backup: {len(rows)} rows → {backup_path}")
-            return len(rows)
+        return self._backup_and_cleanup_analytics_table(
+            table="canary_results",
+            file_prefix="canary_results",
+            log_label="Canary results",
+            retain_days=retain_days,
+            backup_dir=backup_dir,
+        )
 
     def backup_and_cleanup_network_receipts(self, retain_days: int = 7, backup_dir: str = "") -> int:
         """Export old network_receipts to .jsonl.gz, then delete from live DB."""
+        return self._backup_and_cleanup_analytics_table(
+            table="network_receipts",
+            file_prefix="network_receipts",
+            log_label="Network receipts",
+            retain_days=retain_days,
+            backup_dir=backup_dir,
+        )
+
+    def _backup_and_cleanup_analytics_table(
+        self,
+        *,
+        table: str,
+        file_prefix: str,
+        log_label: str,
+        retain_days: int,
+        backup_dir: str,
+    ) -> int:
+        """Stream one append-only analytics table into an atomic gzip archive.
+
+        Analytics tables can contain millions of rows.  A separate read
+        connection keeps normal validator writes moving under WAL while rows
+        are encoded one at a time; the previous ``fetchall()`` retained every
+        Python row object and could exhaust validator host memory.  Deletion is
+        bounded by the captured maximum primary key, so rows appended during
+        the archive are never removed.
+        """
         import gzip
         import json as _json
+
+        if table not in {"canary_results", "network_receipts"}:
+            raise ValueError(f"unsupported analytics archive table: {table}")
 
         cutoff = time.time() - (retain_days * 86400)
         if not backup_dir:
@@ -4582,30 +4661,80 @@ class ValidatorStateDB:
             )
         os.makedirs(backup_dir, exist_ok=True)
 
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM network_receipts WHERE created_at < ?", (cutoff,),
-            ).fetchall()
-            if not rows:
+        read_conn = sqlite3.connect(self._db_path)
+        read_conn.row_factory = sqlite3.Row
+        read_conn.execute("PRAGMA query_only=ON")
+        tmp_path = ""
+        backup_path = ""
+        archived = 0
+        max_id = 0
+        try:
+            max_row = read_conn.execute(
+                f"SELECT MAX(id) AS max_id FROM {table} WHERE created_at < ?",
+                (cutoff,),
+            ).fetchone()
+            max_id = int(max_row["max_id"] or 0) if max_row is not None else 0
+            if max_id <= 0:
                 return 0
 
             from datetime import datetime
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = os.path.join(backup_dir, f"network_receipts_{ts}.jsonl.gz")
-            col_names = [desc[0] for desc in self._conn.execute(
-                "SELECT * FROM network_receipts LIMIT 0"
-            ).description]
 
-            with gzip.open(backup_path, "wt") as f:
-                for row in rows:
-                    f.write(_json.dumps(dict(zip(col_names, row)), default=str) + "\n")
-
-            self._conn.execute(
-                "DELETE FROM network_receipts WHERE created_at < ?", (cutoff,),
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            backup_path = os.path.join(backup_dir, f"{file_prefix}_{ts}.jsonl.gz")
+            tmp_path = (
+                f"{backup_path}.{os.getpid()}.{threading.get_ident()}.tmp"
             )
-            self._conn.commit()
-            bt.logging.info(f"Network receipts backup: {len(rows)} rows → {backup_path}")
-            return len(rows)
+            cursor = read_conn.execute(
+                f"""SELECT * FROM {table}
+                    WHERE created_at < ? AND id <= ?
+                    ORDER BY id ASC""",
+                (cutoff, max_id),
+            )
+            col_names = [desc[0] for desc in cursor.description]
+            with gzip.open(tmp_path, "wt") as output:
+                while True:
+                    row = cursor.fetchone()
+                    if row is None:
+                        break
+                    output.write(
+                        _json.dumps(dict(zip(col_names, row)), default=str) + "\n"
+                    )
+                    archived += 1
+            if archived <= 0:
+                os.remove(tmp_path)
+                return 0
+            os.replace(tmp_path, backup_path)
+            tmp_path = ""
+        except Exception:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except FileNotFoundError:
+                    pass
+            raise
+        finally:
+            read_conn.close()
+
+        # The archive is durable and visible before any live rows are deleted.
+        # If deletion fails, the rows remain and a later run may create a
+        # duplicate archive, but analytics data is never silently lost.
+        while True:
+            with self._lock:
+                deleted = self._conn.execute(
+                    f"""DELETE FROM {table}
+                        WHERE id IN (
+                            SELECT id FROM {table}
+                            WHERE created_at < ? AND id <= ?
+                            ORDER BY id ASC
+                            LIMIT 5000
+                        )""",
+                    (cutoff, max_id),
+                ).rowcount
+                self._conn.commit()
+            if int(deleted or 0) < 5000:
+                break
+        bt.logging.info(f"{log_label} backup: {archived} rows → {backup_path}")
+        return archived
 
     # ── Cleanup ──────────────────────────────────────────────────────
 

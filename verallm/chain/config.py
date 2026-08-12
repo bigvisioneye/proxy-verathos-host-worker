@@ -171,11 +171,18 @@ class ChainConfig:
         "finney": "chain_config_mainnet.json",
     }
 
-    # Default EVM RPC URLs per network (used when rpc_url not in JSON or CLI)
+    # Default EVM RPC URLs per network (used when rpc_url not in JSON or CLI).
     _NETWORK_RPC_URLS = {
         "test": "https://test.chain.opentensor.ai",
         "finney": "https://lite.chain.opentensor.ai",
     }
+
+    _PUBLIC_RPC_HOSTS = frozenset({
+        "lite.chain.opentensor.ai",
+        "test.chain.opentensor.ai",
+        "entrypoint-finney.opentensor.ai",
+        "entrypoint-test-finney.opentensor.ai",
+    })
 
     @classmethod
     def resolve_config_path(cls, chain_config: str | None, subtensor_network: str | None) -> str | None:
@@ -244,6 +251,21 @@ class ChainConfig:
         if subtensor_network:
             return cls._NETWORK_RPC_URLS.get(subtensor_network)
         return None
+
+    @classmethod
+    def is_public_rpc_endpoint(cls, endpoint: str | None) -> bool:
+        """Return whether an explicitly configured endpoint is public RPC."""
+        if not endpoint:
+            return False
+        from urllib.parse import urlparse
+
+        host = (urlparse(endpoint).hostname or "").lower()
+        return host in cls._PUBLIC_RPC_HOSTS
+
+    @classmethod
+    def should_warn_public_rpc(cls, endpoint: str | None) -> bool:
+        """Return whether the miner will use the public network RPC path."""
+        return not endpoint or cls.is_public_rpc_endpoint(endpoint)
 
     @classmethod
     @classmethod

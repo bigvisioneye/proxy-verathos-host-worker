@@ -27,6 +27,7 @@ Each neuron adds ``--auto-update`` to its argparser.  When enabled::
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.util
 import logging
@@ -35,9 +36,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -46,6 +49,12 @@ logger = logging.getLogger(__name__)
 # Repo root = directory containing this file's parent (neurons/ -> repo root)
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _FIRST_PARTY_SOURCE_ROOTS = ("neurons", "verallm", "zkllm", "trainllm")
+
+
+def derive_jitter_seed(base_seed: bytes, instance_identity: str | int) -> bytes:
+    """Domain-separate restart slots for processes sharing one identity."""
+
+    return bytes(base_seed) + b"\x00instance:" + str(instance_identity).encode("utf-8")
 
 
 def _run_git(*args: str, cwd: Optional[Path] = None) -> tuple[int, str]:
@@ -462,16 +471,19 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
     if not local_head or not remote_head:
         return None
 
-    # No new commits at all — skip version parsing
-    if local_head == remote_head:
-        return None
-
-    # New commits exist — check if our role's version changed
     var_name = "miner_version" if role == "miner" else "validator_version"
 
     # Local version (from the imported module)
     from neurons.version import miner_version, validator_version
     local_version = miner_version if role == "miner" else validator_version
+
+    # Validators and proxies retain the established checkout-based fast path.
+    # A stock multi-endpoint miner is different: several resident processes
+    # share one checkout, so one sibling may advance HEAD while the others
+    # still execute an older imported miner version.  Those siblings must keep
+    # comparing their in-memory version with the remote release and restart.
+    if local_head == remote_head and role != "miner":
+        return None
 
     # Remote version (from git show, without pulling)
     remote_source = _read_remote_version_file()
@@ -487,15 +499,41 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
         return None
 
     if remote_version > local_version:
-        bt.logging.info(f"Remote {var_name}={remote_version} > local {local_version} (commits: {local_head[:8]}→{remote_head[:8]})")
+        bt.logging.info(
+            f"Remote {var_name}={remote_version} > running {local_version} "
+            f"(commits: {local_head[:8]}→{remote_head[:8]})"
+        )
         return (remote_head, remote_version, local_version)
 
-    # New commits but our role's version didn't change — skip
-    bt.logging.debug(f"New commits available ({local_head[:8]}→{remote_head[:8]}) but {var_name} unchanged ({local_version}) — skipping")
+    bt.logging.debug(
+        f"Remote {var_name}={remote_version} does not exceed running "
+        f"{local_version} (commits: {local_head[:8]}→{remote_head[:8]}) — skipping"
+    )
     return None
 
 
-def pull_and_install(
+def _install_lock_path() -> Path:
+    """Return the host-local lock shared by processes using this checkout."""
+
+    checkout_id = hashlib.sha256(
+        str(_REPO_ROOT.resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"verathos-auto-update-{checkout_id}.lock"
+
+
+@contextmanager
+def _exclusive_install_lock():
+    """Serialize git and package mutation across processes sharing a checkout."""
+
+    with _install_lock_path().open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _pull_and_install_locked(
     *,
     install_extras: str = "neurons",
     install_proof_cuda: bool = False,
@@ -555,6 +593,20 @@ def pull_and_install(
     if install_proof_cuda and not install_local_proof_v3_cuda_wheel():
         return False
     return True
+
+
+def pull_and_install(
+    *,
+    install_extras: str = "neurons",
+    install_proof_cuda: bool = False,
+) -> bool:
+    """Serialize and apply one release update for a shared checkout."""
+
+    with _exclusive_install_lock():
+        return _pull_and_install_locked(
+            install_extras=install_extras,
+            install_proof_cuda=install_proof_cuda,
+        )
 
 
 def _detect_pm2() -> Optional[str]:

@@ -181,6 +181,7 @@ class NeuronConfig(ChainConfig):
     capacity_audit_hard_proof_misses_for_zero_score: int = 2
     capacity_audit_invalid_proof_misses_for_zero_score: int = 1
     capacity_audit_allow_timing_only_score_gate: bool = True
+    capacity_audit_uid_escalation_enabled: bool = False
     capacity_audit_uid_escalation_min_entries: int = 2
     capacity_audit_uid_escalation_fraction: float = 0.10
     capacity_audit_uid_escalation_max_entries: int = 10
@@ -276,6 +277,7 @@ class NeuronConfig(ChainConfig):
             "capacity_audit_hard_proof_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_HARD_PROOF_MISSES_FOR_ZERO_SCORE",
             "capacity_audit_invalid_proof_misses_for_zero_score": "VERATHOS_CAPACITY_AUDIT_INVALID_PROOF_MISSES_FOR_ZERO_SCORE",
             "capacity_audit_allow_timing_only_score_gate": "VERATHOS_CAPACITY_AUDIT_ALLOW_TIMING_ONLY_SCORE_GATE",
+            "capacity_audit_uid_escalation_enabled": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_ENABLED",
             "capacity_audit_uid_escalation_min_entries": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_MIN_ENTRIES",
             "capacity_audit_uid_escalation_fraction": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_FRACTION",
             "capacity_audit_uid_escalation_max_entries": "VERATHOS_CAPACITY_AUDIT_UID_ESCALATION_MAX_ENTRIES",

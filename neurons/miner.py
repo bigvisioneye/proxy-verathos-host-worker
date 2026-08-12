@@ -87,6 +87,11 @@ PROOF_V3_RUNTIME_ENCODING_ENV = "VERATHOS_PROOF_V3_RUNTIME_ENCODING"
 PROOF_V3_WEIGHT_CACHE_DIR_ENV = "VERATHOS_PROOF_V3_WEIGHT_CACHE_DIR"
 PROOF_V3_RELEASE_ENV = "VERATHOS_PROOF_V3_RELEASE"
 
+_PROOF_SAFE_FP8_BACKEND_ENV = (
+    "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER",
+    "VLLM_USE_DEEP_GEMM",
+)
+
 PROOF_V3_ARTIFACT_REFRESH_INTERVAL_SECONDS = 60.0
 PROOF_V3_ARTIFACT_REFRESH_RETRY_SECONDS = 5.0
 
@@ -95,8 +100,11 @@ _MANAGED_NGINX_CONFIG_PATHS = (
     Path("/etc/nginx/sites-enabled/verathos-miner"),
     Path("/etc/nginx/nginx.conf"),
 )
-_MANAGED_NGINX_OLD_READ_TIMEOUT = "proxy_read_timeout 120s;"
-_MANAGED_NGINX_READ_TIMEOUT = "proxy_read_timeout 360s;"
+_MANAGED_NGINX_OLD_READ_TIMEOUTS = (
+    "proxy_read_timeout 120s;",
+    "proxy_read_timeout 360s;",
+)
+_MANAGED_NGINX_READ_TIMEOUT = "proxy_read_timeout 540s;"
 
 
 def _reconcile_managed_nginx_read_timeout(
@@ -107,10 +115,10 @@ def _reconcile_managed_nginx_read_timeout(
 ) -> bool:
     """Align the stock HTTPS proxy with the signed hard-proof deadline.
 
-    The hard-proof response budget is 300 seconds.  Older versions of the
-    stock nginx template used a 120-second upstream read timeout, which could
-    terminate a valid long-decode proof before the validator deadline.  Only
-    byte-recognizable Verathos-managed server blocks are migrated; custom
+    The authenticated hard-proof response budget reaches 480 seconds for the
+    largest qualified decode geometry. Older stock templates used 120 or 360
+    seconds and could terminate a valid proof before the validator deadline.
+    Only byte-recognizable Verathos-managed server blocks are migrated; custom
     reverse-proxy configurations are never rewritten.
     """
 
@@ -185,24 +193,37 @@ def _reconcile_managed_nginx_read_timeout(
             continue
         if _MANAGED_NGINX_READ_TIMEOUT in original:
             continue
-        if _MANAGED_NGINX_OLD_READ_TIMEOUT not in original:
+        old_timeouts = tuple(
+            value
+            for value in _MANAGED_NGINX_OLD_READ_TIMEOUTS
+            if value in original
+        )
+        if not old_timeouts:
             continue
         if managed_marker not in original or backend_marker not in original:
             bt.logging.warning(
-                f"Custom nginx config {path} retains a 120s read timeout; "
-                "set the proof-v3 upstream timeout to at least 360s"
+                f"Custom nginx config {path} retains an old read timeout; "
+                "set the proof-v3 upstream timeout to at least 540s"
             )
             continue
-        if original.count(_MANAGED_NGINX_OLD_READ_TIMEOUT) != 1:
+        old_count = original.count(old_timeouts[0]) if len(old_timeouts) == 1 else 0
+        current_count = original.count(_MANAGED_NGINX_READ_TIMEOUT)
+        managed_count = original.count(managed_marker)
+        backend_count = original.count(backend_marker)
+        if (
+            len(old_timeouts) != 1
+            or old_count < 1
+            or managed_count != backend_count
+            or managed_count != old_count + current_count
+        ):
             bt.logging.warning(
                 f"Managed nginx config {path} has an ambiguous read timeout; "
-                "set the proof-v3 upstream timeout to at least 360s"
+                "set the proof-v3 upstream timeout to at least 540s"
             )
             continue
         updated = original.replace(
-            _MANAGED_NGINX_OLD_READ_TIMEOUT,
+            old_timeouts[0],
             _MANAGED_NGINX_READ_TIMEOUT,
-            1,
         )
         try:
             mode = path.stat().st_mode & 0o7777
@@ -265,7 +286,7 @@ def _reconcile_managed_nginx_read_timeout(
         return False
 
     bt.logging.info(
-        "Updated the managed nginx upstream read timeout to 360s for "
+        "Updated the managed nginx upstream read timeout to 540s for "
         "proof-v3 hard responses"
     )
     return True
@@ -2114,9 +2135,9 @@ def parse_args():
     parser.add_argument("--chain-config", default=None,
                         help="Path to chain config JSON. If omitted, derived from --subtensor-network.")
     parser.add_argument("--subtensor-network", default=None,
-                        help="Bittensor network name (test or finney). Selects chain config (contracts) and default RPC URL.")
+                        help="Bittensor network name (test or finney). Selects chain config and default RPC URL.")
     parser.add_argument("--subtensor-chain-endpoint", default=None,
-                        help="Explicit Substrate+EVM RPC endpoint (e.g. http://localhost:9944 for local subtensor).")
+                        help="Explicit Substrate+EVM endpoint. Public RPCs are not recommended for stable mining.")
     parser.add_argument("--endpoint", required=True, help="Public miner endpoint URL")
     parser.add_argument("--skip-external-port-check", action="store_true",
                         help="Skip the public endpoint reachability preflight. "
@@ -2372,6 +2393,37 @@ def _neuron_config_from_args(args) -> NeuronConfig:
     return NeuronConfig.from_env(**overrides)
 
 
+def _configure_proof_safe_fp8_backend(quant: str) -> tuple[str, ...]:
+    """Install the canonical vLLM FP8 backend defaults before server spawn.
+
+    The setup installer persists these values in ``.env.sh``, but a miner
+    started directly (or a newly added PM2 sibling) must not depend on an
+    interactive shell having sourced that file.  Explicit incompatible
+    overrides fail before model loading instead of selecting an unqualified
+    backend later in vLLM startup.
+    """
+
+    normalized = str(quant or "").strip().lower().replace("-", "_")
+    if not normalized.startswith("fp8"):
+        return ()
+
+    defaulted: list[str] = []
+    for name in _PROOF_SAFE_FP8_BACKEND_ENV:
+        value = os.environ.get(name)
+        if value is None or not value.strip():
+            os.environ[name] = "0"
+            defaulted.append(name)
+            continue
+        if value.strip() != "0":
+            raise RuntimeError(
+                f"FP8 proof serving requires {name}=0, got {value!r}. "
+                "Remove the override or rerun scripts/setup_miner.sh before "
+                "starting the miner; refusing an unqualified vLLM backend "
+                "before model load."
+            )
+    return tuple(defaulted)
+
+
 def _extract_code_measurement(platform: str, attestation_report: bytes, Web3) -> bytes:
     """Extract and hash the code measurement from an attestation report.
 
@@ -2513,24 +2565,108 @@ def _compile_cache_dirs(
     return tuple(dict.fromkeys(cache_dirs))
 
 
-def _clear_stale_compile_caches() -> None:
-    """Clear torch.compile / Triton caches to prevent stale kernels.
+def _compile_cache_runtime_fingerprint(*, repository_root=None) -> str:
+    """Fingerprint code and packages that can change generated GPU kernels."""
 
-    Stale caches from previous code versions can cause CUDA illegal memory
-    access crashes or silent proof performance regressions.  Clearing on
-    every startup is safe — recompilation adds ~30s to first startup only.
+    import hashlib
+    import importlib.metadata
+
+    root = (
+        Path(__file__).resolve().parents[1]
+        if repository_root is None
+        else Path(repository_root)
+    )
+    runtime_files = [
+        root / "neurons" / "miner.py",
+        root / "neurons" / "version.py",
+        root / "verallm" / "api" / "server.py",
+    ]
+    runtime_files.extend(
+        sorted((root / "verallm" / "miner").glob("*.so"))
+    )
+    runtime_files.extend(
+        sorted((root / "verallm" / "vllm_plugin").glob("*.py"))
+    )
+    digest = hashlib.sha256()
+    digest.update(sys.version.encode("utf-8"))
+    for package in ("torch", "triton", "vllm"):
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            version = "missing"
+        digest.update(f"\0package:{package}={version}".encode("utf-8"))
+    for path in runtime_files:
+        if not path.is_file():
+            continue
+        digest.update(f"\0file:{path.relative_to(root)}\0".encode("utf-8"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _clear_stale_compile_caches(
+    *,
+    marker_path=None,
+    lock_path=None,
+    runtime_fingerprint=None,
+) -> bool:
+    """Clear stale compile caches once per installed runtime fingerprint.
+
+    Same-host endpoint processes share the Torch/Triton caches.  A host lock
+    prevents sibling miners from deleting a cache another process has just
+    warmed, while the content fingerprint preserves mandatory invalidation
+    whenever code or the Torch/Triton/vLLM stack changes.
     """
+    import fcntl
     import shutil
+
+    state_dir = Path.home() / ".cache" / "verathos"
+    marker = (
+        state_dir / "compile-cache-runtime.sha256"
+        if marker_path is None
+        else Path(marker_path)
+    )
+    lock = (
+        state_dir / "compile-cache-runtime.lock"
+        if lock_path is None
+        else Path(lock_path)
+    )
+    fingerprint = (
+        _compile_cache_runtime_fingerprint()
+        if runtime_fingerprint is None
+        else str(runtime_fingerprint)
+    )
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+
     cleared = 0
-    for d in _compile_cache_dirs():
-        if d.is_dir():
-            try:
-                shutil.rmtree(d)
-                cleared += 1
-            except Exception:
-                pass
+    failed = 0
+    with lock.open("a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if marker.is_file() and marker.read_text().strip() == fingerprint:
+                return False
+        except OSError:
+            pass
+        for cache_dir in _compile_cache_dirs():
+            if cache_dir.is_dir():
+                try:
+                    shutil.rmtree(cache_dir)
+                    cleared += 1
+                except Exception:
+                    failed += 1
+        if failed:
+            bt.logging.warning(
+                f"Could not clear {failed} stale torch/triton compile cache(s)"
+            )
+            return False
+        marker.write_text(fingerprint + "\n")
     if cleared:
-        bt.logging.info(f"Cleared {cleared} stale torch/triton compile caches")
+        bt.logging.info(
+            f"Cleared {cleared} stale torch/triton compile caches for a new runtime"
+        )
+    return True
 
 
 def main():
@@ -2595,9 +2731,28 @@ def main():
     )
     bt.logging.info(f"Model config: {resolved.model_id} quant={resolved.quant} ctx={resolved.max_context_len}")
 
-    # Resolve EVM RPC URL: explicit endpoint > network default > JSON default
+    try:
+        defaulted_fp8_env = _configure_proof_safe_fp8_backend(resolved.quant)
+    except RuntimeError as exc:
+        bt.logging.error(str(exc))
+        sys.exit(1)
+    if defaulted_fp8_env:
+        bt.logging.info(
+            "Applied proof-safe FP8 backend defaults before model load: "
+            + ", ".join(f"{name}=0" for name in defaulted_fp8_env)
+        )
+
+    explicit_chain_endpoint = getattr(args, "subtensor_chain_endpoint", None)
+    if ChainConfig.should_warn_public_rpc(explicit_chain_endpoint):
+        bt.logging.warning(
+            "Public Bittensor RPC configured. Public endpoints are rate-limited "
+            "and may make miner registration, heartbeats, and capacity audits "
+            "unstable. For production mining, run a Subtensor node and pass "
+            "its endpoint with --subtensor-chain-endpoint."
+        )
+
     rpc_override = ChainConfig.resolve_rpc_url(
-        getattr(args, "subtensor_chain_endpoint", None),
+        explicit_chain_endpoint,
         args.subtensor_network,
     )
     chain_config = ChainConfig.from_json(
@@ -2609,8 +2764,8 @@ def main():
             setattr(config, k, getattr(chain_config, k))
 
     # Set Substrate network from CLI args
-    if getattr(args, "subtensor_chain_endpoint", None):
-        ep = args.subtensor_chain_endpoint
+    if explicit_chain_endpoint:
+        ep = explicit_chain_endpoint
         ws_ep = ep.replace("http://", "ws://").replace("https://", "wss://")
         config.subtensor_network = ws_ep
     elif args.subtensor_network:
@@ -3088,7 +3243,7 @@ def main():
 
     # ── Auto-updater ──
     if args.auto_update:
-        from neurons.auto_update import AutoUpdater
+        from neurons.auto_update import AutoUpdater, derive_jitter_seed
 
         def _miner_busy() -> bool:
             return neuron._auto_update_busy(local_health_url)
@@ -3098,7 +3253,10 @@ def main():
             check_interval=args.auto_update_interval,
             busy_check=_miner_busy,
             jitter_seconds=args.auto_update_jitter,
-            jitter_seed=neuron.hotkey_seed,
+            jitter_seed=derive_jitter_seed(
+                neuron.hotkey_seed,
+                _extract_server_port(server_args),
+            ),
         )
         updater.start()
 

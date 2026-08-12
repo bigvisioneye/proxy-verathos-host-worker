@@ -119,8 +119,8 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_buffering off;
         proxy_cache off;
-        # Hard proofs have an authenticated 300-second response budget.
-        proxy_read_timeout 360s;
+        # Covers the largest authenticated hard-proof response budget.
+        proxy_read_timeout 540s;
     }
 }
 CONFEOF

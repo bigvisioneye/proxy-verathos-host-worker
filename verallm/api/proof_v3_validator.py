@@ -156,6 +156,10 @@ class ProofV3PeerServiceFailure(ProofV3PeerFailure):
     """The selected miner reported an inference-service failure."""
 
 
+class ProofV3FirstTokenTimeout(ProofV3PeerServiceFailure):
+    """The peer emitted no token within the caller's routing deadline."""
+
+
 class ProofV3PostcommitFailure(ProofV3PeerFailure):
     """A hard exchange failed after the validator disclosed its nonce."""
 
@@ -1113,6 +1117,7 @@ async def run_proof_v3_exchange_async(
     request_body: Mapping[str, object],
     exchange: ProofV3ValidatorExchange,
     stream_callback: Callable[[str], Any] | None = None,
+    first_token_timeout_seconds: float | None = None,
 ) -> ProofV3ExchangeResult:
     """Run one asynchronous v3 SSE + conditional hard-opening exchange."""
 
@@ -1120,6 +1125,15 @@ async def run_proof_v3_exchange_async(
         raise TypeError("exchange has an unexpected type")
     if inference_path not in ("/inference", "/chat"):
         raise ValueError("proof-v3 inference path is unsupported")
+    if (
+        first_token_timeout_seconds is not None
+        and (
+            isinstance(first_token_timeout_seconds, bool)
+            or not isinstance(first_token_timeout_seconds, (int, float))
+            or first_token_timeout_seconds <= 0
+        )
+    ):
+        raise ValueError("first-token timeout must be positive")
     body: MutableMapping[str, object] = dict(request_body)
     fields = exchange.request_fields()
     for key, value in fields.items():
@@ -1140,32 +1154,68 @@ async def run_proof_v3_exchange_async(
             if response.is_error:
                 await response.aread()
             response.raise_for_status()
-            async for event_type, data in _iter_sse_events_async(response):
-                received = time.monotonic_ns()
-                if event_type in ("proof_precommit", "done"):
-                    # Canonical envelope parsing and the complete done-event
-                    # admission path are CPU work.  Running them on the
-                    # shared asyncio loop serializes otherwise-independent
-                    # streams and can make already-arrived precommits appear
-                    # late under a wide co-batch.  Timestamp receipt first,
-                    # then validate off-loop; ordering within this exchange
-                    # remains strict because this coroutine awaits each call.
-                    await asyncio.to_thread(
-                        exchange.observe_sse_event,
-                        event_type=event_type,
-                        data=data,
-                        received_monotonic_ns=received,
-                    )
-                else:
-                    exchange.observe_sse_event(
-                        event_type=event_type,
-                        data=data,
-                        received_monotonic_ns=received,
-                    )
-                if event_type == "token" and stream_callback is not None:
-                    callback_result = stream_callback(str(data.get("text", "")))
-                    if inspect.isawaitable(callback_result):
-                        await callback_result
+            events = _iter_sse_events_async(response)
+            first_token_seen = False
+            first_token_deadline = (
+                asyncio.get_running_loop().time()
+                + float(first_token_timeout_seconds)
+                if first_token_timeout_seconds is not None
+                else None
+            )
+            try:
+                while True:
+                    try:
+                        if not first_token_seen and first_token_deadline is not None:
+                            remaining = (
+                                first_token_deadline
+                                - asyncio.get_running_loop().time()
+                            )
+                            if remaining <= 0:
+                                raise asyncio.TimeoutError
+                            event_type, data = await asyncio.wait_for(
+                                anext(events),
+                                timeout=remaining,
+                            )
+                        else:
+                            event_type, data = await anext(events)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError as exc:
+                        raise ProofV3FirstTokenTimeout(
+                            "miner produced no token before the routing deadline"
+                        ) from exc
+
+                    received = time.monotonic_ns()
+                    if event_type in ("proof_precommit", "done"):
+                        # Canonical envelope parsing and the complete done-event
+                        # admission path are CPU work.  Running them on the
+                        # shared asyncio loop serializes otherwise-independent
+                        # streams and can make already-arrived precommits appear
+                        # late under a wide co-batch.  Timestamp receipt first,
+                        # then validate off-loop; ordering within this exchange
+                        # remains strict because this coroutine awaits each call.
+                        await asyncio.to_thread(
+                            exchange.observe_sse_event,
+                            event_type=event_type,
+                            data=data,
+                            received_monotonic_ns=received,
+                        )
+                    else:
+                        exchange.observe_sse_event(
+                            event_type=event_type,
+                            data=data,
+                            received_monotonic_ns=received,
+                        )
+                    if event_type == "token":
+                        first_token_seen = True
+                        if stream_callback is not None:
+                            callback_result = stream_callback(
+                                str(data.get("text", ""))
+                            )
+                            if inspect.isawaitable(callback_result):
+                                await callback_result
+            finally:
+                await events.aclose()
         exchange.record_stream_timing(
             request_started_wall=request_started_wall,
             request_started_ns=request_started_ns,
@@ -1240,6 +1290,7 @@ async def run_proof_v3_exchange_async(
 __all__ = [
     "MAX_PROOF_V3_SSE_EVENT_BYTES",
     "ProofV3ExchangeResult",
+    "ProofV3FirstTokenTimeout",
     "ProofV3PeerFailure",
     "ProofV3PeerServiceFailure",
     "ProofV3PostcommitFailure",

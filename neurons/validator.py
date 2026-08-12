@@ -1099,6 +1099,12 @@ class ValidatorNeuron:
         # cannot delay the timestamp assigned to another.
         self._capacity_audit_receipt_executor = ThreadPoolExecutor(max_workers=4)
         self._miner_debug_executor = ThreadPoolExecutor(max_workers=1)
+        # Analytics retention is best-effort maintenance, not an epoch-close
+        # dependency.  A daemon worker keeps multi-million-row archives off the
+        # block subscription thread; the DB layer streams them with bounded
+        # memory and short write locking.
+        self._analytics_archive_lock = threading.Lock()
+        self._analytics_archive_thread: threading.Thread | None = None
         proof_workers = max(
             1,
             int(getattr(config, "capacity_audit_proof_verify_workers", 4) or 4),
@@ -3704,6 +3710,12 @@ class ValidatorNeuron:
                 timing_status=timing_status,
                 verdict=verdict,
                 failure_reason=failure_reason,
+                probation_required=(
+                    verdict == "timing_miss"
+                    and self._capacity_audit_failure_requires_probation(
+                        proof_policy_required=False,
+                    )
+                ),
                 final_observed_block=final_observed_block,
                 received_at=ts,
             )
@@ -4411,12 +4423,17 @@ class ValidatorNeuron:
                 f"Capacity audit score gate disabled while proof verifier is unhealthy{suffix}"
             )
             return ""
-        since_epoch = max(0, int(epoch_number) - int(cfg.repeat_window_epochs) + 1)
+        since_epoch = max(
+            0,
+            int(epoch_number) - int(cfg.repeat_window_epochs) + 1,
+            int(getattr(self, "_probation_state_reset_effective_epoch", 0) or 0),
+        )
         invalid_failures = self._db.recent_invalid_capacity_proof_failures(
             address,
             model_index,
             since_epoch=since_epoch,
             require_chain_confirmed=True,
+            require_consequence_eligible=True,
         )
         if invalid_failures >= int(cfg.invalid_proof_misses_for_zero_score):
             return f"{invalid_failures} cryptographically invalid capacity proof(s)"
@@ -4426,6 +4443,7 @@ class ValidatorNeuron:
             since_epoch=since_epoch,
             verdicts=("hard_proof_miss", "no_show"),
             require_chain_confirmed=True,
+            require_consequence_eligible=True,
         )
         if hard_failures >= int(cfg.hard_proof_misses_for_zero_score):
             return f"{hard_failures} hard capacity-audit failures"
@@ -4436,6 +4454,7 @@ class ValidatorNeuron:
                 since_epoch=since_epoch,
                 verdicts=("timing_miss",),
                 require_chain_confirmed=True,
+                require_consequence_eligible=True,
             )
             if timing_failures >= int(cfg.timing_misses_for_zero_score):
                 return f"{timing_failures} timing capacity-audit misses"
@@ -4452,6 +4471,8 @@ class ValidatorNeuron:
         )
         if uid is None or not cfg.enabled or cfg.mode != "score_gate":
             return ""
+        if not bool(getattr(cfg, "uid_escalation_enabled", False)):
+            return ""
         if not self._capacity_audit_enforcement_enabled(epoch_number):
             return ""
         if self._proof_v3_follower_mode_active():
@@ -4461,11 +4482,16 @@ class ValidatorNeuron:
             return ""
         if getattr(self, "_capacity_audit_verifier_unhealthy", False):
             return ""
-        since_epoch = max(0, int(epoch_number) - int(cfg.repeat_window_epochs) + 1)
+        since_epoch = max(
+            0,
+            int(epoch_number) - int(cfg.repeat_window_epochs) + 1,
+            int(getattr(self, "_probation_state_reset_effective_epoch", 0) or 0),
+        )
         counts = self._db.recent_capacity_failure_counts_for_uid(
             int(uid),
             since_epoch=since_epoch,
             require_chain_confirmed=True,
+            require_consequence_eligible=True,
         )
         convicted: list[Tuple[str, int]] = []
         for key, row in counts.items():
@@ -10328,8 +10354,42 @@ class ValidatorNeuron:
         except Exception as exc:
             bt.logging.warning(f"Capacity audit storage cleanup failed: {exc}")
 
-        # Periodic analytics backup+cleanup (every ~7 days ≈ 140 epochs)
+        # Periodic analytics backup+cleanup (every ~7 days ≈ 140 epochs).
+        # Never perform this on the epoch-close thread: the retained tables can
+        # contain millions of rows and archiving must not stall chain progress.
         if epoch_number % 140 == 0:
+            self._schedule_analytics_archive()
+
+        elapsed = time.monotonic() - t0
+        bt.logging.info(f"Epoch {epoch_number} closed in {elapsed:.1f}s")
+
+    def _schedule_analytics_archive(self) -> bool:
+        """Start one bounded background analytics archive if none is active."""
+
+        lock = getattr(self, "_analytics_archive_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._analytics_archive_lock = lock
+        with lock:
+            current = getattr(self, "_analytics_archive_thread", None)
+            if current is not None and current.is_alive():
+                bt.logging.info(
+                    "Analytics archive already active; skipping duplicate schedule"
+                )
+                return False
+            worker = threading.Thread(
+                target=self._run_analytics_archive,
+                name="validator-analytics-archive",
+                daemon=True,
+            )
+            self._analytics_archive_thread = worker
+            worker.start()
+            return True
+
+    def _run_analytics_archive(self) -> None:
+        """Archive retained analytics without blocking epoch processing."""
+
+        try:
             for table, fn in [
                 ("canary results", self._db.backup_and_cleanup_canary_results),
                 ("network receipts", self._db.backup_and_cleanup_network_receipts),
@@ -10337,24 +10397,53 @@ class ValidatorNeuron:
                 archived = fn(retain_days=7)
                 if archived > 0:
                     bt.logging.info(f"Analytics: archived {archived} {table}")
-
-            # Auto-delete old backup files unless --retain-backups is set
+        except Exception as exc:
+            bt.logging.warning(
+                f"Analytics backup+cleanup failed without affecting epoch processing: {exc}"
+            )
+        finally:
+            # Pruning is independent of either table archive.  A failed second
+            # archive must not retain old weekly files forever and fill disk.
             if not getattr(self.config, "retain_backups", False):
-                _backup_dir = os.path.join(
-                    os.environ.get("VERALLM_DATA_DIR", os.path.expanduser("~/.verathos")),
+                backup_dir = os.path.join(
+                    os.environ.get(
+                        "VERALLM_DATA_DIR",
+                        os.path.expanduser("~/.verathos"),
+                    ),
                     "backups",
                 )
-                if os.path.isdir(_backup_dir):
+                if os.path.isdir(backup_dir):
                     import glob as _glob
-                    _cutoff = time.time() - (7 * 86400)
-                    for _pattern in ("canary_results_*.jsonl.gz", "network_receipts_*.jsonl.gz"):
-                        for _f in _glob.glob(os.path.join(_backup_dir, _pattern)):
-                            if os.path.getmtime(_f) < _cutoff:
-                                os.remove(_f)
-                                bt.logging.info(f"Deleted old backup: {os.path.basename(_f)}")
 
-        elapsed = time.monotonic() - t0
-        bt.logging.info(f"Epoch {epoch_number} closed in {elapsed:.1f}s")
+                    cutoff = time.time() - (7 * 86400)
+                    for pattern in (
+                        "canary_results_*.jsonl.gz",
+                        "network_receipts_*.jsonl.gz",
+                    ):
+                        for path in _glob.glob(os.path.join(backup_dir, pattern)):
+                            try:
+                                if os.path.getmtime(path) < cutoff:
+                                    os.remove(path)
+                                    bt.logging.info(
+                                        f"Deleted old backup: {os.path.basename(path)}"
+                                    )
+                            except FileNotFoundError:
+                                pass
+                    stale_tmp_cutoff = time.time() - 86400
+                    for pattern in (
+                        "canary_results_*.jsonl.gz.*.tmp",
+                        "network_receipts_*.jsonl.gz.*.tmp",
+                    ):
+                        for path in _glob.glob(os.path.join(backup_dir, pattern)):
+                            try:
+                                if os.path.getmtime(path) < stale_tmp_cutoff:
+                                    os.remove(path)
+                                    bt.logging.info(
+                                        "Deleted stale analytics temporary file: "
+                                        f"{os.path.basename(path)}"
+                                    )
+                            except FileNotFoundError:
+                                pass
 
     def _shared_hard_prefetch_result(
         self,
