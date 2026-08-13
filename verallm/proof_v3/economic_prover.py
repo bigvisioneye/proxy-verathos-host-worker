@@ -30,6 +30,7 @@ from verallm.proof_v3.economic_wire import (
     EconomicExecutionAnchorRowV3,
     EconomicGdnLayerCouplingRevealV3,
     EconomicLayerCouplingRevealV3,
+    EconomicMlpActivationRevealV3,
     EconomicProjectionRevealV3,
     EconomicRecomputeProofV3,
     bounded_byte_width_v3,
@@ -452,6 +453,8 @@ def build_economic_recompute_proof_v3(
     attention_kv_positions_by_layer=None,
     gdn_runtime_rows_by_layer=None,
     gdn_norm_source_rows_by_layer=None,
+    mlp_activation_rows_by_layer=None,
+    require_exact_mlp_activation: bool = False,
     gdn_output_columns_by_key=None,
     gdn_decode_positions_by_layer=None,
     gdn_prefix_positions_by_layer=None,
@@ -596,6 +599,14 @@ def build_economic_recompute_proof_v3(
             else gdn_norm_source_rows_by_layer
         )
     }
+    mlp_activation_rows_by_layer = {
+        int(layer): tuple(rows)
+        for layer, rows in (
+            ()
+            if mlp_activation_rows_by_layer is None
+            else mlp_activation_rows_by_layer
+        )
+    }
     gdn_output_columns_by_key = {
         (int(layer), str(projection)): tuple(
             int(column) for column in columns
@@ -657,6 +668,14 @@ def build_economic_recompute_proof_v3(
     lean_tokens_by_layer = {}
     lean_positions_by_layer = {}
     if lean_mode:
+        from verallm.proof_v3.lean_projection_fold import (
+            LeanProjectionCatalogV3,
+        )
+
+        if not isinstance(lean_projection_catalog, LeanProjectionCatalogV3):
+            raise ProofV3Error(
+                "lean projection catalog has an unexpected type"
+            )
         from verallm.proof_v3.lean_execution_anchor import (
             lean_projection_row_layouts_v3,
         )
@@ -707,6 +726,37 @@ def build_economic_recompute_proof_v3(
             }
             for layer, layout in lean_layouts
         }
+        if require_exact_mlp_activation:
+            expected_mlp_layers = tuple(
+                sorted(int(layer) for layer in challenge.selected_layer_indices)
+            )
+            if tuple(sorted(mlp_activation_rows_by_layer)) != expected_mlp_layers:
+                raise ProofV3Error(
+                    "lean MLP activation replay does not cover the exact "
+                    "selected layer inventory"
+                )
+            for layer in expected_mlp_layers:
+                expected_positions = tuple(
+                    position
+                    for position, _row_index in dict(lean_layouts)[layer]
+                )
+                actual_positions = tuple(
+                    int(record[0])
+                    for record in mlp_activation_rows_by_layer[layer]
+                )
+                if actual_positions != tuple(sorted(expected_positions)):
+                    raise ProofV3Error(
+                        "lean MLP activation replay positions are incomplete "
+                        f"for layer {layer}"
+                    )
+        elif mlp_activation_rows_by_layer:
+            raise ProofV3Error(
+                "legacy lean proof must not carry exact MLP activation cells"
+            )
+    elif mlp_activation_rows_by_layer:
+        raise ProofV3Error(
+            "non-lean proof must not carry MLP activation replay cells"
+        )
     for layer in sorted(challenge.selected_layer_indices):
         tokens = (
             lean_tokens_by_layer[layer]
@@ -732,6 +782,25 @@ def build_economic_recompute_proof_v3(
                         if (
                             layer_kinds[layer] == "full_attention"
                             and manifest_suffix == "qkv"
+                        )
+                        else set()
+                    )
+                    | (
+                        {
+                            output
+                            for column in challenge.mlp_cols_for(
+                                layer_index=layer,
+                                inter_dim=s_oracle.commitment.col_count // 2,
+                            )
+                            for output in (
+                                column,
+                                s_oracle.commitment.col_count // 2 + column,
+                            )
+                        }
+                        if (
+                            require_exact_mlp_activation
+                            and manifest_suffix == "gate_up"
+                            and s_oracle.commitment.col_count % 2 == 0
                         )
                         else set()
                     )
@@ -1212,6 +1281,7 @@ def build_economic_recompute_proof_v3(
         )
     elif succinct_projection:
         from verallm.proof_v3.succinct_projection_batch import (
+            SuccinctProjectionWeightRowsV3,
             build_succinct_projection_batch_reference_v3,
             encode_succinct_projection_batch_v3,
         )
@@ -1247,6 +1317,9 @@ def build_economic_recompute_proof_v3(
                 succinct_claim_weights,
                 strict=True,
             ):
+                if isinstance(weights, SuccinctProjectionWeightRowsV3):
+                    padded_weight_rows.append(weights)
+                    continue
                 rows = (
                     weights.tolist()
                     if hasattr(weights, "tolist")
@@ -1566,6 +1639,13 @@ def build_economic_recompute_proof_v3(
         projections=tuple(projections),
         couplings=tuple(couplings),
         gdn_couplings=tuple(gdn_couplings),
+        mlp_activation_reveals=tuple(
+            EconomicMlpActivationRevealV3(
+                layer_index=layer,
+                rows=mlp_activation_rows_by_layer[layer],
+            )
+            for layer in sorted(mlp_activation_rows_by_layer)
+        ),
         chain=chain,
         final=final,
         attention=attention_section,

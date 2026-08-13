@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from verallm.proof_v3.attention_runtime_semantics import (
@@ -454,6 +454,20 @@ def load_qualified_economic_proof_v3_release(
             projection_catalog_validation_context
         ),
     )
+    registration = QualifiedEconomicAdapterV3(runtime.artifacts)
+    if document.profile != runtime.profile:
+        # Transition profiles differ only in a verifier-digest-gated relation
+        # variant.  Validate the exact signed profile against the already
+        # authenticated artifacts before selecting it as the runtime profile;
+        # arbitrary or stale profiles still fail closed here.
+        try:
+            registration.validate_profile(profile=document.profile)
+        except ProofV3VerificationError as exc:
+            raise ProofV3VerificationError(
+                "signed execution profile was not selected by the "
+                "validator catalog"
+            ) from exc
+        runtime = replace(runtime, profile=document.profile)
     expected_profile_digest = runtime.profile.digest()
     qualified = QualifiedExecutionProfileV3.from_signed_document(
         document=document,
@@ -461,7 +475,7 @@ def load_qualified_economic_proof_v3_release(
         expected_execution_profile_digest=expected_profile_digest,
         expected_authority_signers=expected_authorities,
         authority_threshold=authority_threshold,
-        registration=QualifiedEconomicAdapterV3(runtime.artifacts),
+        registration=registration,
     )
     if qualified.profile != runtime.profile:
         raise ProofV3VerificationError(

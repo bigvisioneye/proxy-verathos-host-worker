@@ -6,9 +6,110 @@ Checks whether the installed vLLM supports:
 - CompilationConfig.splitting_ops for piecewise CUDA graphs
 """
 
+import functools
+import inspect
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+_PATCHED_VLLM_MIXED_BATCH_RNG = False
+
+
+def patch_vllm_mixed_batch_rng() -> bool:
+    """Keep mixed greedy/random batches off PyTorch's global CUDA RNG.
+
+    vLLM's native sampler first draws a random candidate for every row and
+    later replaces greedy rows with their argmax result.  When only the random
+    rows have per-request generators, upstream fills the complete candidate
+    tensor through the process-global generator before overwriting the seeded
+    rows.  A failed CUDA-graph capture can leave that global generator in a
+    captured state, making an otherwise valid later mixed batch fail with
+    ``Offset increment outside graph capture encountered unexpectedly``.
+
+    Verathos gives every stochastic request a private seed.  Therefore, in a
+    partially seeded batch the unseeded rows are greedy and their random
+    candidates are discarded by vLLM's final ``torch.where``.  Initialize only
+    those unused candidates to one and keep vLLM's exact generator-driven draw
+    for every stochastic row.  Pure greedy batches never enter this function;
+    fully seeded random batches retain upstream behavior. An unseeded
+    stochastic batch fails closed.
+
+    This is installed immediately after model construction and CUDA-graph
+    warmup, before serving starts. That preserves vLLM's discarded synthetic
+    sampler warmup while protecting all real requests. It is deliberately
+    fail-closed on an incompatible sampler ABI instead of silently claiming
+    protection on an unknown vLLM implementation.
+    """
+
+    global _PATCHED_VLLM_MIXED_BATCH_RNG
+    if _PATCHED_VLLM_MIXED_BATCH_RNG:
+        return True
+
+    try:
+        from vllm.v1.sample.ops import topk_topp_sampler as sampler_module
+    except ImportError:
+        logger.error(
+            "vLLM native top-k/top-p sampler is unavailable; cannot install "
+            "mixed-batch CUDA RNG isolation"
+        )
+        return False
+
+    original = getattr(sampler_module, "random_sample", None)
+    if not callable(original):
+        logger.error(
+            "vLLM random_sample ABI is unavailable; cannot install "
+            "mixed-batch CUDA RNG isolation"
+        )
+        return False
+    try:
+        parameter_names = tuple(inspect.signature(original).parameters)
+    except (TypeError, ValueError):
+        parameter_names = ()
+    if parameter_names != ("probs", "generators"):
+        logger.error(
+            "vLLM random_sample ABI is unsupported; expected "
+            "(probs, generators), got %s",
+            parameter_names,
+        )
+        return False
+    if getattr(original, "_verathos_mixed_batch_rng_v1", False):
+        _PATCHED_VLLM_MIXED_BATCH_RNG = True
+        return True
+
+    @functools.wraps(original)
+    def random_sample(probs, generators):
+        row_count = int(probs.shape[0])
+        generator_count = len(generators)
+        if generator_count == 0:
+            # This helper is never reached for an all-greedy batch.  An empty
+            # map here therefore means an unseeded stochastic request escaped
+            # the serving boundary and would use the unsafe global generator.
+            raise RuntimeError(
+                "vLLM stochastic sampling requires a private per-request seed"
+            )
+        if generator_count == row_count:
+            return original(probs, generators)
+
+        # Every stochastic Verathos request has a private generator.  Missing
+        # entries are consequently greedy rows, whose candidate is ignored by
+        # vLLM after this helper returns.  Avoid the process-global RNG without
+        # adding one generator/kernel launch per greedy request.
+        import torch
+
+        q = torch.ones_like(probs)
+        for index, generator in generators.items():
+            q[index].exponential_(generator=generator)
+        return probs.div_(q).argmax(dim=-1).view(-1)
+
+    random_sample._verathos_mixed_batch_rng_v1 = True
+    random_sample._verathos_upstream_random_sample = original
+    sampler_module.random_sample = random_sample
+    _PATCHED_VLLM_MIXED_BATCH_RNG = True
+    logger.info(
+        "verallm.compat: installed mixed-batch CUDA RNG isolation for vLLM"
+    )
+    return True
 
 
 def has_customop_oot() -> bool:

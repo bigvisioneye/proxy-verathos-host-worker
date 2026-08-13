@@ -115,6 +115,11 @@ _CORRIDOR_CHI2 = float(_os.environ.get("VERATHOS_CORRIDOR_CHI2", "0.2"))
 # (tag, aggregate_kind, delta, sigma, extra)
 # instead of failing (calibration only; never set in production)
 _CORRIDOR_REPORT = None
+# Qualification-only sink for the exact fused-SwiGLU cells selected by the
+# production verifier.  A model release report consumes these records to prove
+# calibration and held-out coverage for every registered runtime layer.  It is
+# never enabled by serving or validation.
+_MLP_ACTIVATION_QUALIFICATION_REPORT = None
 # Ordinary hard-trace replay under one authenticated serving geometry admits
 # at most one quantized bin here. Prefix-cache replay crosses independently
 # scheduled prefill geometries and uses its own signed cell-plus-row corridor.
@@ -895,19 +900,57 @@ def _rmsnorm_quantization_interval(
         gain_center - 0.5 * norm_scale,
         gain_center + 0.5 * norm_scale,
     )
-    numerator_candidates = tuple(
-        source * gain
-        for source in selected_interval
-        for gain in gain_interval
-    )
-    numerator_lower = min(numerator_candidates)
-    numerator_upper = max(numerator_candidates)
-    output_candidates = (
-        numerator_lower / rms_lower,
-        numerator_lower / rms_upper,
-        numerator_upper / rms_lower,
-        numerator_upper / rms_upper,
-    )
+    selected_lower, selected_upper = selected_interval
+    if math.isinf(selected_upper):
+        if (
+            selected_upper < 0.0
+            or not math.isfinite(selected_lower)
+            or selected_lower < 0.0
+        ):
+            raise _fail("RMSNorm selected source interval is malformed")
+        # A positive int8 source rail represents [edge, +inf).  Dividing
+        # the two half-infinite source/RMS intervals independently loses the
+        # exact RMSNorm invariant and produces an invalid infinite output
+        # interval.  For every finite row and positive epsilon,
+        #
+        #     abs(source_i / rms(source)) < sqrt(width).
+        #
+        # Use that backend-independent identity as the finite ratio rail.
+        # The lower endpoint remains zero because another saturated
+        # coordinate may dominate the denominator.
+        ratio_interval = (0.0, math.sqrt(len(source_row)))
+        output_candidates = tuple(
+            ratio * gain
+            for ratio in ratio_interval
+            for gain in gain_interval
+        )
+    elif math.isinf(selected_lower):
+        if (
+            selected_lower > 0.0
+            or not math.isfinite(selected_upper)
+            or selected_upper > 0.0
+        ):
+            raise _fail("RMSNorm selected source interval is malformed")
+        ratio_interval = (-math.sqrt(len(source_row)), 0.0)
+        output_candidates = tuple(
+            ratio * gain
+            for ratio in ratio_interval
+            for gain in gain_interval
+        )
+    else:
+        numerator_candidates = tuple(
+            source * gain
+            for source in selected_interval
+            for gain in gain_interval
+        )
+        numerator_lower = min(numerator_candidates)
+        numerator_upper = max(numerator_candidates)
+        output_candidates = (
+            numerator_lower / rms_lower,
+            numerator_lower / rms_upper,
+            numerator_upper / rms_lower,
+            numerator_upper / rms_upper,
+        )
     return min(output_candidates), max(output_candidates)
 
 
@@ -1030,6 +1073,140 @@ def _silu(value: float) -> float:
         return value / (1.0 + math.exp(-value))
     exp_value = math.exp(value)
     return value * exp_value / (1.0 + exp_value)
+
+
+def _runtime_precision_neighbors_v3(
+    value: float,
+    *,
+    encoding_id: str,
+    ulps: int = 2,
+) -> tuple[float, ...]:
+    """Canonical fp16/bf16 neighborhood around one fused-runtime result."""
+
+    import numpy as np
+
+    if not math.isfinite(value) or not 0 <= int(ulps) <= 2:
+        raise _fail("fused MLP runtime precision input is malformed")
+    if encoding_id == "fp16.v1":
+        word = int(
+            np.asarray([value], dtype="<f2").view("<u2")[0]
+        )
+
+        def decode(candidate: int) -> float:
+            return float(
+                np.asarray([candidate], dtype="<u2")
+                .view("<f2")
+                .astype(np.float64)[0]
+            )
+
+    elif encoding_id == "bf16.v1":
+        value32 = np.asarray([value], dtype="<f4")
+        bits = value32.view("<u4")
+        rounded = bits + np.uint32(0x7FFF) + (
+            (bits >> np.uint32(16)) & np.uint32(1)
+        )
+        word = int((rounded >> np.uint32(16))[0])
+
+        def decode(candidate: int) -> float:
+            bits = np.asarray(
+                [np.uint32(candidate) << np.uint32(16)],
+                dtype="<u4",
+            )
+            return float(bits.view("<f4")[0])
+
+    else:
+        raise _fail("fused MLP runtime encoding is not qualified")
+    center = decode(word)
+    if not math.isfinite(center):
+        raise _fail("fused MLP runtime precision neighborhood is malformed")
+
+    # IEEE fp16/bf16 words are sign-magnitude encodings, not numerically
+    # ordered integers.  In particular, decrementing 0x8000 (-0) enters the
+    # NaN range instead of crossing to small positive values.  Walk each
+    # numerical direction explicitly and treat the two zero encodings as one
+    # value so a finite near-zero fused result has a canonical finite ULP
+    # neighborhood.
+    def adjacent(candidate: int, *, upward: bool) -> int | None:
+        if candidate in (0x0000, 0x8000):
+            next_word = 0x0001 if upward else 0x8001
+        elif upward:
+            next_word = candidate - 1 if candidate & 0x8000 else candidate + 1
+        else:
+            next_word = candidate + 1 if candidate & 0x8000 else candidate - 1
+        if not 0 <= next_word <= 0xFFFF:
+            return None
+        return next_word if math.isfinite(decode(next_word)) else None
+
+    words = {word}
+    for upward in (False, True):
+        candidate = word
+        for _ in range(int(ulps)):
+            next_word = adjacent(candidate, upward=upward)
+            if next_word is None:
+                break
+            words.add(next_word)
+            candidate = next_word
+    values = tuple(sorted({decode(candidate) for candidate in words}))
+    if not values or not all(math.isfinite(candidate) for candidate in values):
+        raise _fail("fused MLP runtime precision neighborhood is malformed")
+    return values
+
+
+def _verify_exact_runtime_mlp_cell_v3(
+    *,
+    gate: float,
+    up: float,
+    got: float,
+    expected_gate_i8: int,
+    expected_up_i8: int,
+    expected_down_i8: int,
+    gate_up_scale: float,
+    down_x_scale: float,
+    encoding_id: str,
+) -> tuple[int, int, int]:
+    """Bind one exact runtime SwiGLU cell to its quantized proof openings."""
+
+    import numpy as np
+
+    values = (gate, up, got, gate_up_scale, down_x_scale)
+    if (
+        not all(math.isfinite(float(value)) for value in values)
+        or gate_up_scale <= 0.0
+        or down_x_scale <= 0.0
+        or any(
+            isinstance(value, bool) or not -128 <= int(value) <= 127
+            for value in (
+                expected_gate_i8,
+                expected_up_i8,
+                expected_down_i8,
+            )
+        )
+    ):
+        raise _fail("lean MLP activation cell is malformed")
+
+    def quantize(value: float, scale: float) -> int:
+        rounded = int(np.rint(np.float64(value) / np.float64(scale)))
+        return max(-128, min(127, rounded))
+
+    actual_gate_i8 = quantize(gate, gate_up_scale)
+    actual_up_i8 = quantize(up, gate_up_scale)
+    actual_down_i8 = quantize(got, down_x_scale)
+    if not all((
+        _replay_capture_cell_matches_v3(actual_gate_i8, expected_gate_i8),
+        _replay_capture_cell_matches_v3(actual_up_i8, expected_up_i8),
+        _replay_capture_cell_matches_v3(actual_down_i8, expected_down_i8),
+    )):
+        raise _fail(
+            "lean MLP activation cells are detached from the projection "
+            "openings"
+        )
+    predicted = _silu(gate) * up
+    if got not in _runtime_precision_neighbors_v3(
+        predicted,
+        encoding_id=encoding_id,
+    ):
+        raise _fail("lean MLP activation link is inconsistent")
+    return actual_gate_i8, actual_up_i8, actual_down_i8
 
 
 def quantization_stable_argmax_candidates_v3(
@@ -3243,6 +3420,17 @@ def verify_economic_recompute_v3(
 
     # ---- (5) architecture-specific projection audits ---------------------
     selected_layers = tuple(sorted(challenge.selected_layer_indices))
+    from verallm.proof_v3.economic_profile import (
+        economic_profile_uses_canonical_gdn_input_v3,
+        economic_profile_uses_exact_mlp_activation_v3,
+    )
+
+    exact_mlp_activation = economic_profile_uses_exact_mlp_activation_v3(
+        profile
+    )
+    canonical_gdn_projection_inputs = (
+        economic_profile_uses_canonical_gdn_input_v3(profile)
+    )
     expected_reveal_keys = tuple(
         (layer, x_suffix, s_suffix, manifest_suffix)
         for layer in selected_layers
@@ -3427,6 +3615,25 @@ def verify_economic_recompute_v3(
                     if (
                         layer_kinds[layer] == "full_attention"
                         and manifest_suffix == "qkv"
+                    )
+                    else set()
+                )
+                | (
+                    {
+                        output
+                        for column in challenge.mlp_cols_for(
+                            layer_index=layer,
+                            inter_dim=s_oracle.col_count // 2,
+                        )
+                        for output in (
+                            column,
+                            s_oracle.col_count // 2 + column,
+                        )
+                    }
+                    if (
+                        exact_mlp_activation
+                        and manifest_suffix == "gate_up"
+                        and s_oracle.col_count % 2 == 0
                     )
                     else set()
                 )
@@ -4164,6 +4371,146 @@ def verify_economic_recompute_v3(
     import math
 
     corridor_stats: list[tuple[str, float, float, str]] = []
+    mlp_activation_reveals = {
+        int(reveal.layer_index): tuple(reveal.rows)
+        for reveal in proof.mlp_activation_reveals
+    }
+    if exact_mlp_activation:
+        if tuple(sorted(mlp_activation_reveals)) != selected_layers:
+            raise _fail(
+                "lean MLP activation reveals do not cover exactly the "
+                "selected layers"
+            )
+    elif mlp_activation_reveals:
+        raise _fail(
+            "non-lean proof must not carry MLP activation replay cells"
+        )
+
+    def _verify_exact_mlp_activation_v3(
+        *,
+        layer: int,
+        layer_tokens,
+        mlp_cols,
+        gate_up_values,
+        inter_dim: int,
+        gate_up_scale: float,
+        down_x_rows,
+        down_x_scale: float,
+        gate_up_surrogate,
+        gate_up_x_rows,
+        gate_up_weight_rows,
+        gate_up_x_scale: float,
+        gate_up_w_scale: float,
+        gate_up_bias_at,
+        gate_up_x_sq,
+        gate_up_w_sq,
+        stats,
+    ) -> None:
+        from verallm.proof_v3.economic_execution_anchor import (
+            _decode_row_v3,
+        )
+
+        token_for_position = {
+            int(position): int(token)
+            for token, position in lean_positions_by_layer[layer].items()
+        }
+        expected_positions = tuple(sorted(token_for_position))
+        records = mlp_activation_reveals[layer]
+        actual_positions = tuple(int(record[0]) for record in records)
+        if actual_positions != expected_positions:
+            raise _fail(
+                f"lean MLP activation rows are incomplete for layer {layer}"
+            )
+        expected_width = 2 * len(mlp_cols)
+        for position, gate_raw, up_raw, down_raw in records:
+            if any(
+                len(raw) != expected_width
+                for raw in (gate_raw, up_raw, down_raw)
+            ):
+                raise _fail(
+                    f"lean MLP activation cell width is malformed for "
+                    f"layer {layer}"
+                )
+            gate_values = _decode_row_v3(gate_raw, anchor_encoding)
+            up_values = _decode_row_v3(up_raw, anchor_encoding)
+            down_values = _decode_row_v3(down_raw, anchor_encoding)
+            token = token_for_position[int(position)]
+            if token not in set(layer_tokens):
+                raise _fail(
+                    f"lean MLP activation row is detached for layer {layer}"
+                )
+            for slot, col in enumerate(mlp_cols):
+                gate = float(gate_values[slot])
+                up = float(up_values[slot])
+                got = float(down_values[slot])
+                expected_gate_i8 = int(gate_up_values[(token, col)])
+                expected_up_i8 = int(
+                    gate_up_values[(token, inter_dim + col)]
+                )
+                expected_down_i8 = int(down_x_rows[token][col])
+                for output, value, label in (
+                    (col, gate, "gate"),
+                    (inter_dim + col, up, "up"),
+                ):
+                    bias_value, bias_quant = gate_up_bias_at(output)
+                    _corridor_check(
+                        surrogate_value=_projection_surrogate_value(
+                            gate_up_surrogate,
+                            token,
+                            output,
+                        ),
+                        captured_value=value,
+                        x_row=gate_up_x_rows[token],
+                        w_row=gate_up_weight_rows.get(output, ()),
+                        x_scale=gate_up_x_scale,
+                        w_scale=gate_up_w_scale,
+                        y_scale=1.0,
+                        output_quant_floor=0.0,
+                        captured_is_quantized=False,
+                        what=(
+                            f"coupling l{layer} exact MLP {label} projection"
+                        ),
+                        bias_value=bias_value,
+                        bias_quant=bias_quant,
+                        stats=stats,
+                        kind="y_gate_up",
+                        x_sq=gate_up_x_sq[token],
+                        w_sq=gate_up_w_sq[output],
+                        sigma_cap=corridor_sigma,
+                    )
+                try:
+                    actual_i8 = _verify_exact_runtime_mlp_cell_v3(
+                        gate=gate,
+                        up=up,
+                        got=got,
+                        expected_gate_i8=expected_gate_i8,
+                        expected_up_i8=expected_up_i8,
+                        expected_down_i8=expected_down_i8,
+                        gate_up_scale=gate_up_scale,
+                        down_x_scale=down_x_scale,
+                        encoding_id=anchor_encoding,
+                    )
+                except ProofV3VerificationError as exc:
+                    raise _fail(
+                        f"{exc} (layer={layer}, position={position}, "
+                        f"column={col})"
+                    ) from exc
+                if _MLP_ACTIVATION_QUALIFICATION_REPORT is not None:
+                    _MLP_ACTIVATION_QUALIFICATION_REPORT.append(
+                        {
+                            "layer": int(layer),
+                            "position": int(position),
+                            "column": int(col),
+                            "gate_i8": int(actual_i8[0]),
+                            "up_i8": int(actual_i8[1]),
+                            "down_i8": int(actual_i8[2]),
+                            "gate_near_zero": abs(int(actual_i8[0])) <= 1,
+                            "quantized_rail": any(
+                                value in (-128, 127) for value in actual_i8
+                            ),
+                        }
+                    )
+
     for coupling in proof.couplings:
         layer = coupling.layer_index
         layer_tokens = projection_tokens_by_layer[layer]
@@ -4393,37 +4740,60 @@ def verify_economic_recompute_v3(
         down_x_rows, _s, _w, down_x_scale, _ws, _o = opened_projections[
             (layer, "down")
         ]
-        for token in layer_tokens:
-            for col in mlp_cols:
-                gate_i8 = gate_up_values[(token, col)]
-                up_i8 = gate_up_values[(token, inter_dim + col)]
-                down_i8 = down_x_rows[token][col]
-                gate = gate_i8 * gu_y_scale
-                up = up_i8 * gu_y_scale
-                predicted = _silu(gate) * up
-                got = down_i8 * down_x_scale
-                quant = 0.5 * down_x_scale + 0.5 * gu_y_scale * (
-                    1.1 * abs(up) + abs(_silu(gate)) + 0.5 * gu_y_scale
-                )
-                if _swiglu_output_is_forced_to_quantization_rail_v3(
-                    gate_i8=gate_i8,
-                    up_i8=up_i8,
-                    gate_up_scale=gu_y_scale,
-                    output_i8=down_i8,
-                    output_scale=down_x_scale,
-                ):
-                    predicted = got
-                _fixed_quantization_corridor_check(
-                    delta=abs(got - predicted),
-                    quant=quant,
-                    relative=_REL_COEFF * abs(predicted),
-                    what=f"coupling l{layer} elementwise MLP link",
-                    kind="mlp_elementwise",
-                    failure=(
-                        f"coupling l{layer} elementwise MLP link is outside "
-                        "the quantization corridor (fabricated MLP trace)"
-                    ),
-                )
+        if exact_mlp_activation:
+            _verify_exact_mlp_activation_v3(
+                layer=layer,
+                layer_tokens=layer_tokens,
+                mlp_cols=mlp_cols,
+                gate_up_values=gate_up_values,
+                inter_dim=inter_dim,
+                gate_up_scale=gu_y_scale,
+                down_x_rows=down_x_rows,
+                down_x_scale=down_x_scale,
+                gate_up_surrogate=gu_surrogate,
+                gate_up_x_rows=gu_x_rows,
+                gate_up_weight_rows=gu_weight_rows,
+                gate_up_x_scale=gu_x_scale,
+                gate_up_w_scale=gu_w_scale,
+                gate_up_bias_at=lambda output: _bias_at("gate_up", output),
+                gate_up_x_sq=gu_x_sq,
+                gate_up_w_sq=gu_w_sq,
+                stats=corridor_stats,
+            )
+        else:
+            for token in layer_tokens:
+                for col in mlp_cols:
+                    gate_i8 = gate_up_values[(token, col)]
+                    up_i8 = gate_up_values[(token, inter_dim + col)]
+                    down_i8 = down_x_rows[token][col]
+                    gate = gate_i8 * gu_y_scale
+                    up = up_i8 * gu_y_scale
+                    predicted = _silu(gate) * up
+                    got = down_i8 * down_x_scale
+                    quant = 0.5 * down_x_scale + 0.5 * gu_y_scale * (
+                        1.1 * abs(up)
+                        + abs(_silu(gate))
+                        + 0.5 * gu_y_scale
+                    )
+                    if _swiglu_output_is_forced_to_quantization_rail_v3(
+                        gate_i8=gate_i8,
+                        up_i8=up_i8,
+                        gate_up_scale=gu_y_scale,
+                        output_i8=down_i8,
+                        output_scale=down_x_scale,
+                    ):
+                        predicted = got
+                    _fixed_quantization_corridor_check(
+                        delta=abs(got - predicted),
+                        quant=quant,
+                        relative=_REL_COEFF * abs(predicted),
+                        what=f"coupling l{layer} elementwise MLP link",
+                        kind="mlp_elementwise",
+                        failure=(
+                            f"coupling l{layer} elementwise MLP link is outside "
+                            "the quantization corridor (fabricated MLP trace)"
+                        ),
+                    )
 
         # --- (b) qkv <-> K/V cache corridor at sampled kv columns ---
         (
@@ -5663,6 +6033,57 @@ def verify_economic_recompute_v3(
 
         # Every architecture-specific registered projection is tied to its
         # authenticated runtime output at the nonce-selected output cells.
+        if lean and canonical_gdn_projection_inputs:
+            from verallm.proof_v3.gdn_projection_input import (
+                canonical_gdn_projection_inputs_v3,
+            )
+
+            canonical_input_norm_row = artifacts.verify_weight_row(
+                name=f"l{layer}.input_norm",
+                reveal=coupling.input_norm_row,
+            )
+            canonical_input_norm_scale = artifacts.scale_for(
+                f"l{layer}.input_norm"
+            )
+            canonical_scale_bits, canonical_scale, canonical_x_rows = (
+                canonical_gdn_projection_inputs_v3(
+                    source_rows_by_token={
+                        token: norm_source_rows_by_token[token][0]
+                        for token in layer_tokens
+                    },
+                    norm_row=canonical_input_norm_row,
+                    norm_scale=canonical_input_norm_scale,
+                    norm_gain_offset=norm_gain_offset,
+                    epsilon=rmsnorm_epsilon,
+                )
+            )
+            for projection in ("gdn_qkvz", "gdn_ba"):
+                projection_rows = opened_projections[(layer, projection)]
+                x_rows = projection_rows[0]
+                x_scale_bits = oracle_by_id[
+                    f"l{layer}.{projection}_x"
+                ].scale_bits
+                if x_scale_bits != canonical_scale_bits:
+                    raise _fail(
+                        f"GDN coupling l{layer} {projection} input scale is "
+                        "detached from the authenticated norm source"
+                    )
+                if any(
+                    tuple(x_rows[token]) != canonical_x_rows[token]
+                    for token in layer_tokens
+                ):
+                    raise _fail(
+                        f"GDN coupling l{layer} {projection} input row is "
+                        "detached from the authenticated norm source"
+                    )
+                opened_projections[(layer, projection)] = (
+                    projection_rows[0],
+                    projection_rows[1],
+                    projection_rows[2],
+                    canonical_scale,
+                    projection_rows[4],
+                    projection_rows[5],
+                )
         for suffix, row_key in (
             ("gdn_qkvz", "qkvz_y"),
             ("gdn_ba", "ba_y"),
@@ -5797,48 +6218,62 @@ def verify_economic_recompute_v3(
                 )
         down_x_rows = opened_projections[(layer, "down")][0]
         down_x_scale = opened_projections[(layer, "down")][3]
-        for token in layer_tokens:
-            for col in mlp_cols:
-                sequence_position = lean_positions_by_layer.get(
-                    layer, {}
-                ).get(token)
-                gate_i8 = gate_up_values[(token, col)]
-                up_i8 = gate_up_values[(token, inter_dim + col)]
-                down_i8 = down_x_rows[token][col]
-                gate = gate_i8 * gu_y_scale
-                up = up_i8 * gu_y_scale
-                predicted = _silu(gate) * up
-                got = down_i8 * down_x_scale
-                quant = 0.5 * down_x_scale + 0.5 * gu_y_scale * (
-                    1.1 * abs(up) + abs(_silu(gate)) + 0.5 * gu_y_scale
-                )
-                if _swiglu_output_is_forced_to_quantization_rail_v3(
-                    gate_i8=gate_i8,
-                    up_i8=up_i8,
-                    gate_up_scale=gu_y_scale,
-                    output_i8=down_i8,
-                    output_scale=down_x_scale,
-                ):
-                    predicted = got
-                _fixed_quantization_corridor_check(
-                    delta=abs(got - predicted),
-                    quant=quant,
-                    relative=_REL_COEFF * abs(predicted),
-                    what=(
-                        f"GDN coupling l{layer} token {token} col {col} "
-                        f"position {sequence_position} "
-                        "elementwise MLP link "
-                        f"(gate={gate:.9g}, up={up:.9g}, "
-                        f"predicted={predicted:.9g}, captured={got:.9g}, "
-                        f"gate_up_scale={gu_y_scale:.9g}, "
-                        f"down_scale={down_x_scale:.9g})"
-                    ),
-                    kind="gdn_mlp_elementwise",
-                    failure=(
-                        f"GDN coupling l{layer} elementwise MLP link is "
-                        "outside the quantization corridor"
-                    ),
-                )
+        if exact_mlp_activation:
+            _verify_exact_mlp_activation_v3(
+                layer=layer,
+                layer_tokens=layer_tokens,
+                mlp_cols=mlp_cols,
+                gate_up_values=gate_up_values,
+                inter_dim=inter_dim,
+                gate_up_scale=gu_y_scale,
+                down_x_rows=down_x_rows,
+                down_x_scale=down_x_scale,
+                gate_up_surrogate=gu_surrogate,
+                gate_up_x_rows=gu_x_rows,
+                gate_up_weight_rows=gu_weight_rows,
+                gate_up_x_scale=gu_x_scale,
+                gate_up_w_scale=gu_w_scale,
+                gate_up_bias_at=lambda output: _gdn_bias_at(
+                    "gate_up", output
+                ),
+                gate_up_x_sq=gu_x_sq,
+                gate_up_w_sq=gu_w_sq,
+                stats=corridor_stats,
+            )
+        else:
+            for token in layer_tokens:
+                for col in mlp_cols:
+                    gate_i8 = gate_up_values[(token, col)]
+                    up_i8 = gate_up_values[(token, inter_dim + col)]
+                    down_i8 = down_x_rows[token][col]
+                    gate = gate_i8 * gu_y_scale
+                    up = up_i8 * gu_y_scale
+                    predicted = _silu(gate) * up
+                    got = down_i8 * down_x_scale
+                    quant = 0.5 * down_x_scale + 0.5 * gu_y_scale * (
+                        1.1 * abs(up)
+                        + abs(_silu(gate))
+                        + 0.5 * gu_y_scale
+                    )
+                    if _swiglu_output_is_forced_to_quantization_rail_v3(
+                        gate_i8=gate_i8,
+                        up_i8=up_i8,
+                        gate_up_scale=gu_y_scale,
+                        output_i8=down_i8,
+                        output_scale=down_x_scale,
+                    ):
+                        predicted = got
+                    _fixed_quantization_corridor_check(
+                        delta=abs(got - predicted),
+                        quant=quant,
+                        relative=_REL_COEFF * abs(predicted),
+                        what=f"GDN coupling l{layer} elementwise MLP link",
+                        kind="gdn_mlp_elementwise",
+                        failure=(
+                            f"GDN coupling l{layer} elementwise MLP link is "
+                            "outside the quantization corridor"
+                        ),
+                    )
 
         # Residual chain: GDN output projection, then common MLP.
         rin_rows, rout_rows = opened_boundaries[layer]

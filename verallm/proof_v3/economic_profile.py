@@ -38,6 +38,9 @@ from verallm.proof_v3.execution_anchor import EXECUTION_ANCHOR_ABI_V3
 from verallm.proof_v3.gdn_decode_corridor import (
     GDN_DECODE_CORRIDOR_ABI_V3,
 )
+from verallm.proof_v3.gdn_projection_input import (
+    GDN_CANONICAL_NORM_INPUT_ABI_V3,
+)
 from verallm.proof_v3.lean_execution_anchor import (
     LEAN_EXECUTION_ANCHOR_ABI_V3,
 )
@@ -99,6 +102,9 @@ ECONOMIC_COMPACT_PROJECTION_ABI_V3 = (
 ECONOMIC_QUANTIZATION_SEMANTICS_ID_V3 = "int8.symmetric.v1"
 ECONOMIC_NONCE_SELECTION_ABI_V3 = "economic.recompute.nonce.v1"
 ECONOMIC_RECURSIVE_ACCUMULATOR_ABI_V3 = "economic.openings.v1"
+ECONOMIC_MLP_ACTIVATION_REPLAY_ABI_V3 = (
+    "mlp.silu.selected_runtime_cells.fp16_bf16.ulp2.v1"
+)
 
 _DIGEST_DOMAIN = b"VERATHOS/PROOF_V3/ECONOMIC_PROFILE/V1/"
 _LAYER_ENTRY = re.compile(r"^l([0-9]+)\.([a-z0-9_]+)$")
@@ -127,6 +133,8 @@ __all__ = [
     "ECONOMIC_SELECTED_TRACE_PROFILE_ADAPTER_VERSION_V3",
     "ECONOMIC_SELECTED_TRACE_ESCALATION_PROFILE_ADAPTER_VERSION_V3",
     "ECONOMIC_COMPACT_PROJECTION_ABI_V3",
+    "ECONOMIC_MLP_ACTIVATION_REPLAY_ABI_V3",
+    "GDN_CANONICAL_NORM_INPUT_ABI_V3",
     "ECONOMIC_QUANTIZATION_SEMANTICS_ID_V3",
     "build_economic_execution_profile_v3",
     "economic_static_artifact_digest_v3",
@@ -134,6 +142,8 @@ __all__ = [
     "economic_profile_is_compact_v3",
     "economic_profile_has_full_row_escalation_v3",
     "economic_profile_is_lean_v3",
+    "economic_profile_uses_canonical_gdn_input_v3",
+    "economic_profile_uses_exact_mlp_activation_v3",
     "economic_profile_uses_selected_trace_v3",
     "validate_economic_execution_profile_v3",
 ]
@@ -227,8 +237,17 @@ def economic_verifier_digest_v3(
     compact_projection: bool = False,
     compact_full_row_escalation: bool = False,
     selected_trace: bool = False,
+    exact_mlp_activation: bool = True,
+    canonical_gdn_input: bool | None = None,
 ) -> bytes:
     """Versioned verifier identity for the non-keyed economic adapter."""
+
+    if canonical_gdn_input is None:
+        canonical_gdn_input = exact_mlp_activation
+    if canonical_gdn_input and not exact_mlp_activation:
+        raise ProofV3Error(
+            "canonical GDN inputs require exact MLP activation semantics"
+        )
 
     if compact_projection and not lean:
         raise ProofV3Error(
@@ -274,6 +293,18 @@ def economic_verifier_digest_v3(
             LEAN_EXECUTION_ANCHOR_ABI_V3.encode("ascii")
             + b"\0"
             + GDN_DECODE_CORRIDOR_ABI_V3.encode("ascii")
+            + (
+                b"\0"
+                + ECONOMIC_MLP_ACTIVATION_REPLAY_ABI_V3.encode("ascii")
+                + (
+                    b"\0"
+                    + GDN_CANONICAL_NORM_INPUT_ABI_V3.encode("ascii")
+                    if canonical_gdn_input
+                    else b""
+                )
+                if exact_mlp_activation and not selected_trace
+                else b""
+            )
             + b"\0"
             + LEAN_PROJECTION_BATCH_ABI_V3.encode("ascii")
             + b"\0"
@@ -296,6 +327,63 @@ def economic_verifier_digest_v3(
             if lean
             else b"full_inventory.v1"
         ),
+    )
+
+
+def economic_profile_uses_exact_mlp_activation_v3(
+    profile: ExecutionSecurityProfileV3,
+) -> bool:
+    """Whether the signed verifier digest selects exact fused-SwiGLU cells."""
+
+    if not isinstance(profile, ExecutionSecurityProfileV3):
+        raise ProofV3Error("economic profile has an unexpected type")
+    if (
+        not economic_profile_is_lean_v3(profile)
+        or economic_profile_uses_selected_trace_v3(profile)
+    ):
+        return False
+    common = dict(
+        lean=True,
+        compact_projection=economic_profile_is_compact_v3(profile),
+        compact_full_row_escalation=(
+            economic_profile_has_full_row_escalation_v3(profile)
+        ),
+        selected_trace=False,
+        exact_mlp_activation=True,
+    )
+    return profile.verifier_key_digest in {
+        economic_verifier_digest_v3(
+            **common,
+            canonical_gdn_input=True,
+        ),
+        economic_verifier_digest_v3(
+            **common,
+            canonical_gdn_input=False,
+        ),
+    }
+
+
+def economic_profile_uses_canonical_gdn_input_v3(
+    profile: ExecutionSecurityProfileV3,
+) -> bool:
+    """Whether the profile selects authenticated canonical GDN input rows."""
+
+    if not isinstance(profile, ExecutionSecurityProfileV3):
+        raise ProofV3Error("economic profile has an unexpected type")
+    if (
+        not economic_profile_is_lean_v3(profile)
+        or economic_profile_uses_selected_trace_v3(profile)
+    ):
+        return False
+    return profile.verifier_key_digest == economic_verifier_digest_v3(
+        lean=True,
+        compact_projection=economic_profile_is_compact_v3(profile),
+        compact_full_row_escalation=(
+            economic_profile_has_full_row_escalation_v3(profile)
+        ),
+        selected_trace=False,
+        exact_mlp_activation=True,
+        canonical_gdn_input=True,
     )
 
 
@@ -1469,6 +1557,40 @@ def validate_economic_execution_profile_v3(
             f"economic execution profile qualification failed: {exc}"
         ) from exc
     if expected.canonical_bytes() != profile.canonical_bytes():
-        raise ProofV3VerificationError(
-            "economic execution profile does not match the authenticated artifacts"
+        exact_mlp_legacy = replace(
+            expected,
+            verifier_key_digest=economic_verifier_digest_v3(
+                lean=economic_profile_is_lean_v3(expected),
+                compact_projection=economic_profile_is_compact_v3(expected),
+                compact_full_row_escalation=(
+                    economic_profile_has_full_row_escalation_v3(expected)
+                ),
+                selected_trace=economic_profile_uses_selected_trace_v3(
+                    expected
+                ),
+                exact_mlp_activation=True,
+                canonical_gdn_input=False,
+            ),
         )
+        pre_exact_legacy = replace(
+            expected,
+            verifier_key_digest=economic_verifier_digest_v3(
+                lean=economic_profile_is_lean_v3(expected),
+                compact_projection=economic_profile_is_compact_v3(expected),
+                compact_full_row_escalation=(
+                    economic_profile_has_full_row_escalation_v3(expected)
+                ),
+                selected_trace=economic_profile_uses_selected_trace_v3(
+                    expected
+                ),
+                exact_mlp_activation=False,
+            ),
+        )
+        if profile.canonical_bytes() not in {
+            exact_mlp_legacy.canonical_bytes(),
+            pre_exact_legacy.canonical_bytes(),
+        }:
+            raise ProofV3VerificationError(
+                "economic execution profile does not match the authenticated "
+                "artifacts"
+            )

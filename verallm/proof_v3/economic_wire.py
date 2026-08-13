@@ -65,6 +65,8 @@ from verallm.proof_v3.prefix_cache import (
     PrefixCacheStateRecordV3,
 )
 from zkllm.types import MerklePath
+# v19/v20: lean compact proofs carry exact bounded replay cells for the
+# nonce-selected fused SwiGLU relation. v20 is the prefix-cache counterpart.
 # v17: checkpointed GDN couplings carry exact bounded replay source rows for
 # RMSNorm, avoiding non-conservative intervals when candidate-pool int8 rows
 # clip at later nonce-selected decode positions.
@@ -96,6 +98,8 @@ from zkllm.types import MerklePath
 # execution-anchor commitments stay in the authenticated outer envelope.
 ECONOMIC_WIRE_FORMAT_VERSION = 17
 ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION = 18
+ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION = 19
+ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION = 20
 _WIRE_MAGIC = b"V3EW"
 
 VALUE_MODE_EXTERNAL = 0
@@ -128,7 +132,7 @@ _ANCHORED_EXECUTION_ROOT_DOMAIN = (
 # geometry (27B-class) with margin while staying a hard verifier-side
 # parse bound.
 MAX_ECONOMIC_WIRE_BYTES = 128 << 20
-MAX_SUCCINCT_PROJECTION_WIRE_BYTES_V3 = 2 << 20
+MAX_SUCCINCT_PROJECTION_WIRE_BYTES_V3 = 17 << 17
 MAX_SELECTED_TRACE_WIRE_BYTES_V3 = 2 << 20
 MAX_ORACLES = 4096
 MAX_PROJECTION_REVEALS = 512
@@ -172,6 +176,8 @@ _PHASE_NAMES = {code: name for name, code in _PHASE_CODES.items()}
 __all__ = [
     "ECONOMIC_WIRE_FORMAT_VERSION",
     "ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION",
+    "ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION",
+    "ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION",
     "MAX_ECONOMIC_WIRE_BYTES",
     "MAX_SELECTED_TRACE_WIRE_BYTES_V3",
     "MAX_REVEALED_LOGITS_V3",
@@ -182,6 +188,7 @@ __all__ = [
     "EconomicMerkleSiblingV3",
     "EconomicLayerCouplingRevealV3",
     "EconomicGdnLayerCouplingRevealV3",
+    "EconomicMlpActivationRevealV3",
     "EconomicMerkleOpeningV3",
     "EconomicWeightRowRevealV3",
     "EconomicProjectionRevealV3",
@@ -1239,6 +1246,88 @@ class EconomicProjectionRevealV3:
             complete_output=complete_output,
             succinct_output=succinct_output,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class EconomicMlpActivationRevealV3:
+    """Exact selected runtime cells for one fused SwiGLU relation.
+
+    Each row carries gate, up and fused down-input values at the validator's
+    nonce-derived intermediate columns. Values use the signed execution-anchor
+    fp16/bf16 encoding and are joined to the independently opened int8
+    projection cells by the verifier.
+    """
+
+    layer_index: int
+    rows: tuple[tuple[int, bytes, bytes, bytes], ...] = ()
+
+    def __post_init__(self) -> None:
+        _u_range(self.layer_index, "MLP activation layer_index", bits=32)
+        rows = tuple(self.rows)
+        if not rows or len(rows) > MAX_EXECUTION_ANCHOR_ROWS:
+            raise ProofV3Error("MLP activation row count is out of range")
+        previous_position = -1
+        expected_width = None
+        for record in rows:
+            if not isinstance(record, tuple) or len(record) != 4:
+                raise ProofV3Error("MLP activation row is malformed")
+            position, gate_bytes, up_bytes, down_bytes = record
+            _u_range(position, "MLP activation row position", bits=64)
+            if position <= previous_position:
+                raise ProofV3Error(
+                    "MLP activation rows must be strictly increasing"
+                )
+            previous_position = position
+            widths = tuple(
+                len(value)
+                for value in (gate_bytes, up_bytes, down_bytes)
+                if isinstance(value, bytes)
+            )
+            if (
+                len(widths) != 3
+                or not widths[0]
+                or len(set(widths)) != 1
+                or widths[0] > MAX_EXECUTION_ANCHOR_ROW_BYTES
+                or (expected_width is not None and widths[0] != expected_width)
+            ):
+                raise ProofV3Error(
+                    "MLP activation cell bytes have inconsistent widths"
+                )
+            expected_width = widths[0]
+        object.__setattr__(self, "rows", rows)
+
+    def encode(self, writer: _Writer) -> None:
+        writer.pack("<II", self.layer_index, len(self.rows))
+        for position, gate_bytes, up_bytes, down_bytes in self.rows:
+            writer.pack("<Q", position)
+            for value in (gate_bytes, up_bytes, down_bytes):
+                writer.vbytes(
+                    value,
+                    "MLP activation cells",
+                    MAX_EXECUTION_ANCHOR_ROW_BYTES,
+                )
+
+    @classmethod
+    def decode(cls, reader: _Reader) -> "EconomicMlpActivationRevealV3":
+        layer_index, row_count = reader.unpack("<II")
+        if not row_count or row_count > MAX_EXECUTION_ANCHOR_ROWS:
+            raise ProofV3Error("MLP activation row count is out of range")
+        rows = tuple(
+            (
+                reader.unpack("<Q")[0],
+                reader.vbytes(
+                    "MLP gate cells", MAX_EXECUTION_ANCHOR_ROW_BYTES
+                ),
+                reader.vbytes(
+                    "MLP up cells", MAX_EXECUTION_ANCHOR_ROW_BYTES
+                ),
+                reader.vbytes(
+                    "MLP down-input cells", MAX_EXECUTION_ANCHOR_ROW_BYTES
+                ),
+            )
+            for _ in range(row_count)
+        )
+        return cls(layer_index=layer_index, rows=rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2448,6 +2537,9 @@ class EconomicRecomputeProofV3:
     gdn_couplings: tuple[EconomicGdnLayerCouplingRevealV3, ...] = field(
         default_factory=tuple
     )
+    mlp_activation_reveals: tuple[
+        EconomicMlpActivationRevealV3, ...
+    ] = field(default_factory=tuple)
     lean_projection_batch_wire: bytes = b""
     succinct_projection_batch_wire: bytes = b""
     selected_trace_wire: bytes = b""
@@ -2612,6 +2704,22 @@ class EconomicRecomputeProofV3:
                     raise ProofV3Error(
                         "GDN coupling reveal references an unknown oracle"
                     )
+        mlp_activation_reveals = tuple(self.mlp_activation_reveals)
+        if len(mlp_activation_reveals) > MAX_COUPLING_REVEALS:
+            raise ProofV3Error(
+                "MLP activation reveal count exceeds the wire bound"
+            )
+        previous_layer = -1
+        for reveal in mlp_activation_reveals:
+            if not isinstance(reveal, EconomicMlpActivationRevealV3):
+                raise ProofV3Error(
+                    "MLP activation reveal has an unexpected type"
+                )
+            if reveal.layer_index <= previous_layer:
+                raise ProofV3Error(
+                    "MLP activation reveals must be strictly increasing by layer"
+                )
+            previous_layer = reveal.layer_index
         lean_projection_batch_wire = self.lean_projection_batch_wire
         if not isinstance(lean_projection_batch_wire, bytes):
             raise ProofV3Error(
@@ -2720,6 +2828,9 @@ class EconomicRecomputeProofV3:
         object.__setattr__(self, "couplings", couplings)
         object.__setattr__(self, "gdn_couplings", gdn_couplings)
         object.__setattr__(
+            self, "mlp_activation_reveals", mlp_activation_reveals
+        )
+        object.__setattr__(
             self,
             "lean_projection_batch_wire",
             lean_projection_batch_wire,
@@ -2747,11 +2858,18 @@ class EconomicRecomputeProofV3:
 
     def canonical_bytes(self) -> bytes:
         writer = _Writer()
-        version = (
-            ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION
-            if self.prefix_cache is not None
-            else ECONOMIC_WIRE_FORMAT_VERSION
-        )
+        if self.mlp_activation_reveals:
+            version = (
+                ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION
+                if self.prefix_cache is not None
+                else ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION
+            )
+        else:
+            version = (
+                ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION
+                if self.prefix_cache is not None
+                else ECONOMIC_WIRE_FORMAT_VERSION
+            )
         writer.pack("<4sH", _WIRE_MAGIC, version)
         writer.raw(self.commitment_envelope_digest)
         writer.raw(self.execution_profile_digest)
@@ -2791,6 +2909,10 @@ class EconomicRecomputeProofV3:
         writer.pack("<I", len(self.gdn_couplings))
         for coupling in self.gdn_couplings:
             coupling.encode(writer)
+        if self.mlp_activation_reveals:
+            writer.pack("<I", len(self.mlp_activation_reveals))
+            for reveal in self.mlp_activation_reveals:
+                reveal.encode(writer)
         writer.pack("<B", 1 if self.lean_projection_batch_wire else 0)
         if self.lean_projection_batch_wire:
             writer.vbytes(
@@ -2837,6 +2959,8 @@ class EconomicRecomputeProofV3:
         if magic != _WIRE_MAGIC or version not in {
             ECONOMIC_WIRE_FORMAT_VERSION,
             ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+            ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION,
+            ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION,
         }:
             raise ProofV3Error("economic recompute proof header is not supported")
         commitment_envelope_digest = reader.read(32)
@@ -2902,6 +3026,19 @@ class EconomicRecomputeProofV3:
             EconomicGdnLayerCouplingRevealV3.decode(reader)
             for _ in range(gdn_coupling_count)
         )
+        mlp_activation_reveals = ()
+        if version in {
+            ECONOMIC_MLP_ACTIVATION_WIRE_FORMAT_VERSION,
+            ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+        }:
+            mlp_activation_count = reader.count(
+                "MLP activation reveals",
+                MAX_COUPLING_REVEALS,
+            )
+            mlp_activation_reveals = tuple(
+                EconomicMlpActivationRevealV3.decode(reader)
+                for _ in range(mlp_activation_count)
+            )
         lean_projection_batch_flag = reader.unpack("<B")[0]
         if lean_projection_batch_flag not in (0, 1):
             raise ProofV3Error(
@@ -2958,7 +3095,10 @@ class EconomicRecomputeProofV3:
         )
         prefix_cache = (
             _decode_prefix_cache_section_v3(reader)
-            if version == ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION
+            if version in {
+                ECONOMIC_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+                ECONOMIC_MLP_ACTIVATION_PREFIX_CACHE_WIRE_FORMAT_VERSION,
+            }
             else None
         )
         reader.finish()
@@ -2974,6 +3114,7 @@ class EconomicRecomputeProofV3:
             projections=projections,
             couplings=couplings,
             gdn_couplings=gdn_couplings,
+            mlp_activation_reveals=mlp_activation_reveals,
             lean_projection_batch_wire=lean_projection_batch_wire,
             succinct_projection_batch_wire=succinct_projection_batch_wire,
             selected_trace_wire=selected_trace_wire,

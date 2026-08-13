@@ -33,6 +33,24 @@ echo "  Verathos Installer ($ROLE)"
 echo "============================================================"
 echo ""
 
+# A minimal cloud image may not include git.  The one-command installer must
+# establish its own clone prerequisite instead of failing before the role
+# setup script can install the remaining system packages.
+if ! command -v git >/dev/null 2>&1; then
+    echo "  Installing bootstrap dependency: git..."
+    if [ "$(id -u)" -eq 0 ]; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo apt-get update -qq
+        sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y -qq git ca-certificates
+    else
+        echo "ERROR: git is required and automatic installation needs root or passwordless sudo." >&2
+        exit 1
+    fi
+fi
+
 # ── Detect workspace ──────────────────────────────────────────────────────
 if [ -d /workspace ] && [ -w /workspace ]; then
     WORKSPACE=/workspace

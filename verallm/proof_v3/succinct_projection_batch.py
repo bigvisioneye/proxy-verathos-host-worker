@@ -87,10 +87,11 @@ MAX_SUCCINCT_PROJECTION_CLAIMS_V3: Final = 1024
 # This bounds the canonical *uncompressed subsection*. The enclosing hard
 # bundle is compressed once after assembly. Production GDN/QKV provenance at
 # the qualified four-row policy measures about 1.57 MiB before that outer
-# compression, so keep the parser bound at the operator-approved 1--2 MiB
-# range while the final network bundle remains gated against the matched v9
-# measurement.
-MAX_SUCCINCT_PROJECTION_WIRE_BYTES_V3: Final = 2 << 20
+# compression, so keep the parser bound close to the operator-approved 1--2
+# MiB range while the final network bundle remains gated against the matched
+# v9 measurement. The exact fused-MLP binding needs a small bounded margin
+# above 2 MiB.
+MAX_SUCCINCT_PROJECTION_WIRE_BYTES_V3: Final = 17 << 17
 
 _COEFFICIENT_DOMAIN = (
     b"VERATHOS/PROOF_V3/SUCCINCT_PROJECTION/COEFFICIENTS/U31X4/V2"
