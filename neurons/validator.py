@@ -7703,6 +7703,24 @@ class ValidatorNeuron:
                 if canary_policy is not None
                 else 9_000
             ),
+            owner_full_min_prompt_bps=(
+                getattr(
+                    canary_policy,
+                    "owner_full_context_min_prompt_bps",
+                    1_000,
+                )
+                if canary_policy is not None
+                else 1_000
+            ),
+            owner_full_max_draw_bps=(
+                getattr(
+                    canary_policy,
+                    "owner_full_context_max_draw_bps",
+                    10_000,
+                )
+                if canary_policy is not None
+                else 10_000
+            ),
             hard_decode_anchor_bps=(
                 canary_policy.hard_decode_anchor_bps
                 if canary_policy is not None
