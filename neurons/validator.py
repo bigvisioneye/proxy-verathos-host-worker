@@ -59,6 +59,7 @@ from neurons.capacity_audit import (
     CapacitySlot,
     PROTOCOL_VERSION,
     build_capacity_slot_group_key,
+    capacity_audit_active_hold_seconds,
     capacity_audit_payload_cooldown_blocks,
     capacity_audit_uid_escalation_threshold,
     capacity_audit_window_fits_epoch,
@@ -68,7 +69,6 @@ from neurons.capacity_audit import (
     derive_audit_id,
     derive_audit_seed,
     derive_audit_seed_from_hashes,
-    deterministic_sample_slots,
     derive_proof_challenge_seed,
     derive_proof_seed,
     lease_id,
@@ -76,7 +76,6 @@ from neurons.capacity_audit import (
     select_capacity_audit_slots,
     slot_id,
     verify_artifact_signature,
-    window_cohort_budget,
 )
 from neurons.capacity_audit_combined import (
     CURRENT_COMBINED_PROOF_PROTOCOL_VERSION,
@@ -2970,14 +2969,6 @@ class ValidatorNeuron:
         )
         if not selected:
             return
-        budget = window_cohort_budget(len(active), cfg)
-        if budget > 0 and len(selected) > budget:
-            before = len(selected)
-            selected = deterministic_sample_slots(selected, cohort_seed, budget)
-            bt.logging.info(
-                f"Capacity audit: truncated selected slots {before}->{len(selected)} "
-                f"by per-window drain budget at block {selection_block}"
-            )
         supported_fn = getattr(self, "_capacity_audit_supported_slots_by_id", None)
         if not callable(supported_fn):
             supported_fn = ValidatorNeuron._capacity_audit_supported_slots_by_id.__get__(self)
@@ -2998,13 +2989,11 @@ class ValidatorNeuron:
             audit_block=audit_block,
             cohort_seed=cohort_seed,
         )
-        drain_until_ts = (
-            now
-            + cfg.drain_seconds
-            + cfg.deadline_s
-            + cfg.transport_grace_s
-            + cfg.payload_deadline_s
-        )
+        # Match the miner's complete B_select-to-evidence hold. This timestamp
+        # is exported to routing/canary consumers; shortening it to only the
+        # post-start deadlines can admit work while the miner is still inside
+        # the same audit.
+        drain_until_ts = now + capacity_audit_active_hold_seconds(cfg)
         rows: list[dict] = []
         unsupported_selected = 0
         hotkey_lookup = getattr(self, "_get_miner_ss58", None)
