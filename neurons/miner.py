@@ -28,8 +28,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -90,30 +92,57 @@ _MANAGED_NGINX_CONFIG_PATHS = (
     Path("/etc/nginx/sites-enabled/verathos-miner"),
     Path("/etc/nginx/nginx.conf"),
 )
-_MANAGED_NGINX_OLD_READ_TIMEOUTS = (
-    "proxy_read_timeout 120s;",
-    "proxy_read_timeout 360s;",
+_MANAGED_NGINX_READ_TIMEOUT_PATTERN = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)proxy_read_timeout[ \t]+(?P<seconds>[0-9]+)s;[ \t]*$"
 )
-_MANAGED_NGINX_READ_TIMEOUT = "proxy_read_timeout 540s;"
+_MANAGED_NGINX_TIMEOUT_GRACE_SECONDS = 60
+_MANAGED_NGINX_FALLBACK_READ_TIMEOUT_SECONDS = 960
+
+
+def _managed_nginx_read_timeout_seconds(config: NeuronConfig) -> int:
+    """Return the restart-time proxy ceiling for the active subnet policy."""
+
+    from verallm.proof_v3.session import MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
+
+    full_context_seconds = math.ceil(
+        float(config.canary_full_context_inference_timeout)
+    )
+    hard_proof_seconds = math.ceil(
+        MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 / 1_000_000_000
+    )
+    return (
+        max(full_context_seconds, hard_proof_seconds)
+        + _MANAGED_NGINX_TIMEOUT_GRACE_SECONDS
+    )
 
 
 def _reconcile_managed_nginx_read_timeout(
     *,
+    read_timeout_seconds: int = _MANAGED_NGINX_FALLBACK_READ_TIMEOUT_SECONDS,
     config_paths: tuple[Path, ...] = _MANAGED_NGINX_CONFIG_PATHS,
     run_command: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     effective_uid: int | None = None,
 ) -> bool:
-    """Align the stock HTTPS proxy with the signed hard-proof deadline.
+    """Align the stock HTTPS proxy with the active application deadline.
 
-    The authenticated hard-proof response budget reaches 480 seconds for the
-    largest qualified decode geometry. Older stock templates used 120 or 360
-    seconds and could terminate a valid proof before the validator deadline.
+    Full-context inference and hard proofs have their own validator-enforced
+    deadlines. Nginx is only their transport ceiling, not another policy
+    layer. On each miner restart, the caller derives this value from the
+    effective subnet timeout plus the fixed transport grace.
     Only byte-recognizable Verathos-managed server blocks are migrated; custom
     reverse-proxy configurations are never rewritten.
     """
 
+    if (
+        isinstance(read_timeout_seconds, bool)
+        or not isinstance(read_timeout_seconds, int)
+        or not 1 <= read_timeout_seconds <= 86_400
+    ):
+        raise ValueError("read_timeout_seconds must be an integer in [1, 86400]")
+
     managed_marker = "ssl_certificate /etc/nginx/ssl/miner.crt;"
     backend_marker = "proxy_pass http://127.0.0.1:"
+    target_timeout = f"proxy_read_timeout {read_timeout_seconds}s;"
     selected_uid = os.geteuid() if effective_uid is None else effective_uid
     use_sudo = selected_uid != 0
     changed: list[tuple[Path, str, int]] = []
@@ -181,39 +210,32 @@ def _reconcile_managed_nginx_read_timeout(
             original = path.read_text()
         except (OSError, UnicodeError):
             continue
-        if _MANAGED_NGINX_READ_TIMEOUT in original:
-            continue
-        old_timeouts = tuple(
-            value
-            for value in _MANAGED_NGINX_OLD_READ_TIMEOUTS
-            if value in original
-        )
-        if not old_timeouts:
+        matches = tuple(_MANAGED_NGINX_READ_TIMEOUT_PATTERN.finditer(original))
+        if not matches:
             continue
         if managed_marker not in original or backend_marker not in original:
             bt.logging.warning(
-                f"Custom nginx config {path} retains an old read timeout; "
-                "set the proof-v3 upstream timeout to at least 540s"
+                f"Custom nginx config {path} was not changed; set its upstream "
+                f"read timeout to at least {read_timeout_seconds}s"
             )
             continue
-        old_count = original.count(old_timeouts[0]) if len(old_timeouts) == 1 else 0
-        current_count = original.count(_MANAGED_NGINX_READ_TIMEOUT)
         managed_count = original.count(managed_marker)
         backend_count = original.count(backend_marker)
         if (
-            len(old_timeouts) != 1
-            or old_count < 1
+            managed_count < 1
             or managed_count != backend_count
-            or managed_count != old_count + current_count
+            or managed_count != len(matches)
         ):
             bt.logging.warning(
                 f"Managed nginx config {path} has an ambiguous read timeout; "
-                "set the proof-v3 upstream timeout to at least 540s"
+                f"set it to at least {read_timeout_seconds}s manually"
             )
             continue
-        updated = original.replace(
-            old_timeouts[0],
-            _MANAGED_NGINX_READ_TIMEOUT,
+        if all(int(match.group("seconds")) == read_timeout_seconds for match in matches):
+            continue
+        updated = _MANAGED_NGINX_READ_TIMEOUT_PATTERN.sub(
+            lambda match: f"{match.group('indent')}{target_timeout}",
+            original,
         )
         try:
             mode = path.stat().st_mode & 0o7777
@@ -276,8 +298,9 @@ def _reconcile_managed_nginx_read_timeout(
         return False
 
     bt.logging.info(
-        "Updated the managed nginx upstream read timeout to 540s for "
-        "proof-v3 hard responses"
+        "Updated the managed nginx upstream read timeout to "
+        f"{read_timeout_seconds}s for full-context inference and proof-v3 "
+        "hard responses"
     )
     return True
 
@@ -2471,7 +2494,6 @@ def main():
 
     args, server_args = parse_args()
     setup_neuron_logging(args)
-    _reconcile_managed_nginx_read_timeout()
     _clear_stale_compile_caches()
 
     # The updater executing the first v1 -> v3 fast-forward is still the old
@@ -2802,6 +2824,14 @@ def main():
             neuron._refresh_validator_allowlist()
         except Exception as e:
             bt.logging.warning(f"Initial validator allowlist write failed: {e} — server will block until next refresh succeeds")
+    managed_nginx_timeout_seconds = _managed_nginx_read_timeout_seconds(config)
+    if not _reconcile_managed_nginx_read_timeout(
+        read_timeout_seconds=managed_nginx_timeout_seconds,
+    ):
+        bt.logging.warning(
+            "Managed nginx timeout reconciliation did not complete; verify "
+            f"the upstream read timeout is at least {managed_nginx_timeout_seconds}s"
+        )
     served_proof_protocol_versions = (
         neuron._served_proof_protocol_versions
         or _configured_miner_proof_protocol_versions(

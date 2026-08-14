@@ -119,8 +119,9 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_buffering off;
         proxy_cache off;
-        # Covers the largest authenticated hard-proof response budget.
-        proxy_read_timeout 540s;
+        # Default policy (900s) + 60s transport grace. Miner startup reconciles
+        # managed blocks when the hosted subnet timeout changes.
+        proxy_read_timeout 960s;
     }
 }
 CONFEOF
