@@ -59,6 +59,7 @@ from neurons.capacity_audit import (
     CapacitySlot,
     PROTOCOL_VERSION,
     build_capacity_slot_group_key,
+    capacity_audit_payload_cooldown_blocks,
     capacity_audit_uid_escalation_threshold,
     capacity_audit_window_fits_epoch,
     capacity_audit_window_triggered,
@@ -2927,10 +2928,11 @@ class ValidatorNeuron:
                     f"slot(s) at block {selection_block}"
                 )
         try:
+            payload_cooldown_blocks = capacity_audit_payload_cooldown_blocks(cfg)
             busy_slots = set(
                 self._db.get_capacity_audit_selection_busy_slots(
                     selection_block=int(selection_block),
-                    cooldown_blocks=1,
+                    cooldown_blocks=payload_cooldown_blocks,
                 )
             )
         except Exception as exc:

@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 PROTOCOL_VERSION = "verathos-capacity-audit-v1"
 DEFAULT_MAX_PROOF_PAYLOAD_BYTES = 32 * 1024 * 1024
 DEFAULT_BLOCK_TIME_S = 12.0
+CAPACITY_AUDIT_SELECTION_COOLDOWN_MARGIN_BLOCKS = 2
 AUDIT_PREFIX = b"VERATHOS_AUDIT_V1"
 WINDOW_TRIGGER_PREFIX = b"VERATHOS_CAPACITY_WINDOW_TRIGGER_V1"
 LEASE_PREFIX = b"VERATHOS_CAPACITY_LEASE_V1"
@@ -391,6 +392,34 @@ class CapacityAuditRuntimeConfig:
     uid_escalation_max_entries: int = 10
     validator_urls: tuple[str, ...] = ()
     gpu_classes: tuple[CapacityGpuClass, ...] = DEFAULT_GPU_CLASSES
+
+
+def capacity_audit_payload_cooldown_blocks(
+    cfg: CapacityAuditRuntimeConfig,
+    *,
+    block_time_s: float = DEFAULT_BLOCK_TIME_S,
+) -> int:
+    """Return the post-challenge slot cooldown for one audit payload window.
+
+    Miners retain exclusive ownership of a selected endpoint while they build
+    and publish the nonce-derived payload after ``B_proof``. The validator
+    therefore excludes that slot for the configured payload deadline plus two
+    block boundaries of scheduling margin. Deriving this from subnet policy
+    keeps compressed testnet and mainnet schedules consistent.
+    """
+
+    seconds_per_block = max(
+        0.001,
+        float(block_time_s or DEFAULT_BLOCK_TIME_S),
+    )
+    payload_deadline_s = max(
+        0.0,
+        float(getattr(cfg, "payload_deadline_s", 0.0) or 0.0),
+    )
+    return (
+        int(payload_deadline_s // seconds_per_block)
+        + CAPACITY_AUDIT_SELECTION_COOLDOWN_MARGIN_BLOCKS
+    )
 
 
 def validate_capacity_audit_runtime_config(

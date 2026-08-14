@@ -95,6 +95,9 @@ _MANAGED_NGINX_CONFIG_PATHS = (
 _MANAGED_NGINX_READ_TIMEOUT_PATTERN = re.compile(
     r"(?m)^(?P<indent>[ \t]*)proxy_read_timeout[ \t]+(?P<seconds>[0-9]+)s;[ \t]*$"
 )
+_NGINX_READ_TIMEOUT_VALUE_PATTERN = re.compile(
+    r"\bproxy_read_timeout[ \t]+(?P<seconds>[0-9]+)s?[ \t]*;"
+)
 _MANAGED_NGINX_TIMEOUT_GRACE_SECONDS = 60
 _MANAGED_NGINX_FALLBACK_READ_TIMEOUT_SECONDS = 960
 
@@ -212,12 +215,36 @@ def _reconcile_managed_nginx_read_timeout(
             continue
         matches = tuple(_MANAGED_NGINX_READ_TIMEOUT_PATTERN.finditer(original))
         if not matches:
+            if backend_marker in original:
+                detected = tuple(
+                    _NGINX_READ_TIMEOUT_VALUE_PATTERN.finditer(original)
+                )
+                if detected:
+                    configured_min = min(
+                        int(match.group("seconds")) for match in detected
+                    )
+                    if configured_min < read_timeout_seconds:
+                        bt.logging.warning(
+                            f"Reverse proxy config {path} was not changed; its "
+                            f"shortest upstream read timeout is {configured_min}s, "
+                            f"below the required {read_timeout_seconds}s. Long "
+                            "requests may return HTTP 504"
+                        )
+                else:
+                    bt.logging.warning(
+                        f"Reverse proxy config {path} has no recognized explicit "
+                        "proxy_read_timeout; long inference or proof-v3 responses "
+                        f"may return HTTP 504. Set it to at least {read_timeout_seconds}s"
+                    )
             continue
         if managed_marker not in original or backend_marker not in original:
-            bt.logging.warning(
-                f"Custom nginx config {path} was not changed; set its upstream "
-                f"read timeout to at least {read_timeout_seconds}s"
-            )
+            configured_min = min(int(match.group("seconds")) for match in matches)
+            if configured_min < read_timeout_seconds:
+                bt.logging.warning(
+                    f"Custom nginx config {path} was not changed; its shortest "
+                    f"upstream read timeout is {configured_min}s, below the required "
+                    f"{read_timeout_seconds}s. Long requests may return HTTP 504"
+                )
             continue
         managed_count = original.count(managed_marker)
         backend_count = original.count(backend_marker)

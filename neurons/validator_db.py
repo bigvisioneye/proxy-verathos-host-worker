@@ -51,6 +51,15 @@ def _debug_error_kind(message: object) -> str:
     msg = str(message or "").lower()
     if not msg:
         return ""
+    if (
+        "504 gateway" in msg
+        or "gateway timeout" in msg
+        or "gateway time-out" in msg
+        or "status code 504" in msg
+        or "http status 504" in msg
+        or "response status 504" in msg
+    ):
+        return "reverse_proxy_timeout"
     if "401" in msg or "unauthorized" in msg:
         return "chat_unauthorized"
     if "403" in msg or "forbidden" in msg:
@@ -70,6 +79,7 @@ _DEBUG_ERROR_SUMMARIES = {
     "chat_unauthorized": "Inference request was unauthorized.",
     "chat_forbidden": "Inference request was forbidden.",
     "chat_not_found": "Inference route was not found.",
+    "reverse_proxy_timeout": "The miner's reverse proxy expired before the request deadline.",
     "timeout": "Inference request timed out.",
     "connection_failed": "Validator could not connect to the inference endpoint.",
     "tls_error": "Inference endpoint failed TLS validation.",
@@ -2899,11 +2909,11 @@ class ValidatorStateDB:
     ) -> List[tuple[str, int]]:
         """Return slots that cannot fairly accept a new B_select yet.
 
-        Miners reserve a local endpoint through B_proof and may still be
-        publishing/cleaning up on the immediately following head.  The
-        validator must not create a new timed obligation for the same slot in
-        that short block window, otherwise an honest miner can correctly skip
-        the slot locally while the validator records a no-show.
+        Miners reserve a local endpoint through B_proof and the complete
+        nonce-derived payload deadline. The validator must not create a new
+        timed obligation for the same slot in that interval, otherwise an
+        honest miner can correctly skip the overlap locally while the
+        validator records a no-show.
         """
         cutoff = int(selection_block) - max(0, int(cooldown_blocks))
         with self._lock:
@@ -3585,7 +3595,11 @@ class ValidatorStateDB:
                 item = canaries.setdefault(key, empty_canary())
                 item["total"] += 1
                 status = str(row.get("status") or "")
-                err = row.get("error_message") or ""
+                err = (
+                    row.get("error_message")
+                    or row.get("proof_failure_reason")
+                    or ""
+                )
                 error_kind = _debug_error_kind(err)
                 if status == "ok":
                     item["ok"] += 1
@@ -3884,6 +3898,12 @@ class ValidatorStateDB:
                                 "chat_unauthorized",
                                 "The endpoint is reachable but /chat rejects validator requests with 401.",
                             )
+                        elif canary_data["last_error_kind"] == "reverse_proxy_timeout":
+                            add_hint(
+                                hints,
+                                "reverse_proxy_timeout",
+                                "The miner's reverse proxy returned HTTP 504 before the validator's authenticated request deadline.",
+                            )
                         else:
                             add_hint(
                                 hints,
@@ -3936,10 +3956,16 @@ class ValidatorStateDB:
                             "Keep the endpoint online until at least one scored epoch closes.",
                         )
                     if canary_data.get("last_error_kind"):
-                        add_step(
-                            entry_next_steps,
-                            "Fix the inference route shown by canary.last_error before expecting score recovery.",
-                        )
+                        if canary_data["last_error_kind"] == "reverse_proxy_timeout":
+                            add_step(
+                                entry_next_steps,
+                                "Run the current official installer or raise the upstream proxy read timeout to the minimum printed at miner startup.",
+                            )
+                        else:
+                            add_step(
+                                entry_next_steps,
+                                "Fix the inference route shown by canary.last_error before expecting score recovery.",
+                            )
                     if int(canary_data.get("proof_failures") or 0):
                         add_step(
                             entry_next_steps,
@@ -4158,6 +4184,7 @@ class ValidatorStateDB:
                     "uid_audit_gate_active",
                     "model_gate_active",
                     "stale_uid_identity",
+                    "reverse_proxy_timeout",
                     "proof_failure",
                     "tee_failure",
                     "chat_unauthorized",
