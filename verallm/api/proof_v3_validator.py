@@ -47,6 +47,7 @@ from verallm.proof_v3.request import ObservedExecutionOutputV3
 from verallm.proof_v3.session import (
     ChallengeSessionStateV3,
     DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3,
+    DEFAULT_PRECOMMIT_ARRIVAL_BUDGET_NS_V3,
     ProofV3ChallengeSession,
     QualifiedExecutionProfileV3,
 )
@@ -244,7 +245,7 @@ class ProofV3ValidatorExchange:
         prompt_token_ids: Sequence[int],
         sampler_config_digest: bytes,
         runtime_policy: RuntimeHardAuditPolicyV3,
-        proof_arrival_budget_ns: int = 1_000_000_000,
+        proof_arrival_budget_ns: int = DEFAULT_PRECOMMIT_ARRIVAL_BUDGET_NS_V3,
         hard_proof_arrival_budget_ns: int = (
             DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
         ),
@@ -279,6 +280,9 @@ class ProofV3ValidatorExchange:
             "proof_protocol_version": PROOF_PROTOCOL_V3,
             "proof_v3_preexecution_context": (
                 self.session.precommit_context.canonical_bytes().hex()
+            ),
+            "proof_v3_hard_proof_arrival_budget_ns": (
+                self.session.hard_proof_arrival_budget_ns
             ),
         }
 
@@ -365,13 +369,29 @@ class ProofV3ValidatorExchange:
             or stream_finished_wall < request_started_wall
         ):
             self.fail_closed()
-            raise ProofV3VerificationError(
-                "proof-v3 stream timing is malformed or duplicated"
+            raise ProofV3UnavailableError(
+                "proof-v3 validator stream timing is malformed or duplicated"
             )
         self._request_started_wall = request_started_wall
         self._request_started_ns = request_started_ns
         self._stream_finished_wall = stream_finished_wall
         self._stream_finished_ns = stream_finished_ns
+        if self._observed_output is not None and self._decision is None:
+            # Tier selection is validator-local and must start only after the
+            # canonical SSE stream has reached EOF.  Starting the bounded
+            # local reveal clock at the earlier ``done`` event allowed stream
+            # teardown or worker rescheduling to consume that clock and made
+            # an honest miner appear late before it had even received a nonce.
+            try:
+                self._decision = self.session.select_audit_tier_once(
+                    selected_monotonic_ns=stream_finished_ns,
+                )
+            except ProofV3Error as exc:
+                self.fail_closed()
+                raise ProofV3UnavailableError(
+                    "proof-v3 validator could not select the post-stream "
+                    "audit tier"
+                ) from exc
 
     def _observe_precommit(
         self, data: Mapping[str, object], received_monotonic_ns: int
@@ -466,9 +486,6 @@ class ProofV3ValidatorExchange:
             last_visible_token_monotonic_ns=self._last_token_ns,
             received_monotonic_ns=self._precommit_received_ns,
         )
-        self._decision = self.session.select_audit_tier_once(
-            selected_monotonic_ns=received_monotonic_ns,
-        )
         self._observed_output = observed
 
     def observe_sse_event(
@@ -509,10 +526,15 @@ class ProofV3ValidatorExchange:
             raise
 
     def require_stream_complete(self) -> PostCommitAuditDecisionV3:
-        if self._observed_output is None or self._decision is None:
+        if self._observed_output is None:
             self.fail_closed()
             raise ProofV3VerificationError(
                 "proof-v3 stream ended before its canonical done event"
+            )
+        if self._decision is None:
+            self.fail_closed()
+            raise ProofV3UnavailableError(
+                "proof-v3 validator did not select a post-stream audit tier"
             )
         return self._decision
 
@@ -523,17 +545,17 @@ class ProofV3ValidatorExchange:
         if action == "hold":
             hold_budget_ns = self.session.nonce_reveal_hold_budget_ns
             if hold_budget_ns is None:
-                raise ProofV3VerificationError(
+                raise ProofV3UnavailableError(
                     "proof-v3 exchange has no precommit hold budget"
                 )
         elif action == "release":
             if decision.hard_audit_selected:
-                raise ProofV3VerificationError(
+                raise ProofV3UnavailableError(
                     "proof-v3 hard exchange cannot use light release"
                 )
             hold_budget_ns = 0
         else:
-            raise ProofV3VerificationError(
+            raise ProofV3UnavailableError(
                 "proof-v3 retention action is unsupported"
             )
         return {
@@ -552,6 +574,14 @@ class ProofV3ValidatorExchange:
             reveal = self.session.reveal_nonce_once(
                 revealed_monotonic_ns=revealed_monotonic_ns,
             )
+        except ProofV3Error as exc:
+            # Nothing has been disclosed to the miner yet.  Selection,
+            # serialization and the call into this method are validator-local
+            # work, so failure here must never become a peer proof strike.
+            self.fail_closed()
+            raise ProofV3UnavailableError(
+                "proof-v3 validator missed its local nonce-reveal window"
+            ) from exc
         except Exception:
             self.fail_closed()
             raise
@@ -638,11 +668,11 @@ class ProofV3ValidatorExchange:
         decision = self.require_stream_complete()
         hard = decision.hard_audit_selected
         if hard and self.session.state is not ChallengeSessionStateV3.VERIFIED:
-            raise ProofV3VerificationError(
+            raise ProofV3UnavailableError(
                 "proof-v3 hard exchange has not verified its proof"
             )
         if not hard and self.session.state is not ChallengeSessionStateV3.LIGHT_REVEALED:
-            raise ProofV3VerificationError(
+            raise ProofV3UnavailableError(
                 "proof-v3 light exchange has an unexpected state"
             )
         assert self._last_token_ns is not None
@@ -650,7 +680,7 @@ class ProofV3ValidatorExchange:
         assert self._precommit_received_ns is not None
         assert self._observed_output is not None
         if self._request_started_ns is None or self._stream_finished_ns is None:
-            raise ProofV3VerificationError(
+            raise ProofV3UnavailableError(
                 "proof-v3 exchange lacks validator-observed stream timing"
             )
         ttft_ms = max(
@@ -913,7 +943,7 @@ def _raise_exchange_failure(
         ) from exc
     if isinstance(exc, (httpx.HTTPStatusError, httpx.TransportError)):
         raise exc
-    raise ProofV3VerificationError(
+    raise ProofV3UnavailableError(
         "proof-v3 local exchange failed closed"
     ) from exc
 
@@ -1054,6 +1084,15 @@ def finalize_proof_v3_exchange_sync(
                 "POST",
                 f"{base_url}{ECONOMIC_PROOF_V3_CHALLENGE_PATH}",
                 json={"nonce_reveal": reveal.hex()},
+                timeout=(
+                    getattr(
+                        getattr(exchange, "session", None),
+                        "hard_proof_arrival_budget_ns",
+                        540_000_000_000,
+                    )
+                    / 1_000_000_000
+                    + 1.0
+                ),
             ) as response:
                 if response.is_error:
                     response.read()
@@ -1232,6 +1271,15 @@ async def run_proof_v3_exchange_async(
                 "POST",
                 f"{base_url}{ECONOMIC_PROOF_V3_CHALLENGE_PATH}",
                 json={"nonce_reveal": reveal.hex()},
+                timeout=(
+                    getattr(
+                        getattr(exchange, "session", None),
+                        "hard_proof_arrival_budget_ns",
+                        540_000_000_000,
+                    )
+                    / 1_000_000_000
+                    + 1.0
+                ),
             ) as response:
                 if response.is_error:
                     await response.aread()
@@ -1282,7 +1330,7 @@ async def run_proof_v3_exchange_async(
             ) from exc
         if isinstance(exc, (httpx.HTTPStatusError, httpx.TransportError)):
             raise
-        raise ProofV3VerificationError(
+        raise ProofV3UnavailableError(
             "proof-v3 local exchange failed closed"
         ) from exc
 

@@ -78,6 +78,11 @@ class NeuronConfig(ChainConfig):
     # local fallback when that config is unavailable.
     proof_v3_failure_epochs_for_penalty: int = 1
     proof_v3_failure_clean_epochs_for_reset: int = 3
+    proof_v3_timing_ordinary_decode_tokens: int = 4096
+    proof_v3_timing_max_decode_tokens: int = 8192
+    proof_v3_timing_ordinary_hard_proof_timeout_s: int = 900
+    proof_v3_timing_max_hard_proof_timeout_s: int = 1800
+    proof_v3_timing_transport_margin_s: int = 60
     # Monotonic, owner-controlled generation used for a one-time network-wide
     # operational probation reset.  It is intentionally not exposed as an
     # environment knob; only the owner-hosted subnet config may advance it.

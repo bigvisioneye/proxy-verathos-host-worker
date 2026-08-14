@@ -106,6 +106,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from verallm.api.proxy_auth import proxy_llm_key_from_env, verify_proxy_llm_request
 from verallm.api.proxy_forward import proxy_json_post, proxy_state, merge_upstream_health
 
+from neurons.version import (
+    miner_version_str,
+    version_str as spec_version_str,
+)
 from verallm.config import Config, set_config
 from verallm.challenge.beacon import (
     derive_hard_audit_sampling_challenge,
@@ -220,6 +224,7 @@ class ProofProtocolRequestBody(BaseModel):
     validator_nonce_commitment: Optional[str] = None
     proof_challenge_id: Optional[str] = None
     proof_v3_preexecution_context: Optional[str] = None
+    proof_v3_hard_proof_arrival_budget_ns: Optional[StrictInt] = None
     proof_protocol_version: Optional[StrictInt] = None
     _inline_proof_v2: ClassVar[bool] = True
 
@@ -282,6 +287,23 @@ class ProofProtocolRequestBody(BaseModel):
     def _validate_proof_protocol_version(cls, value: Optional[int]) -> Optional[int]:
         return validate_proof_protocol_version(value)
 
+    @validator("proof_v3_hard_proof_arrival_budget_ns")
+    def _validate_proof_v3_hard_proof_arrival_budget_ns(
+        cls,
+        value: Optional[int],
+    ) -> Optional[int]:
+        if value is None:
+            return None
+        from verallm.proof_v3.session import (
+            MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3,
+        )
+
+        if not 0 < value <= MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3:
+            raise ValueError(
+                "proof_v3_hard_proof_arrival_budget_ns is out of range"
+            )
+        return value
+
     @root_validator(skip_on_failure=True)
     def _validate_nonce_exchange(cls, values: dict) -> dict:
         version = resolve_proof_protocol_version(values.get("proof_protocol_version"))
@@ -289,6 +311,9 @@ class ProofProtocolRequestBody(BaseModel):
         nonce_commitment = values.get("validator_nonce_commitment")
         challenge_id = values.get("proof_challenge_id")
         v3_context = values.get("proof_v3_preexecution_context")
+        v3_hard_budget = values.get(
+            "proof_v3_hard_proof_arrival_budget_ns"
+        )
         if version == PROOF_PROTOCOL_V2 and cls._inline_proof_v2:
             if nonce is not None:
                 raise ValueError("proof-v2 request must not reveal validator_nonce")
@@ -300,6 +325,10 @@ class ProofProtocolRequestBody(BaseModel):
             if v3_context is not None:
                 raise ValueError(
                     "proof-v2 request must not include proof-v3 context"
+                )
+            if v3_hard_budget is not None:
+                raise ValueError(
+                    "proof-v2 request must not include proof-v3 hard budget"
                 )
         elif version == PROOF_PROTOCOL_V3:
             if (
@@ -325,6 +354,10 @@ class ProofProtocolRequestBody(BaseModel):
             if v3_context is not None:
                 raise ValueError(
                     "legacy proof request must not include proof-v3 context"
+                )
+            if v3_hard_budget is not None:
+                raise ValueError(
+                    "legacy proof request must not include proof-v3 hard budget"
                 )
         return values
 
@@ -1333,6 +1366,11 @@ async def health():
         )
     result = {
         "status": "ok",
+        # Report the versions imported by this running process.  These are
+        # operational diagnostics only; validators never trust /health for
+        # proof or release admission.
+        "miner_version": miner_version_str,
+        "spec_version": spec_version_str,
         "model": state.model_name,
         "moe": state.moe_config is not None,
         "batch_mode": state.batch_mode,
@@ -1770,6 +1808,9 @@ async def run_inference(body: InferenceRequestBody, request: Request = None):
             proof_v3_preexecution_context=(
                 body.proof_v3_preexecution_context
             ),
+            proof_v3_hard_proof_arrival_budget_ns=(
+                body.proof_v3_hard_proof_arrival_budget_ns
+            ),
             proof_protocol_version=body.proof_protocol_version,
             max_new_tokens=body.max_new_tokens,
             do_sample=body.do_sample,
@@ -2078,6 +2119,9 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
         validator_nonce_commitment=body.validator_nonce_commitment,
         proof_challenge_id=body.proof_challenge_id,
         proof_v3_preexecution_context=body.proof_v3_preexecution_context,
+        proof_v3_hard_proof_arrival_budget_ns=(
+            body.proof_v3_hard_proof_arrival_budget_ns
+        ),
         proof_protocol_version=body.proof_protocol_version,
         max_new_tokens=body.max_new_tokens,
         do_sample=body.do_sample,
@@ -4540,6 +4584,9 @@ async def _stream_inference_batched(
                                 ),
                                 sampling_params=proof_v3_replay_sampling_params,
                                 requested_decode_tokens=body.max_new_tokens,
+                                hard_proof_arrival_budget_ns=(
+                                    body.proof_v3_hard_proof_arrival_budget_ns
+                                ),
                             )
                         )
                     except Exception as exc:

@@ -55,8 +55,11 @@ from verallm.proof_v3.verifier import (
 
 
 DEFAULT_PROOF_ARRIVAL_BUDGET_NS_V3 = 1_000_000_000
-DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 = 300_000_000_000
-MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 = 480_000_000_000
+DEFAULT_PRECOMMIT_ARRIVAL_BUDGET_NS_V3 = 5_000_000_000
+DEFAULT_LOCAL_NONCE_REVEAL_BUDGET_NS_V3 = 10_000_000_000
+DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 = 360_000_000_000
+LEGACY_MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 = 540_000_000_000
+MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 = 1_800_000_000_000
 HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3 = 4096
 HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3 = 8192
 MAX_NONCE_REVEAL_HOLD_BUDGET_NS_V3 = 930_000_000_000
@@ -116,10 +119,10 @@ def _arrival_budget_ns(value: int) -> int:
     if (
         isinstance(value, bool)
         or not isinstance(value, int)
-        or not 0 < value <= DEFAULT_PROOF_ARRIVAL_BUDGET_NS_V3
+        or not 0 < value <= DEFAULT_PRECOMMIT_ARRIVAL_BUDGET_NS_V3
     ):
         raise ProofV3VerificationError(
-            "proof_arrival_budget_ns must be between one nanosecond and one second"
+            "proof_arrival_budget_ns must be between one nanosecond and five seconds"
         )
     return value
 
@@ -132,12 +135,19 @@ def _hard_arrival_budget_ns(value: int) -> int:
     ):
         raise ProofV3VerificationError(
             "hard_proof_arrival_budget_ns must be between one nanosecond "
-            "and eight minutes"
+            "and thirty minutes"
         )
     return value
 
 
-def hard_proof_arrival_budget_for_decode_v3(decode_tokens: int) -> int:
+def hard_proof_arrival_budget_for_decode_v3(
+    decode_tokens: int,
+    *,
+    ordinary_decode_tokens: int = HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3,
+    max_decode_tokens: int = HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3,
+    ordinary_budget_ns: int = DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3,
+    max_budget_ns: int = LEGACY_MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3,
+) -> int:
     """Return the bounded validator deadline for one authenticated geometry."""
 
     if (
@@ -148,27 +158,43 @@ def hard_proof_arrival_budget_for_decode_v3(decode_tokens: int) -> int:
         raise ProofV3VerificationError(
             "hard-proof decode token count must be a positive integer"
         )
-    if decode_tokens > HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3:
+    for value, name in (
+        (ordinary_decode_tokens, "ordinary_decode_tokens"),
+        (max_decode_tokens, "max_decode_tokens"),
+        (ordinary_budget_ns, "ordinary_budget_ns"),
+        (max_budget_ns, "max_budget_ns"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ProofV3VerificationError(
+                f"hard-proof deadline {name} must be a positive integer"
+            )
+    if ordinary_decode_tokens > max_decode_tokens:
+        raise ProofV3VerificationError(
+            "hard-proof ordinary decode boundary exceeds its maximum"
+        )
+    if ordinary_budget_ns > max_budget_ns:
+        raise ProofV3VerificationError(
+            "hard-proof ordinary budget exceeds its maximum"
+        )
+    if max_budget_ns > MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3:
+        raise ProofV3VerificationError(
+            "hard-proof deadline exceeds the implementation safety ceiling"
+        )
+    if decode_tokens > max_decode_tokens:
         raise ProofV3VerificationError(
             "hard-proof decode token count exceeds the qualified deadline geometry"
         )
-    if decode_tokens <= HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3:
-        return DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
-    token_span = (
-        HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3
-        - HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3
-    )
-    extension_span = (
-        MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
-        - DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
-    )
-    extension_tokens = (
-        decode_tokens - HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3
-    )
+    if decode_tokens <= ordinary_decode_tokens:
+        return ordinary_budget_ns
+    token_span = max_decode_tokens - ordinary_decode_tokens
+    if token_span <= 0:
+        return max_budget_ns
+    extension_span = max_budget_ns - ordinary_budget_ns
+    extension_tokens = decode_tokens - ordinary_decode_tokens
     extension_ns = (
         extension_tokens * extension_span + token_span - 1
     ) // token_span
-    return DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 + extension_ns
+    return ordinary_budget_ns + extension_ns
 
 
 def _nonce_reveal_hold_budget_ns(value: int | None) -> int | None:
@@ -611,7 +637,7 @@ class ProofV3ChallengeSession:
         prompt_token_ids: Sequence[int],
         sampler_config_digest: bytes,
         runtime_policy: RuntimeHardAuditPolicyV3,
-        proof_arrival_budget_ns: int = DEFAULT_PROOF_ARRIVAL_BUDGET_NS_V3,
+        proof_arrival_budget_ns: int = DEFAULT_PRECOMMIT_ARRIVAL_BUDGET_NS_V3,
         hard_proof_arrival_budget_ns: int = (
             DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
         ),
@@ -794,6 +820,12 @@ class ProofV3ChallengeSession:
         """Return the bounded post-precommit hold configured at issuance."""
 
         return self._nonce_reveal_hold_budget_ns
+
+    @property
+    def hard_proof_arrival_budget_ns(self) -> int:
+        """Return the validator-owned post-nonce arrival budget."""
+
+        return self._hard_proof_arrival_budget_ns
 
     @property
     def verified_capture_chain_digest(self) -> bytes | None:
@@ -995,7 +1027,9 @@ class ProofV3ChallengeSession:
             # its precommit deadline. Give the immediately following local
             # nonce serialization its own bounded window instead of reusing
             # the already-consumed peer arrival deadline.
-            reveal_deadline = selected + DEFAULT_PROOF_ARRIVAL_BUDGET_NS_V3
+            reveal_deadline = (
+                selected + DEFAULT_LOCAL_NONCE_REVEAL_BUDGET_NS_V3
+            )
             if reveal_deadline >= 1 << 63:
                 self._fail_locked(state=ChallengeSessionStateV3.FAILED)
                 raise ProofV3VerificationError(
@@ -1243,7 +1277,9 @@ class ProofV3ChallengeSession:
 __all__ = [
     "ChallengeSessionStateV3",
     "DEFAULT_HARD_PROOF_ARRIVAL_BUDGET_NS_V3",
+    "DEFAULT_LOCAL_NONCE_REVEAL_BUDGET_NS_V3",
     "DEFAULT_PROOF_ARRIVAL_BUDGET_NS_V3",
+    "DEFAULT_PRECOMMIT_ARRIVAL_BUDGET_NS_V3",
     "HARD_PROOF_EXTENDED_DECODE_LIMIT_TOKENS_V3",
     "HARD_PROOF_EXTENDED_DECODE_START_TOKENS_V3",
     "MAX_NONCE_REVEAL_HOLD_BUDGET_NS_V3",

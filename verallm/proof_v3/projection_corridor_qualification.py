@@ -43,6 +43,14 @@ _FULL_ATTENTION_NEGATIVE_CASE_V3 = (
     "self_consistent_full_attention_substitute"
 )
 _GDN_NEGATIVE_CASE_V3 = "self_consistent_gdn_substitute"
+_MLP_ACTIVATION_NEGATIVE_CASES_V3 = frozenset(
+    (
+        "mlp_activation_down_mutation",
+        "mlp_activation_gate_mutation",
+        "mlp_activation_up_mutation",
+        "saturated_mlp_activation_substitute",
+    )
+)
 _EVIDENCE_CLASSES_V3 = frozenset(
     (
         "real_model_wire",
@@ -67,6 +75,10 @@ _CASE_EVIDENCE_CLASSES_V3 = {
     _GDN_NEGATIVE_CASE_V3: frozenset(
         ("real_model_wire", "qualified_relation_fixture")
     ),
+    **{
+        case_id: frozenset(("qualified_relation_fixture",))
+        for case_id in _MLP_ACTIVATION_NEGATIVE_CASES_V3
+    },
 }
 
 
@@ -227,6 +239,8 @@ def validate_projection_corridor_honest_coverage_v3(
         "geometry_counts",
         "maximum_geometry_case_count",
         "honest_coverage_gate_passed",
+        "mlp_activation_coverage_gate_passed",
+        "mlp_activation_layer_coverage",
         "heldout_gate_passed",
         "heldout_maximum_required_sigma",
         "heldout_maximum_chi2",
@@ -238,6 +252,8 @@ def validate_projection_corridor_honest_coverage_v3(
     }
     if not required.issubset(value) or value.get(
         "honest_coverage_gate_passed"
+    ) is not True or value.get(
+        "mlp_activation_coverage_gate_passed"
     ) is not True or value.get("heldout_gate_passed") is not True:
         raise ProofV3Error(
             "projection-corridor honest coverage is incomplete"
@@ -308,6 +324,58 @@ def validate_projection_corridor_honest_coverage_v3(
         value["heldout_layer_counts"],
         name="held-out layer counts",
     )
+    mlp_coverage_value = value["mlp_activation_layer_coverage"]
+    mlp_coverage_fields = {
+        "layer",
+        "calibration_case_count",
+        "calibration_selected_cell_count",
+        "calibration_selected_rail_cell_count",
+        "calibration_selected_near_zero_cell_count",
+        "calibration_scanned_cell_count",
+        "calibration_rail_cell_count",
+        "calibration_near_zero_cell_count",
+        "heldout_case_count",
+        "heldout_selected_cell_count",
+        "heldout_selected_rail_cell_count",
+        "heldout_selected_near_zero_cell_count",
+        "heldout_scanned_cell_count",
+        "heldout_rail_cell_count",
+        "heldout_near_zero_cell_count",
+    }
+    if not isinstance(mlp_coverage_value, list):
+        raise ProofV3Error(
+            "projection-corridor MLP activation coverage is malformed"
+        )
+    mlp_coverage = {}
+    for item in mlp_coverage_value:
+        if not isinstance(item, dict) or set(item) != mlp_coverage_fields:
+            raise ProofV3Error(
+                "projection-corridor MLP activation coverage is malformed"
+            )
+        layer = item["layer"]
+        counts = tuple(
+            item[name]
+            for name in sorted(mlp_coverage_fields - {"layer"})
+        )
+        if (
+            isinstance(layer, bool)
+            or not isinstance(layer, int)
+            or layer in mlp_coverage
+            or any(
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+                for count in counts
+            )
+        ):
+            raise ProofV3Error(
+                "projection-corridor MLP activation coverage is malformed"
+            )
+        mlp_coverage[layer] = item
+    if tuple(mlp_coverage) != layers:
+        raise ProofV3Error(
+            "projection-corridor MLP activation layer coverage is incomplete"
+        )
     decode_counts = _canonical_positive_counts(
         value["decode_length_counts"],
         key_name="decode_tokens",
@@ -485,6 +553,30 @@ def validate_projection_corridor_honest_coverage_v3(
         or any(count < length_minimum for count in decode_counts.values())
         or any(count < length_minimum for count in context_counts.values())
         or any(count < length_minimum for count in geometry_counts.values())
+        or any(
+            item[f"{split}_case_count"] < minimum
+            or item[f"{split}_selected_cell_count"] < minimum
+            or item[f"{split}_scanned_cell_count"] < minimum
+            for item in mlp_coverage.values()
+            for split, minimum in (
+                ("calibration", calibration_minimum),
+                ("heldout", heldout_minimum),
+            )
+        )
+        or any(
+            sum(
+                item[f"{split}_selected_{kind}_cell_count"]
+                for item in mlp_coverage.values()
+            )
+            < 1
+            for split in ("calibration", "heldout")
+            for kind in ("rail", "near_zero")
+            if sum(
+                item[f"{split}_{kind}_cell_count"]
+                for item in mlp_coverage.values()
+            )
+            > 0
+        )
         or isinstance(maximum_geometry_count, bool)
         or not isinstance(maximum_geometry_count, int)
         or maximum_geometry_count < length_minimum
@@ -517,6 +609,11 @@ def required_projection_corridor_negative_cases_v3(
         required.add(_FULL_ATTENTION_NEGATIVE_CASE_V3)
     if any(name.rsplit(".", 1)[-1] == "gdn_ba" for name in names):
         required.add(_GDN_NEGATIVE_CASE_V3)
+    if any(
+        name.rsplit(".", 1)[-1] in {"down", "mlp_down"}
+        for name in names
+    ):
+        required.update(_MLP_ACTIVATION_NEGATIVE_CASES_V3)
     return tuple(sorted(required))
 
 

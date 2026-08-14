@@ -21,7 +21,8 @@ from verallm.proof_v3.errors import (
 )
 
 
-CANARY_POLICY_ABI_V3 = "proof_v3.canary_policy.v5"
+LEGACY_CANARY_POLICY_ABI_V3 = "proof_v3.canary_policy.v5"
+CANARY_POLICY_ABI_V3 = "proof_v3.canary_policy.v6"
 CANARY_PROMPT_RECIPE_ABI_V3 = "natural_composite.secret_seeded.long_form.v3"
 CANARY_CONTEXT_CONSTRUCTION_ABI_V3 = "validator_tokenizer.near_advertised.v2"
 CANARY_BUSY_POLICY_ABI_V3 = "validator_receipt_interval.one_epoch_debt.v1"
@@ -32,6 +33,12 @@ CANARY_HARD_DECODE_SELECTION_ABI_V3 = (
     "secret_seeded.independent_common_anchors_log_uniform_tail.v2"
 )
 CANARY_REPEAT_PREFIX_ABI_V3 = "validator_secret.shared_prefix_groups.v1"
+CANARY_OWNER_CONTEXT_SIZING_ABI_V3 = (
+    "secret_seeded.min_heavy_log_uniform_prompt.bernoulli_max.v1"
+)
+MIN_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3 = 100
+DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3 = 1_000
+DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3 = 500
 CANARY_PROMPT_MIN_TOKEN_TOLERANCE_V3 = 64
 CANARY_HARD_DECODE_ANCHORS_V3 = (512, 1_024, 2_048, 4_096, 8_192)
 MIN_CANARY_HARD_DECODE_ANCHOR_BPS_V3 = 2_500
@@ -264,6 +271,13 @@ class CanaryPolicyV3:
     repeat_prefix_min_tokens: int = (
         DEFAULT_CANARY_REPEAT_PREFIX_MIN_TOKENS_V3
     )
+    owner_full_context_min_prompt_bps: int = (
+        DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
+    )
+    owner_full_context_max_draw_bps: int = (
+        DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3
+    )
+    owner_context_sizing_abi_id: str = CANARY_OWNER_CONTEXT_SIZING_ABI_V3
     max_full_context_deferral_epochs: int = 1
     max_hard_audit_drought_epochs: int = (
         DEFAULT_CANARY_MAX_HARD_DROUGHT_EPOCHS_V3
@@ -420,6 +434,32 @@ class CanaryPolicyV3:
             raise ProofV3DocumentError(
                 "repeat_prefix_min_tokens exceeds half the minimum low context"
             )
+        owner_min_prompt_bps = _u32(
+            self.owner_full_context_min_prompt_bps,
+            "owner_full_context_min_prompt_bps",
+            minimum=1,
+        )
+        if owner_min_prompt_bps >= 10_000:
+            raise ProofV3DocumentError(
+                "owner_full_context_min_prompt_bps must leave draw range "
+                "below the safe maximum"
+            )
+        owner_max_draw_bps = _u32(
+            self.owner_full_context_max_draw_bps,
+            "owner_full_context_max_draw_bps",
+            minimum=MIN_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3,
+        )
+        if owner_max_draw_bps > 10_000:
+            raise ProofV3DocumentError(
+                "owner_full_context_max_draw_bps exceeds 10000"
+            )
+        if (
+            self.owner_context_sizing_abi_id
+            != CANARY_OWNER_CONTEXT_SIZING_ABI_V3
+        ):
+            raise ProofV3DocumentError(
+                "canary owner context-sizing ABI is unsupported"
+            )
         if self.max_full_context_deferral_epochs != 1:
             raise ProofV3DocumentError(
                 "proof-v3 permits exactly one epoch of full-context deferral"
@@ -437,8 +477,22 @@ class CanaryPolicyV3:
             raise ProofV3DocumentError(
                 "canary policy version is unsupported"
             )
-        if self.policy_abi_id != CANARY_POLICY_ABI_V3:
+        if self.policy_abi_id not in {
+            LEGACY_CANARY_POLICY_ABI_V3,
+            CANARY_POLICY_ABI_V3,
+        }:
             raise ProofV3DocumentError("canary policy ABI is unsupported")
+        if (
+            self.policy_abi_id == LEGACY_CANARY_POLICY_ABI_V3
+            and (
+                owner_min_prompt_bps
+                != DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
+                or owner_max_draw_bps != 10_000
+            )
+        ):
+            raise ProofV3DocumentError(
+                "legacy canary policy must retain fixed context sizing"
+            )
         if self.prompt_recipe_abi_id != CANARY_PROMPT_RECIPE_ABI_V3:
             raise ProofV3DocumentError("canary prompt recipe ABI is unsupported")
         if (
@@ -477,6 +531,10 @@ class CanaryPolicyV3:
             (
                 self.hard_decode_selection_abi_id,
                 "hard_decode_selection_abi_id",
+            ),
+            (
+                self.owner_context_sizing_abi_id,
+                "owner_context_sizing_abi_id",
             ),
             (self.repeat_prefix_abi_id, "repeat_prefix_abi_id"),
         ):
@@ -527,9 +585,19 @@ class CanaryPolicyV3:
             "repeat_prefix_min_tokens",
             repeat_prefix_min,
         )
+        object.__setattr__(
+            self,
+            "owner_full_context_min_prompt_bps",
+            owner_min_prompt_bps,
+        )
+        object.__setattr__(
+            self,
+            "owner_full_context_max_draw_bps",
+            owner_max_draw_bps,
+        )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "advertised_context_target_bps": (
                 self.advertised_context_target_bps
             ),
@@ -575,6 +643,21 @@ class CanaryPolicyV3:
             "repeat_prefix_target_bps": self.repeat_prefix_target_bps,
             "schedule_selection_abi_id": self.schedule_selection_abi_id,
         }
+        if self.policy_abi_id == CANARY_POLICY_ABI_V3:
+            result.update(
+                {
+                    "owner_context_sizing_abi_id": (
+                        self.owner_context_sizing_abi_id
+                    ),
+                    "owner_full_context_max_draw_bps": (
+                        self.owner_full_context_max_draw_bps
+                    ),
+                    "owner_full_context_min_prompt_bps": (
+                        self.owner_full_context_min_prompt_bps
+                    ),
+                }
+            )
+        return result
 
     def canonical_bytes(self) -> bytes:
         return json.dumps(
@@ -595,7 +678,7 @@ class CanaryPolicyV3:
 
     @classmethod
     def from_dict(cls, value: object) -> "CanaryPolicyV3":
-        keys = {
+        legacy_keys = {
             "advertised_context_target_bps",
             "busy_policy_abi_id",
             "context_construction_abi_id",
@@ -625,7 +708,22 @@ class CanaryPolicyV3:
             "repeat_prefix_target_bps",
             "schedule_selection_abi_id",
         }
-        if not isinstance(value, dict) or set(value) != keys:
+        if not isinstance(value, dict):
+            raise ProofV3DocumentError(
+                "canary policy fields do not match the canonical schema"
+            )
+        policy_abi_id = value.get("policy_abi_id")
+        if policy_abi_id == LEGACY_CANARY_POLICY_ABI_V3:
+            expected_keys = legacy_keys
+        elif policy_abi_id == CANARY_POLICY_ABI_V3:
+            expected_keys = legacy_keys | {
+                "owner_context_sizing_abi_id",
+                "owner_full_context_max_draw_bps",
+                "owner_full_context_min_prompt_bps",
+            }
+        else:
+            raise ProofV3DocumentError("canary policy ABI is unsupported")
+        if set(value) != expected_keys:
             raise ProofV3DocumentError(
                 "canary policy fields do not match the canonical schema"
             )
@@ -711,6 +809,30 @@ class CanaryPolicyV3:
             max_hard_audit_drought_epochs=_u32(
                 value["max_hard_audit_drought_epochs"],
                 "max_hard_audit_drought_epochs",
+            ),
+            owner_full_context_min_prompt_bps=(
+                _u32(
+                    value["owner_full_context_min_prompt_bps"],
+                    "owner_full_context_min_prompt_bps",
+                )
+                if policy_abi_id == CANARY_POLICY_ABI_V3
+                else DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
+            ),
+            owner_full_context_max_draw_bps=(
+                _u32(
+                    value["owner_full_context_max_draw_bps"],
+                    "owner_full_context_max_draw_bps",
+                )
+                if policy_abi_id == CANARY_POLICY_ABI_V3
+                else 10_000
+            ),
+            owner_context_sizing_abi_id=(
+                _identifier(
+                    value["owner_context_sizing_abi_id"],
+                    "owner_context_sizing_abi_id",
+                )
+                if policy_abi_id == CANARY_POLICY_ABI_V3
+                else CANARY_OWNER_CONTEXT_SIZING_ABI_V3
             ),
             policy_version=_u32(value["policy_version"], "policy_version"),
             protocol_version=_u32(
@@ -973,15 +1095,20 @@ __all__ = [
     "CANARY_HARD_DECODE_ANCHORS_V3",
     "MAX_CANARY_FULL_PAIR_HOLD_SECONDS_V3",
     "CANARY_HARD_DECODE_SELECTION_ABI_V3",
+    "CANARY_OWNER_CONTEXT_SIZING_ABI_V3",
     "CANARY_POLICY_ABI_V3",
     "CANARY_PROMPT_RECIPE_ABI_V3",
     "CANARY_REPEAT_PREFIX_ABI_V3",
     "DEFAULT_CANARY_MAX_HARD_DROUGHT_EPOCHS_V3",
+    "DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3",
+    "DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3",
     "DEFAULT_CANARY_REPEAT_PREFIX_MIN_TOKENS_V3",
     "DEFAULT_CANARY_REPEAT_PREFIX_TARGET_BPS_V3",
     "MIN_CANARY_HARD_DECODE_ANCHOR_BPS_V3",
     "MIN_CANARY_HARD_DECODE_TAIL_BPS_V3",
     "MIN_CANARY_LATE_DECODE_OUTPUT_BPS_V3",
+    "MIN_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3",
+    "LEGACY_CANARY_POLICY_ABI_V3",
     "CanaryModelPolicyV3",
     "CanaryPolicyV3",
     "SignedCanaryPolicyDocumentV3",

@@ -477,13 +477,10 @@ def check_remote_version(role: str) -> Optional[tuple[str, int, int]]:
     from neurons.version import miner_version, validator_version
     local_version = miner_version if role == "miner" else validator_version
 
-    # Validators and proxies retain the established checkout-based fast path.
-    # A stock multi-endpoint miner is different: several resident processes
-    # share one checkout, so one sibling may advance HEAD while the others
-    # still execute an older imported miner version.  Those siblings must keep
-    # comparing their in-memory version with the remote release and restart.
-    if local_head == remote_head and role != "miner":
-        return None
+    # HEAD equality does not prove process adoption. A sibling may have
+    # advanced a shared checkout, or this process may have pulled successfully
+    # before its package install failed. Every role must compare the imported
+    # in-memory version with the remote release so the old process can retry.
 
     # Remote version (from git show, without pulling)
     remote_source = _read_remote_version_file()

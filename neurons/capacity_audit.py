@@ -11,7 +11,6 @@ import hashlib
 import ipaddress
 import json
 import math
-import random
 import re
 import struct
 import time
@@ -23,6 +22,8 @@ from urllib.parse import urlparse
 PROTOCOL_VERSION = "verathos-capacity-audit-v1"
 DEFAULT_MAX_PROOF_PAYLOAD_BYTES = 32 * 1024 * 1024
 DEFAULT_BLOCK_TIME_S = 12.0
+CAPACITY_AUDIT_SELECTION_COOLDOWN_MARGIN_BLOCKS = 2
+CAPACITY_AUDIT_ACTIVE_STATE_MARGIN_S = 30.0
 AUDIT_PREFIX = b"VERATHOS_AUDIT_V1"
 WINDOW_TRIGGER_PREFIX = b"VERATHOS_CAPACITY_WINDOW_TRIGGER_V1"
 LEASE_PREFIX = b"VERATHOS_CAPACITY_LEASE_V1"
@@ -393,6 +394,65 @@ class CapacityAuditRuntimeConfig:
     gpu_classes: tuple[CapacityGpuClass, ...] = DEFAULT_GPU_CLASSES
 
 
+def capacity_audit_active_hold_seconds(
+    cfg: CapacityAuditRuntimeConfig,
+    *,
+    block_time_s: float = DEFAULT_BLOCK_TIME_S,
+) -> float:
+    """Return the miner's complete local busy hold from ``B_select``."""
+
+    seconds_per_block = max(
+        0.001,
+        float(block_time_s or DEFAULT_BLOCK_TIME_S),
+    )
+    pre_challenge_blocks = max(0, int(cfg.lead_blocks or 0)) + max(
+        1,
+        int(cfg.proof_challenge_delay_blocks or 1),
+    )
+    evidence_s = (
+        max(0.0, float(cfg.deadline_s or 0.0))
+        + max(0.0, float(cfg.transport_grace_s or 0.0))
+        + max(0.0, float(cfg.payload_deadline_s or 0.0))
+        + CAPACITY_AUDIT_ACTIVE_STATE_MARGIN_S
+    )
+    return max(
+        max(0.0, float(cfg.drain_seconds or 0.0)),
+        (pre_challenge_blocks * seconds_per_block) + evidence_s,
+        60.0,
+    )
+
+
+def capacity_audit_payload_cooldown_blocks(
+    cfg: CapacityAuditRuntimeConfig,
+    *,
+    block_time_s: float = DEFAULT_BLOCK_TIME_S,
+) -> int:
+    """Return the post-``B_proof`` cooldown matching the miner's busy hold.
+
+    Database overlap checks are anchored to the previous challenge block, so
+    remove the pre-challenge portion from the complete active hold, round the
+    remainder up, and retain two block boundaries of scheduling margin.
+    """
+
+    seconds_per_block = max(
+        0.001,
+        float(block_time_s or DEFAULT_BLOCK_TIME_S),
+    )
+    pre_challenge_blocks = max(0, int(cfg.lead_blocks or 0)) + max(
+        1,
+        int(cfg.proof_challenge_delay_blocks or 1),
+    )
+    post_challenge_s = max(
+        0.0,
+        capacity_audit_active_hold_seconds(cfg, block_time_s=seconds_per_block)
+        - (pre_challenge_blocks * seconds_per_block),
+    )
+    return (
+        int(math.ceil(post_challenge_s / seconds_per_block))
+        + CAPACITY_AUDIT_SELECTION_COOLDOWN_MARGIN_BLOCKS
+    )
+
+
 def validate_capacity_audit_runtime_config(
     cfg: CapacityAuditRuntimeConfig,
     *,
@@ -646,20 +706,6 @@ def derive_sampled_pass_index(root_hex: str, lease_identifier: str, gpu_index: i
     return int.from_bytes(digest[:8], "big") % passes
 
 
-def deterministic_sample_slots(
-    slots: Iterable[CapacitySlot],
-    audit_seed_hex: str,
-    budget: int,
-) -> list[CapacitySlot]:
-    ordered = sorted(slots, key=lambda s: (s.address_lower, s.model_index, s.endpoint))
-    if budget <= 0 or not ordered:
-        return []
-    if budget >= len(ordered):
-        return ordered
-    rng = random.Random(int(audit_seed_hex[:16], 16))
-    return sorted(rng.sample(ordered, budget), key=lambda s: (s.address_lower, s.model_index))
-
-
 def cohort_budget(endpoint_count: int, cfg: CapacityAuditRuntimeConfig) -> int:
     if endpoint_count <= 0:
         return 0
@@ -670,7 +716,12 @@ def cohort_budget(endpoint_count: int, cfg: CapacityAuditRuntimeConfig) -> int:
 
 
 def window_cohort_budget(endpoint_count: int, cfg: CapacityAuditRuntimeConfig) -> int:
-    """Exact per-window budget while preserving the configured per-epoch target."""
+    """Return the nominal flat-selection budget for planning and telemetry.
+
+    This must not be used to truncate the public per-slot predicate result:
+    miners can reproduce only that predicate, not validator-global roster
+    sampling. Group-stress hits can therefore exceed this nominal value.
+    """
     epoch_budget = cohort_budget(endpoint_count, cfg)
     if epoch_budget <= 0:
         return 0

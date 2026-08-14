@@ -11,6 +11,8 @@ from verallm.proof_v3.canary_policy import (
     CANARY_HARD_DECODE_ANCHORS_V3,
     DEFAULT_CANARY_CANDIDATE_HARD_BPS_V3,
     DEFAULT_CANARY_CANDIDATE_TARGET_PER_EPOCH_V3,
+    DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3,
+    DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3,
     DEFAULT_CANARY_REPEAT_PREFIX_MIN_TOKENS_V3,
     DEFAULT_CANARY_REPEAT_PREFIX_TARGET_BPS_V3,
     MIN_CANARY_HARD_DECODE_ANCHOR_BPS_V3,
@@ -445,6 +447,58 @@ def _independent_full_decode_category_v3(
     return "common"
 
 
+def _log_uniform_prompt_bands_v3(
+    minimum: int,
+    maximum: int,
+) -> tuple[tuple[int, int], ...]:
+    """Partition a prompt range into contiguous doubling bands."""
+
+    low = int(minimum)
+    high = int(maximum)
+    if low <= 0 or high < low:
+        raise ValueError("prompt band range is invalid")
+    bands: list[tuple[int, int]] = []
+    lower = low
+    while lower <= high:
+        upper = min(high, 2 * lower - 1)
+        bands.append((lower, upper))
+        lower = upper + 1
+    if len(bands) > 1 and bands[-1][0] == bands[-1][1]:
+        previous = bands[-2]
+        bands[-2] = (previous[0], bands[-1][1])
+        bands.pop()
+    return tuple(bands)
+
+
+def _owner_full_prompt_target_v3(
+    seed: bytes,
+    *,
+    minimum: int,
+    maximum: int,
+    max_draw_bps: int,
+) -> int:
+    """Draw an owner-only min-heavy context with an exact-ceiling tail."""
+
+    low = int(minimum)
+    high = int(maximum)
+    tail_bps = int(max_draw_bps)
+    if low <= 0 or high < low:
+        raise ValueError("owner full-prompt range is invalid")
+    if not 0 < tail_bps <= 10_000:
+        raise ValueError("owner full-prompt maximum rate is invalid")
+    if _seed_int(seed, b"owner_full_prompt_max_draw", 10_000) < tail_bps:
+        return high
+    bands = _log_uniform_prompt_bands_v3(low, high)
+    lower, upper = bands[
+        _seed_int(seed, b"owner_full_prompt_band", len(bands))
+    ]
+    return lower + _seed_int(
+        seed,
+        b"owner_full_prompt_offset",
+        upper - lower + 1,
+    )
+
+
 def _record(seed: bytes, index: int, style: int) -> str:
     row = _derive(b"VERATHOS/CANARY/RECORD/V3", seed, index.to_bytes(8, "big"))
     actor = _ACTORS[int.from_bytes(row[:2], "big") % len(_ACTORS)]
@@ -841,6 +895,12 @@ class CanaryScheduler:
     )
     hard_candidate_bps: int = DEFAULT_CANARY_CANDIDATE_HARD_BPS_V3
     advertised_context_target_bps: int = 9_000
+    owner_full_min_prompt_bps: int = (
+        DEFAULT_CANARY_OWNER_FULL_MIN_PROMPT_BPS_V3
+    )
+    owner_full_max_draw_bps: int = (
+        DEFAULT_CANARY_OWNER_FULL_MAX_DRAW_BPS_V3
+    )
     hard_decode_anchor_bps: int = MIN_CANARY_HARD_DECODE_ANCHOR_BPS_V3
     hard_decode_tail_bps: int = MIN_CANARY_HARD_DECODE_TAIL_BPS_V3
     late_decode_min_output_bps: int = 9_000
@@ -922,6 +982,19 @@ class CanaryScheduler:
             ),
         )
         return min(fraction_target, reserve_target)
+
+    def _owner_full_prompt_floor(self, max_target: int) -> int:
+        """Return the signed floor, kept above the low-context lane."""
+
+        return min(
+            int(max_target),
+            max(
+                int(self.low_context_max_tokens) + 1,
+                int(max_target)
+                * int(self.owner_full_min_prompt_bps)
+                // 10_000,
+            ),
+        )
 
     def plan_epoch(self, miners: list) -> List[CanaryTest]:
         self.tests = []
@@ -1079,21 +1152,38 @@ class CanaryScheduler:
                     miner,
                     group=b"marked_full",
                 )
-                full_repeat_target = self._repeat_prefix_target(
-                    self._safe_context_target(
-                        context_limit,
-                        decode_reserve_tokens=decode_cap,
-                    )
-                )
 
-                # The advertised-maximum request checks the endpoint's claimed
-                # context capacity but is never passed off as cryptographic
-                # coverage beyond the signed hard-audit reach.
+                # The advertised-capacity light request uses the same signed
+                # min-heavy sizing rule as marked candidates. Its ceiling is
+                # the endpoint's safe advertised target, while cryptographic
+                # coverage remains bounded by the signed hard-audit reach.
                 seed = self._test_seed(miner, test_index)
                 advertised_decode = int(self.full_context_max_decode_tokens)
-                advertised_target = self._safe_context_target(
+                advertised_max = self._safe_context_target(
                     int(miner.max_context_len),
                     decode_reserve_tokens=advertised_decode,
+                )
+                marked_full_max = self._safe_context_target(
+                    context_limit,
+                    decode_reserve_tokens=decode_cap,
+                )
+                sampling_enabled = int(self.owner_full_max_draw_bps) < 10_000
+                if sampling_enabled:
+                    advertised_target = _owner_full_prompt_target_v3(
+                        seed,
+                        minimum=self._owner_full_prompt_floor(advertised_max),
+                        maximum=advertised_max,
+                        max_draw_bps=self.owner_full_max_draw_bps,
+                    )
+                    full_repeat_basis = min(
+                        self._owner_full_prompt_floor(marked_full_max),
+                        self._owner_full_prompt_floor(advertised_max),
+                    )
+                else:
+                    advertised_target = advertised_max
+                    full_repeat_basis = marked_full_max
+                full_repeat_target = self._repeat_prefix_target(
+                    full_repeat_basis
                 )
                 self.tests.append(
                     CanaryTest(
@@ -1221,6 +1311,13 @@ class CanaryScheduler:
                         context_limit,
                         decode_reserve_tokens=max_new,
                     )
+                    if sampling_enabled:
+                        target = _owner_full_prompt_target_v3(
+                            seed,
+                            minimum=self._owner_full_prompt_floor(target),
+                            maximum=target,
+                            max_draw_bps=self.owner_full_max_draw_bps,
+                        )
                     late_decode = (
                         max_new > self.low_context_max_decode_tokens
                     )

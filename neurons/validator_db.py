@@ -51,18 +51,71 @@ def _debug_error_kind(message: object) -> str:
     msg = str(message or "").lower()
     if not msg:
         return ""
+    if (
+        "504 gateway" in msg
+        or "gateway timeout" in msg
+        or "gateway time-out" in msg
+        or "status code 504" in msg
+        or "http status 504" in msg
+        or "response status 504" in msg
+    ):
+        return "reverse_proxy_timeout"
+    if (
+        "produced no token before the routing deadline" in msg
+        or "first token timeout" in msg
+        or "first-token timeout" in msg
+        or "ttft deadline" in msg
+    ):
+        return "first_token_timeout"
+    if "429" in msg or "too many requests" in msg or "rate limit" in msg:
+        return "rate_limited"
     if "401" in msg or "unauthorized" in msg:
         return "chat_unauthorized"
     if "403" in msg or "forbidden" in msg:
         return "chat_forbidden"
     if "404" in msg or "not found" in msg:
         return "chat_not_found"
+    if (
+        "400 bad request" in msg
+        or "status code 400" in msg
+        or "http status 400" in msg
+        or "422 unprocessable" in msg
+        or "status code 422" in msg
+        or "http status 422" in msg
+    ):
+        return "bad_request"
+    if (
+        "500 internal server" in msg
+        or "502 bad gateway" in msg
+        or "503 service unavailable" in msg
+        or "status code 500" in msg
+        or "status code 502" in msg
+        or "status code 503" in msg
+        or "http status 500" in msg
+        or "http status 502" in msg
+        or "http status 503" in msg
+    ):
+        return "service_unavailable"
+    if (
+        "empty response" in msg
+        or "response body is empty" in msg
+        or "hard proof is empty" in msg
+        or "stream ended before" in msg
+    ):
+        return "empty_response"
     if "timeout" in msg or "timed out" in msg:
         return "timeout"
-    if "connection" in msg or "connect" in msg or "network is unreachable" in msg:
-        return "connection_failed"
+    if (
+        "name or service not known" in msg
+        or "temporary failure in name resolution" in msg
+        or "nodename nor servname" in msg
+        or "getaddrinfo failed" in msg
+    ):
+        return "dns_error"
     if "ssl" in msg or "certificate" in msg or "tls" in msg:
         return "tls_error"
+    if "connection" in msg or "connect" in msg or "network is unreachable" in msg:
+        return "connection_failed"
     return "chat_error"
 
 
@@ -70,13 +123,72 @@ _DEBUG_ERROR_SUMMARIES = {
     "chat_unauthorized": "Inference request was unauthorized.",
     "chat_forbidden": "Inference request was forbidden.",
     "chat_not_found": "Inference route was not found.",
+    "reverse_proxy_timeout": "The miner's reverse proxy expired before the request deadline.",
+    "first_token_timeout": "The miner produced no token before the routing deadline.",
+    "rate_limited": "The miner endpoint rate-limited the validator request.",
+    "bad_request": "The miner rejected the validator request as malformed or incompatible.",
+    "service_unavailable": "The miner inference service returned an upstream server error.",
+    "empty_response": "The miner ended the response without the required payload.",
     "timeout": "Inference request timed out.",
+    "dns_error": "The registered endpoint hostname could not be resolved.",
     "connection_failed": "Validator could not connect to the inference endpoint.",
     "tls_error": "Inference endpoint failed TLS validation.",
     "chat_error": "Inference request failed.",
     "proof_failure": "Proof verification failed.",
     "tee_failure": "TEE attestation verification failed.",
 }
+
+
+_DEBUG_ERROR_NEXT_STEPS = {
+    "chat_unauthorized": "Check validator discovery/allowlisting and request authentication on the miner.",
+    "chat_forbidden": "Check the miner's validator allowlist and reverse-proxy access rules.",
+    "chat_not_found": "Run the current official installer and confirm the registered endpoint exposes the inference and proof-v3 routes.",
+    "reverse_proxy_timeout": "Run the current official installer or raise the upstream proxy read timeout to the minimum printed at miner startup.",
+    "first_token_timeout": "Inspect the model-engine queue, GPU memory and inference logs; the endpoint accepted the request but emitted no token in time.",
+    "rate_limited": "Remove unintended rate limiting from validator traffic or raise the endpoint's authenticated validator allowance.",
+    "bad_request": "Update the miner to the current release and inspect route/payload compatibility in the miner log.",
+    "service_unavailable": "Inspect the miner and model-engine logs for the upstream 5xx failure and restore the inference service.",
+    "empty_response": "Inspect the inference/proof worker for an early exit after accepting the request.",
+    "timeout": "Inspect inference load and transport timeouts; the request exceeded the validator's configured deadline.",
+    "dns_error": "Correct the registered endpoint hostname and verify it resolves publicly.",
+    "connection_failed": "Confirm the registered endpoint, listener and reverse proxy are online and publicly reachable.",
+    "tls_error": "Repair the endpoint certificate chain, hostname coverage and system clock.",
+    "chat_error": "Inspect the miner log for the matching canary request and restore the failing inference route.",
+    "proof_failure": "Inspect proof-v3 generation logs and the retained failure code; update the miner before retrying if its runtime or artifact is incompatible.",
+    "tee_failure": "Check the TEE attestation path and registered enclave identity.",
+}
+
+
+def _debug_error_next_step(kind: object) -> str:
+    return _DEBUG_ERROR_NEXT_STEPS.get(
+        str(kind or ""),
+        "Inspect the miner log for the matching validator request.",
+    )
+
+
+def _debug_capacity_audit_next_step(reason: object) -> str:
+    """Return bounded operator guidance for a public capacity failure code."""
+
+    code = str(reason or "").strip().lower()
+    if code == "missing_final_receipt":
+        return "Check the capacity-audit worker, chain connection and final-receipt upload path."
+    if code in {"missing_proof_payload", "missing_payload"}:
+        return "Check the post-challenge capacity proof worker and proof-payload upload path."
+    if code == "deadline_exceeded":
+        return "Check capacity benchmark load, audit drain timing and host performance against the signed deadline."
+    if code in {"pass0_root_mismatch", "v2_final_commitment_not_pre_challenge"}:
+        return "Update the miner and inspect capacity transcript construction; its signed commitments were inconsistent."
+    if code == "validator_verify_error":
+        return "No miner action is indicated by this event; the validator verifier failed locally and should retry."
+    if (
+        code.startswith("unsupported_")
+        or code.startswith("legacy_")
+        or code == "missing_v2_pre_challenge_final_commitment"
+    ):
+        return "Update the miner to the current release; its capacity proof protocol is not accepted."
+    if code:
+        return f"Inspect the capacity-audit worker for failure code {code}."
+    return "Inspect capacity-audit execution and publishing for this endpoint."
 
 
 def _debug_public_error_summary(kind: str) -> str:
@@ -2899,11 +3011,11 @@ class ValidatorStateDB:
     ) -> List[tuple[str, int]]:
         """Return slots that cannot fairly accept a new B_select yet.
 
-        Miners reserve a local endpoint through B_proof and may still be
-        publishing/cleaning up on the immediately following head.  The
-        validator must not create a new timed obligation for the same slot in
-        that short block window, otherwise an honest miner can correctly skip
-        the slot locally while the validator records a no-show.
+        Miners reserve a local endpoint through B_proof and the complete
+        nonce-derived payload deadline. The validator must not create a new
+        timed obligation for the same slot in that interval, otherwise an
+        honest miner can correctly skip the overlap locally while the
+        validator records a no-show.
         """
         cutoff = int(selection_block) - max(0, int(cooldown_blocks))
         with self._lock:
@@ -3180,7 +3292,8 @@ class ValidatorStateDB:
                               model_index, endpoint, status, error_message,
                               proof_requested, proof_verified, proof_failure_reason,
                               tee_requested, tee_verified,
-                              tokens_generated, tokens_per_sec, created_at
+                              tokens_generated, tokens_per_sec, receipt_pushed,
+                              created_at
                        FROM canary_results
                        WHERE epoch_number >= ?
                          AND miner_uid IS NOT NULL
@@ -3436,6 +3549,7 @@ class ValidatorStateDB:
                 "proof_requested": 0,
                 "proof_verified": 0,
                 "proof_failures": 0,
+                "receipt_delivery_failures": 0,
                 "tee_requested": 0,
                 "tee_verified": 0,
                 "tee_failures": 0,
@@ -3585,8 +3699,16 @@ class ValidatorStateDB:
                 item = canaries.setdefault(key, empty_canary())
                 item["total"] += 1
                 status = str(row.get("status") or "")
-                err = row.get("error_message") or ""
+                proof_requested = bool(int(row.get("proof_requested") or 0))
+                proof_verified = bool(int(row.get("proof_verified") or 0))
+                err = (
+                    row.get("error_message")
+                    or row.get("proof_failure_reason")
+                    or ""
+                )
                 error_kind = _debug_error_kind(err)
+                if status == "proof_failed" and error_kind == "chat_error":
+                    error_kind = "proof_failure"
                 if status == "ok":
                     item["ok"] += 1
                 else:
@@ -3606,11 +3728,11 @@ class ValidatorStateDB:
                         item["recent_errors"] = item["recent_errors"][-10:]
                     item["last_error_kind"] = error_kind
                     item["last_error"] = error_text
-                if int(row.get("proof_requested") or 0):
+                if proof_requested:
                     item["proof_requested"] += 1
-                    if int(row.get("proof_verified") or 0):
+                    if proof_verified:
                         item["proof_verified"] += 1
-                    elif status == "ok":
+                    elif status in {"ok", "proof_failed"}:
                         item["proof_failures"] += 1
                         proof_reason = _debug_public_reason(
                             row.get("proof_failure_reason"),
@@ -3622,6 +3744,8 @@ class ValidatorStateDB:
                             "reason": proof_reason,
                         })
                         item["recent_proof_failures"] = item["recent_proof_failures"][-10:]
+                if status == "ok" and not int(row.get("receipt_pushed") or 0):
+                    item["receipt_delivery_failures"] += 1
                 if int(row.get("tee_requested") or 0):
                     item["tee_requested"] += 1
                     if int(row.get("tee_verified") or 0):
@@ -3878,18 +4002,12 @@ class ValidatorStateDB:
                         )
                     if canary_data.get("last_error_kind"):
                         entry_hint_codes.append(str(canary_data["last_error_kind"]))
-                        if canary_data["last_error_kind"] == "chat_unauthorized":
-                            add_hint(
-                                hints,
-                                "chat_unauthorized",
-                                "The endpoint is reachable but /chat rejects validator requests with 401.",
-                            )
-                        else:
-                            add_hint(
-                                hints,
-                                str(canary_data["last_error_kind"]),
-                                "Recent canary requests failed on the inference route.",
-                            )
+                        error_kind = str(canary_data["last_error_kind"])
+                        add_hint(
+                            hints,
+                            error_kind,
+                            _debug_public_error_summary(error_kind),
+                        )
                     if int(canary_data.get("proof_failures") or 0):
                         entry_hint_codes.append("proof_failure")
                         add_hint(
@@ -3903,6 +4021,13 @@ class ValidatorStateDB:
                             hints,
                             "tee_failure",
                             "Recent TEE attestation verification failed for this executor.",
+                        )
+                    if int(canary_data.get("receipt_delivery_failures") or 0):
+                        entry_hint_codes.append("receipt_delivery_failed")
+                        add_hint(
+                            hints,
+                            "receipt_delivery_failed",
+                            "A successful canary result could not be delivered to the miner's receipt endpoint.",
                         )
                     if gate_data["hard_failures"] or gate_data["timing_failures"] or gate_data["invalid_proof_failures"]:
                         entry_hint_codes.append("capacity_audit_failures")
@@ -3938,17 +4063,31 @@ class ValidatorStateDB:
                     if canary_data.get("last_error_kind"):
                         add_step(
                             entry_next_steps,
-                            "Fix the inference route shown by canary.last_error before expecting score recovery.",
+                            _debug_error_next_step(
+                                canary_data["last_error_kind"]
+                            ),
                         )
                     if int(canary_data.get("proof_failures") or 0):
                         add_step(
                             entry_next_steps,
-                            "Check proof generation and keep the endpoint online for clean synthetic proofs.",
+                            _debug_error_next_step("proof_failure"),
                         )
                     if int(canary_data.get("tee_failures") or 0):
                         add_step(
                             entry_next_steps,
-                            "Check the TEE attestation path and registered enclave identity.",
+                            _debug_error_next_step("tee_failure"),
+                        )
+                    if int(canary_data.get("receipt_delivery_failures") or 0):
+                        add_step(
+                            entry_next_steps,
+                            "Check the miner receipt-ingest route and validator authorization; inference itself succeeded.",
+                        )
+                    for failure_reason in sorted(
+                        (audit_data.get("failure_reasons") or {}).keys()
+                    ):
+                        add_step(
+                            entry_next_steps,
+                            _debug_capacity_audit_next_step(failure_reason),
                         )
                     if is_probation:
                         add_step(
@@ -4158,15 +4297,23 @@ class ValidatorStateDB:
                     "uid_audit_gate_active",
                     "model_gate_active",
                     "stale_uid_identity",
+                    "reverse_proxy_timeout",
+                    "first_token_timeout",
+                    "rate_limited",
+                    "bad_request",
+                    "service_unavailable",
+                    "empty_response",
                     "proof_failure",
                     "tee_failure",
                     "chat_unauthorized",
                     "chat_forbidden",
                     "chat_not_found",
                     "timeout",
+                    "dns_error",
                     "connection_failed",
                     "tls_error",
                     "chat_error",
+                    "receipt_delivery_failed",
                     "no_active_endpoint",
                     "on_probation",
                     "new_entry_not_scored",

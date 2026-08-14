@@ -241,8 +241,8 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_buffering off;
-        # Hard proofs have an authenticated 300-second response budget.
-        proxy_read_timeout 540s;
+        # Default subnet policy (900s) plus 60s transport grace.
+        proxy_read_timeout 960s;
     }
 }
 ```
@@ -254,6 +254,15 @@ nginx -t && nginx -s reload    # or: systemctl reload nginx
 ```
 
 Then register with `--endpoint https://YOUR-IP` (add `:PORT` if not using 443).
+
+The official miner reconciles recognizable installer-managed nginx blocks on
+each restart to the active subnet full-context timeout plus 60 seconds. Custom
+reverse-proxy configurations are never rewritten automatically. At startup,
+the miner warns when a detectable custom nginx upstream has no explicit read
+timeout or a timeout below the active requirement. An HTTP 504 observed by a
+validator is also reported as `reverse_proxy_timeout` in miner-debug. This is a
+static/runtime diagnostic; startup does not wait through a synthetic long
+request.
 
 > **Container / cloud GPU environments:** Many providers expose specific mapped ports
 > rather than the standard 443. Check which ports are available on your instance and
@@ -276,8 +285,8 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_buffering off;
-        # Hard proofs have an authenticated 300-second response budget.
-        proxy_read_timeout 540s;
+        # Default subnet policy (900s) plus 60s transport grace.
+        proxy_read_timeout 960s;
     }
 }
 ```

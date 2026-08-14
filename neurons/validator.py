@@ -16,8 +16,7 @@ Lifecycle:
 5. After epoch + grace window:
    a. Pull all receipts from each miner: GET /epoch/{n}/receipts.
    b. Build EpochOutcome per miner-model entry.
-   c. Score entries: utility × throughput² × latency, update EMAs.
-   d. Apply traffic volume multiplier.
+   c. Score entries: utility × authenticated work × latency, update EMAs.
 6. At weight-setting boundary:
    a. Compute per-UID weights (additive aggregation × traffic volume).
    b. ``set_weights()`` on Substrate.
@@ -60,6 +59,8 @@ from neurons.capacity_audit import (
     CapacitySlot,
     PROTOCOL_VERSION,
     build_capacity_slot_group_key,
+    capacity_audit_active_hold_seconds,
+    capacity_audit_payload_cooldown_blocks,
     capacity_audit_uid_escalation_threshold,
     capacity_audit_window_fits_epoch,
     capacity_audit_window_triggered,
@@ -68,7 +69,6 @@ from neurons.capacity_audit import (
     derive_audit_id,
     derive_audit_seed,
     derive_audit_seed_from_hashes,
-    deterministic_sample_slots,
     derive_proof_challenge_seed,
     derive_proof_seed,
     lease_id,
@@ -76,7 +76,6 @@ from neurons.capacity_audit import (
     select_capacity_audit_slots,
     slot_id,
     verify_artifact_signature,
-    window_cohort_budget,
 )
 from neurons.capacity_audit_combined import (
     CURRENT_COMBINED_PROOF_PROTOCOL_VERSION,
@@ -126,6 +125,7 @@ from neurons.scoring import (
     compute_model_base_utility,
     compute_model_demand,
     compute_peer_medians,
+    select_scoring_authority_receipts,
 )
 from neurons.validator_db import ValidatorStateDB
 from neurons.proof_v3_failure_strikes import HardProofStrikeTracker
@@ -159,6 +159,17 @@ _PROOF_V3_ARTIFACT_REFRESH_SECONDS = 3600.0
 
 class _ProofV3ValidatorConfigurationError(RuntimeError):
     """Local v3 configuration is unavailable; the miner is not at fault."""
+
+
+def _decode_scoring_authority_hotkey(ss58_address: str) -> bytes:
+    """Decode one exact Substrate account id or fail closed."""
+
+    from verallm.chain.wallet import ss58_decode
+
+    authority = bytes(ss58_decode(str(ss58_address or "")))
+    if len(authority) != 32:
+        raise ValueError("decoded scoring authority is not 32 bytes")
+    return authority
 
 
 class _ProofV3FullPairBarrier:
@@ -2916,10 +2927,11 @@ class ValidatorNeuron:
                     f"slot(s) at block {selection_block}"
                 )
         try:
+            payload_cooldown_blocks = capacity_audit_payload_cooldown_blocks(cfg)
             busy_slots = set(
                 self._db.get_capacity_audit_selection_busy_slots(
                     selection_block=int(selection_block),
-                    cooldown_blocks=1,
+                    cooldown_blocks=payload_cooldown_blocks,
                 )
             )
         except Exception as exc:
@@ -2957,14 +2969,6 @@ class ValidatorNeuron:
         )
         if not selected:
             return
-        budget = window_cohort_budget(len(active), cfg)
-        if budget > 0 and len(selected) > budget:
-            before = len(selected)
-            selected = deterministic_sample_slots(selected, cohort_seed, budget)
-            bt.logging.info(
-                f"Capacity audit: truncated selected slots {before}->{len(selected)} "
-                f"by per-window drain budget at block {selection_block}"
-            )
         supported_fn = getattr(self, "_capacity_audit_supported_slots_by_id", None)
         if not callable(supported_fn):
             supported_fn = ValidatorNeuron._capacity_audit_supported_slots_by_id.__get__(self)
@@ -2985,13 +2989,11 @@ class ValidatorNeuron:
             audit_block=audit_block,
             cohort_seed=cohort_seed,
         )
-        drain_until_ts = (
-            now
-            + cfg.drain_seconds
-            + cfg.deadline_s
-            + cfg.transport_grace_s
-            + cfg.payload_deadline_s
-        )
+        # Match the miner's complete B_select-to-evidence hold. This timestamp
+        # is exported to routing/canary consumers; shortening it to only the
+        # post-start deadlines can admit work while the miner is still inside
+        # the same audit.
+        drain_until_ts = now + capacity_audit_active_hold_seconds(cfg)
         rows: list[dict] = []
         unsupported_selected = 0
         hotkey_lookup = getattr(self, "_get_miner_ss58", None)
@@ -7692,6 +7694,24 @@ class ValidatorNeuron:
                 if canary_policy is not None
                 else 9_000
             ),
+            owner_full_min_prompt_bps=(
+                getattr(
+                    canary_policy,
+                    "owner_full_context_min_prompt_bps",
+                    1_000,
+                )
+                if canary_policy is not None
+                else 1_000
+            ),
+            owner_full_max_draw_bps=(
+                getattr(
+                    canary_policy,
+                    "owner_full_context_max_draw_bps",
+                    10_000,
+                )
+                if canary_policy is not None
+                else 10_000
+            ),
             hard_decode_anchor_bps=(
                 canary_policy.hard_decode_anchor_bps
                 if canary_policy is not None
@@ -8342,6 +8362,15 @@ class ValidatorNeuron:
             "top_p": float(test.top_p or 1.0),
             "min_p": 0.0,
         }
+        from neurons.subnet_runtime_config import (
+            proof_v3_timing_config_from_neuron_config,
+        )
+
+        request_kwargs["hard_proof_arrival_budget_ns"] = (
+            proof_v3_timing_config_from_neuron_config(
+                self.config
+            ).hard_proof_arrival_budget_ns(test.max_new_tokens)
+        )
         pair_id = str(getattr(test, "full_pair_id", "") or "")
         barrier = None
         exchange = None
@@ -9576,10 +9605,44 @@ class ValidatorNeuron:
         except Exception as e:
             bt.logging.debug(f"Failed to store network receipts: {e}")
 
+        # Only the epoch-latched subnet scoring authority may create organic
+        # throughput and model-demand credit. Other permitted validators still
+        # contribute independently authenticated canary performance samples,
+        # but cannot manufacture traffic volume for a colluding miner.
+        scoring_authority_hotkey = b""
+        scoring_authority_ss58 = str(
+            self._epoch_close_value(
+                "owner_hotkey_ss58",
+                getattr(
+                    self.config,
+                    "proof_v3_hard_auditor_hotkey_ss58",
+                    "",
+                ),
+            )
+            or ""
+        )
+        try:
+            scoring_authority_hotkey = _decode_scoring_authority_hotkey(
+                scoring_authority_ss58,
+            )
+        except Exception as exc:
+            scoring_authority_hotkey = b""
+            bt.logging.warning(
+                f"Epoch {epoch_number}: scoring authority is unavailable; "
+                f"organic throughput and demand credit are disabled: {exc}"
+            )
+        scoring_authority_receipts = select_scoring_authority_receipts(
+            all_epoch_receipts,
+            scoring_authority_hotkey,
+        )
+
         # ── Compute per-model demand ──────────────────────────────
         demand_scores: Dict[str, int] = {}
         if self.config.demand_bonus_enabled:
-            demand_scores = compute_model_demand(all_epoch_receipts, epoch_number)
+            demand_scores = compute_model_demand(
+                scoring_authority_receipts,
+                epoch_number,
+            )
             if demand_scores:
                 bt.logging.info(f"Epoch {epoch_number} demand scores: {{k: v for k, v in sorted(demand_scores.items(), key=lambda x: -x[1])[:5]}}")
         # Stash for shared state (proxy serves these via /v1/network/stats)
@@ -10063,6 +10126,10 @@ class ValidatorNeuron:
                 expected_own_receipt_count=expected,
                 expected_canary_obligations=expected_inventory,
                 all_receipts=all_receipts,
+                scoring_receipts=select_scoring_authority_receipts(
+                    all_receipts,
+                    scoring_authority_hotkey,
+                ),
                 proof_tests=len(proof_tested) + shared_hard_tests,
                 proof_failures=len(proof_failed) + shared_hard_failures,
                 proof_failure_penalty_required=(

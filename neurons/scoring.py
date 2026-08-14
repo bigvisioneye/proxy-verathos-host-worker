@@ -14,20 +14,22 @@ Weight composition:
 
     ENTRY_EMA   = exponential moving average of epoch_scores:
                   - No receipts at all          → None (neutral, keep EMA)
-                  - Receipts present + integrity → UTILITY × THROUGHPUT² × TTFT × SPEED × DEMAND_BONUS
+                  - Receipts present + integrity → UTILITY × WORK_FACTOR × TTFT × SPEED × DEMAND_BONUS
                   - Receipt integrity failure    → 0.0 (hard penalty, decays EMA)
 
     UTILITY     = log2(Q)^1.8 × log2(ctx/1K) × Qq × Gq
                   Matches verallm/registry/models.py utility formula.
 
-    THROUGHPUT²  = (weighted_tokens / 1M)²
-                  Weighted tokens served per epoch (output × 3 + input), in megatokens.
+    WORK_FACTOR  = 0.09 × min(3, 1 + (trusted_organic_tokens / 25K)²)
+                  Every eligible endpoint gets the same nonzero base. Canary
+                  token counts never affect score; they establish integrity
+                  and provide performance samples. Only organic receipts from
+                  the subnet scoring authority add throughput credit.
                   Output weighted 3× input — decode is sequential, prefill is parallel.
                   Sybil defense: N UIDs splitting fixed demand each get 1/N tokens,
                   score per UID = (1/N)², total = N × (1/N)² = 1/N of honest.
-                  Per-receipt output cap: canary receipts are capped at
-                  CANARY_OUTPUT_CAP (matches canary spec max), organic at
-                  ORGANIC_OUTPUT_CAP (matches proxy default). This is defense
+                  Per-receipt organic output is capped at ORGANIC_OUTPUT_CAP
+                  (matches the proxy default). This is defense
                   in depth for legacy/imported receipts; live clients reject
                   counts that exceed the request or disagree with proof data.
 
@@ -48,9 +50,9 @@ Weight composition:
                   Per-model demand signal from organic (non-canary) traffic.
                   Range: 1.0 (no demand data) to 1.0 + demand_bonus_max.
 
-Peer medians use median-of-miner-medians: each miner's median TTFT/TPS is
-computed from its receipts, then the model-level median is the median across
-miner medians. This prevents high-traffic miners from skewing the reference.
+Performance samples use one median per permitted validator, then one median
+per miner, then the model-level median across miners. This keeps TPS/TTFT
+decentralized while preventing receipt-count flooding from creating influence.
 """
 
 from __future__ import annotations
@@ -78,6 +80,12 @@ QUANT_QUALITY: dict[str, float] = {
     "fp8": 0.98, "int8": 0.95,
     "int4": 0.90, "nf4": 0.90, "nvfp4": 0.92,
 }
+
+# Performance is decentralized, but one permitted signer must never be able to
+# move an endpoint's score alone. Three independent signer medians make the
+# middle observation robust to one arbitrary outlier. With fewer, performance
+# factors stay neutral while integrity and fixed-base eligibility still apply.
+MIN_PERFORMANCE_VALIDATORS = 3
 
 
 @dataclass
@@ -114,6 +122,10 @@ class EpochOutcome:
 
     # ALL receipts for this miner-model (from all validators)
     all_receipts: List[ServiceReceipt] = field(default_factory=list)
+    # Epoch-latched scoring-authority receipts. ``None`` preserves the
+    # standalone scoring API for historical/offline callers; production
+    # validators always provide an explicitly filtered list (possibly empty).
+    scoring_receipts: Optional[List[ServiceReceipt]] = None
 
     # Proof verification outcomes (from own receipts where proof_requested=True)
     proof_tests: int = 0  # number of receipts where proof was requested
@@ -240,71 +252,45 @@ def compute_speed_factor(
     return min(1.3, math.sqrt(miner_median_tps / model_median_tps))
 
 
-def _canonical_canary_tokens(
+def _median_of_validator_medians(
     receipts: List[ServiceReceipt],
+    attribute: str,
     *,
-    max_context_len: int,
-    output_weight: int,
-    output_cap: int,
-) -> int:
-    """Return a validator-role-independent canary throughput contribution.
+    min_validators: int = MIN_PERFORMANCE_VALIDATORS,
+) -> float:
+    """Return one equally weighted performance sample per receipt signer."""
 
-    Every honest validator pulls the same authenticated receipt set, but the
-    designated hard auditor and light-only followers intentionally schedule
-    different local inventories.  A shared receipt pool must therefore never
-    be clipped by the observer's local schedule.
-
-    Compute one bounded contribution per receipt signer and use the largest
-    completed inventory.  This preserves the strongest observed work sample
-    while preventing the number of validators from multiplying canary credit.
-    Organic receipts are accounted separately and remain additive.
-    """
-
-    per_validator: Dict[bytes, int] = {}
-    obligation_values: Dict[Tuple[bytes, bytes], int] = {}
-    context_cap = max(0, int(max_context_len))
-
+    per_validator: Dict[bytes, List[float]] = {}
     for receipt in receipts:
-        if not receipt.is_canary or int(receipt.tokens_generated or 0) <= 0:
-            continue
         if receipt.proof_requested and not receipt.proof_verified:
             continue
-
+        value = float(getattr(receipt, attribute, 0.0) or 0.0)
+        if value <= 0:
+            continue
         signer = bytes(getattr(receipt, "validator_hotkey", b"") or b"")
-        output_tokens = min(
-            max(0, int(receipt.tokens_generated or 0)),
-            int(output_cap),
-        )
-        prompt_tokens = max(0, int(receipt.prompt_tokens or 0))
-        if context_cap > 0:
-            prompt_tokens = min(prompt_tokens, context_cap)
+        if len(signer) != 32:
+            continue
+        per_validator.setdefault(signer, []).append(value)
+    if len(per_validator) < max(1, int(min_validators)):
+        return 0.0
+    return _median([_median(values) for values in per_validator.values()])
 
-        # Receipt v4 binds the validator's intended prompt target.  It is an
-        # additional per-receipt ceiling, never a source of extra credit.
-        version = int(getattr(receipt, "receipt_version", 1) or 1)
-        target = int(
-            getattr(receipt, "canary_target_prompt_tokens", 0) or 0
-        )
-        if version >= 4 and target > 0:
-            prompt_tokens = min(prompt_tokens, target)
 
-        weighted = prompt_tokens + int(output_weight) * output_tokens
-        obligation_id = bytes(
-            getattr(receipt, "canary_obligation_id", b"") or b""
-        )
-        if version >= 4 and len(obligation_id) == 16:
-            key = (signer, obligation_id)
-            obligation_values[key] = max(
-                obligation_values.get(key, 0),
-                weighted,
-            )
-        else:
-            per_validator[signer] = per_validator.get(signer, 0) + weighted
+def select_scoring_authority_receipts(
+    receipts: List[ServiceReceipt],
+    authority_hotkey: bytes,
+) -> List[ServiceReceipt]:
+    """Select receipts signed by one exact 32-byte scoring authority."""
 
-    for (signer, _obligation_id), weighted in obligation_values.items():
-        per_validator[signer] = per_validator.get(signer, 0) + weighted
-
-    return max(per_validator.values(), default=0)
+    authority = bytes(authority_hotkey or b"")
+    if len(authority) != 32:
+        return []
+    return [
+        receipt
+        for receipt in receipts
+        if bytes(getattr(receipt, "validator_hotkey", b"") or b"")
+        == authority
+    ]
 
 
 def compute_epoch_entry_score(
@@ -434,75 +420,75 @@ def compute_epoch_entry_score(
     if not outcome.all_receipts:
         return None
 
-    # Total weighted tokens served this epoch.
-    # Output tokens weighted 3× input — decode is sequential (one forward pass
-    # per token) while prefill is parallel. Reflects actual GPU cost ratio.
-    # Receipts where proof was requested and failed contribute 0 tokens.
+    # Organic work is additive to a fixed nonzero eligibility baseline.
+    # Output tokens are weighted 3× input because decode is sequential while
+    # prefill is parallel. Canary token counts never enter this calculation:
+    # their hidden schedule and request geometry are security parameters, not
+    # demand, and must not create random score variance.
     #
     # Per-receipt output cap is defense in depth for legacy/imported receipts.
     # Live validator clients reject counts that exceed max_new_tokens or do not
-    # match the commitment and proof bundle. Cap canary receipts at the canary
-    # spec max (small canary 100-300, full-context 200), and organic receipts at
-    # the proxy default max_new_tokens.
+    # match the commitment and proof bundle. Organic receipts are capped at the
+    # proxy default max_new_tokens.
     OUTPUT_WEIGHT = 3
-    CANARY_OUTPUT_CAP = 300       # matches max_new_tokens in canary.generate_*
     ORGANIC_OUTPUT_CAP = 4096     # matches PlaintextChatRequest.max_new_tokens default
     ORGANIC_PROMPT_CAP = 4096
     ORGANIC_PROMPT_TO_OUTPUT_CAP = 8
+    IDLE_BASELINE_WORK_SCORE = 0.09
+    ORGANIC_REFERENCE_WEIGHTED_TOKENS = 25_000
+    MAX_WORK_FACTOR_MULTIPLIER = 3.0
 
-    # Canary credit is derived from the shared authenticated receipt set, not
-    # from this observer's local obligation inventory.  Owner and follower
-    # validators schedule different work by design; using the local inventory
-    # here made identical receipt sets produce different throughput scores.
-    canary_tokens = _canonical_canary_tokens(
-        outcome.all_receipts,
-        max_context_len=outcome.max_context_len,
-        output_weight=OUTPUT_WEIGHT,
-        output_cap=CANARY_OUTPUT_CAP,
+    # Production validators explicitly provide only receipts signed by the
+    # epoch-latched scoring authority. ``None`` is retained for standalone and
+    # historical callers, where the supplied receipt set is already the full
+    # scoring input.
+    traffic_receipts = (
+        outcome.all_receipts
+        if outcome.scoring_receipts is None
+        else outcome.scoring_receipts
     )
     organic_tokens = 0
-    for r in outcome.all_receipts:
+    for r in traffic_receipts:
         if r.tokens_generated <= 0:
             continue
         if r.proof_requested and not r.proof_verified:
             continue
-        cap = CANARY_OUTPUT_CAP if r.is_canary else ORGANIC_OUTPUT_CAP
-        output_tokens = min(r.tokens_generated, cap)
         if r.is_canary:
             continue
+        output_tokens = min(max(0, r.tokens_generated), ORGANIC_OUTPUT_CAP)
         prompt_tokens = min(
-            r.prompt_tokens,
+            max(0, r.prompt_tokens),
             ORGANIC_PROMPT_CAP,
             ORGANIC_PROMPT_TO_OUTPUT_CAP * output_tokens,
         )
         weighted = OUTPUT_WEIGHT * output_tokens + prompt_tokens
         organic_tokens += weighted
 
-    total_tokens = canary_tokens + organic_tokens
-    if total_tokens <= 0:
-        return None if suppress_hard_failures else 0.0
-
     # Extract latency: split canary vs organic, take WORSE (max) of the two
-    # medians when both are statistically meaningful.  This neutralizes any
+    # validator-balanced medians when both are statistically meaningful. Each
+    # permitted signer contributes one median regardless of its receipt count,
+    # preventing one validator from flooding the performance sample. This neutralizes any
     # canary preferential treatment (prefill-cache, load-shedding, dedicated
     # GPU on canary requests, etc.) — a miner cannot benefit from making
     # canaries artificially faster than organic.  Falls back to whichever
-    # population exists when one is empty (new miners with no organic load,
-    # or miners whose canaries all 503'd / errored).
-    organic_ttfts = [
-        r.ttft_ms for r in outcome.all_receipts
-        if r.ttft_ms > 0 and not r.is_canary
-    ]
-    canary_ttfts = [
-        r.ttft_ms for r in outcome.all_receipts
-        if r.ttft_ms > 0 and r.is_canary
-    ]
-    if len(organic_ttfts) >= 3 and canary_ttfts:
-        median_ttft = max(_median(organic_ttfts), _median(canary_ttfts))
-    elif canary_ttfts:
-        median_ttft = _median(canary_ttfts)
-    elif organic_ttfts:
-        median_ttft = _median(organic_ttfts)
+    # population has three independent signers. Fewer signers are neutral.
+    organic_median_ttft = _median_of_validator_medians(
+        [r for r in outcome.all_receipts if not r.is_canary],
+        "ttft_ms",
+    )
+    canary_median_ttft = _median_of_validator_medians(
+        [r for r in outcome.all_receipts if r.is_canary],
+        "ttft_ms",
+    )
+    if organic_median_ttft > 0 and canary_median_ttft > 0:
+        median_ttft = max(
+            organic_median_ttft,
+            canary_median_ttft,
+        )
+    elif canary_median_ttft > 0:
+        median_ttft = canary_median_ttft
+    elif organic_median_ttft > 0:
+        median_ttft = organic_median_ttft
     else:
         median_ttft = 0
 
@@ -515,18 +501,18 @@ def compute_epoch_entry_score(
         generation_quality=generation_quality,
     )
 
-    # THROUGHPUT_SCORE (total tokens served, squared — sybil defense)
-    # N sybil UIDs splitting fixed demand: each gets 1/N tokens,
-    # score per UID = (1/N)², total = N × (1/N)² = 1/N of honest.
-    # No normalization needed — weights are normalized across UIDs,
-    # and utility already handles cross-model size differentiation.
-    # Scale to megatokens before squaring for human-readable scores.
-    # Divisor is cosmetic (cancels in weight normalization). At /1M:
-    # canary-only ≈ 2 (idle baseline), 1K organic reqs ≈ 156 (real demand).
-    throughput_score = (total_tokens / 1_000_000) ** throughput_power
+    # WORK_SCORE = fixed eligible base + authenticated organic throughput².
+    # The additive form means zero organic demand remains nonzero while the
+    # quadratic organic term retains the existing split-demand Sybil defense.
+    throughput_score = IDLE_BASELINE_WORK_SCORE * min(
+        MAX_WORK_FACTOR_MULTIPLIER,
+        1.0
+        + (organic_tokens / ORGANIC_REFERENCE_WEIGHTED_TOKENS)
+        ** throughput_power,
+    )
 
-    # TTFT_FACTOR (peer-relative, uncapped)
-    # Faster than peer median → bonus (up to 2.0×).
+    # TTFT_FACTOR (peer-relative, capped at 1.3)
+    # Faster than peer median → bonus (up to 1.3×).
     # Slower than peer median → penalty (sqrt curve).
     # No peers → 1.0 (no comparison possible).
     ttft_factor = 1.0
@@ -540,20 +526,23 @@ def compute_epoch_entry_score(
     # min of the two) drives the score.
     speed_factor = 1.0
     if peer_medians is not None:
-        organic_tps = [
-            r.tokens_per_sec for r in outcome.all_receipts
-            if r.tokens_per_sec > 0 and not r.is_canary
-        ]
-        canary_tps = [
-            r.tokens_per_sec for r in outcome.all_receipts
-            if r.tokens_per_sec > 0 and r.is_canary
-        ]
-        if len(organic_tps) >= 3 and canary_tps:
-            miner_median_tps = min(_median(organic_tps), _median(canary_tps))
-        elif canary_tps:
-            miner_median_tps = _median(canary_tps)
-        elif organic_tps:
-            miner_median_tps = _median(organic_tps)
+        organic_median_tps = _median_of_validator_medians(
+            [r for r in outcome.all_receipts if not r.is_canary],
+            "tokens_per_sec",
+        )
+        canary_median_tps = _median_of_validator_medians(
+            [r for r in outcome.all_receipts if r.is_canary],
+            "tokens_per_sec",
+        )
+        if organic_median_tps > 0 and canary_median_tps > 0:
+            miner_median_tps = min(
+                organic_median_tps,
+                canary_median_tps,
+            )
+        elif canary_median_tps > 0:
+            miner_median_tps = canary_median_tps
+        elif organic_median_tps > 0:
+            miner_median_tps = organic_median_tps
         else:
             miner_median_tps = 0
         if miner_median_tps > 0:
@@ -613,7 +602,10 @@ def compute_model_demand(
     # Filter to organic traffic for this epoch
     organic = [
         r for r in all_receipts
-        if r.epoch_number == epoch_number and not r.is_canary
+        if r.epoch_number == epoch_number
+        and not r.is_canary
+        and r.tokens_generated > 0
+        and not (r.proof_requested and not r.proof_verified)
     ]
     if not organic:
         return {}
@@ -678,9 +670,9 @@ def compute_peer_medians(
 ) -> Dict[str, PeerMedians]:
     """Compute per-model median TTFT and decode speed from all epoch receipts.
 
-    Uses median-of-miner-medians: each miner's median TTFT/TPS is computed
-    from its receipts, then the model-level median is the median across miner
-    medians. This prevents high-traffic miners from skewing the reference.
+    Uses median-of-validator-medians inside each miner, then a median across
+    miners. Receipt count therefore cannot give one permitted validator or one
+    high-traffic miner disproportionate influence over the reference.
 
     Args:
         all_receipts: All receipts from all miners for the epoch.
@@ -689,15 +681,25 @@ def compute_peer_medians(
     Returns:
         Dict mapping model_id to PeerMedians.
     """
-    # Group by (model_id, miner_address) → ([ttft], [tps])
-    model_miner_stats: Dict[str, Dict[str, Tuple[List[float], List[float]]]] = {}
+    # Group by model -> miner -> validator -> ([ttft], [tps]).
+    model_miner_stats: Dict[
+        str,
+        Dict[str, Dict[bytes, Tuple[List[float], List[float]]]],
+    ] = {}
 
     for r in all_receipts:
         if r.epoch_number != epoch_number:
             continue
+        if r.proof_requested and not r.proof_verified:
+            continue
+        signer = bytes(getattr(r, "validator_hotkey", b"") or b"")
+        if len(signer) != 32:
+            continue
         model_miners = model_miner_stats.setdefault(r.model_id, {})
-        ttft_list, tps_list = model_miners.setdefault(
-            r.miner_address, ([], []),
+        miner_validators = model_miners.setdefault(r.miner_address, {})
+        ttft_list, tps_list = miner_validators.setdefault(
+            signer,
+            ([], []),
         )
         if r.ttft_ms > 0:
             ttft_list.append(r.ttft_ms)
@@ -710,11 +712,29 @@ def compute_peer_medians(
         miner_ttft_medians: List[float] = []
         miner_tps_medians: List[float] = []
 
-        for _addr, (ttft_vals, tps_vals) in miners.items():
-            ttft_med = _median(ttft_vals)
+        for _addr, validators in miners.items():
+            ttft_signer_medians = [
+                _median(ttft_vals)
+                for ttft_vals, _tps_vals in validators.values()
+                if ttft_vals
+            ]
+            ttft_med = (
+                _median(ttft_signer_medians)
+                if len(ttft_signer_medians) >= MIN_PERFORMANCE_VALIDATORS
+                else 0.0
+            )
             if ttft_med > 0:
                 miner_ttft_medians.append(ttft_med)
-            tps_med = _median(tps_vals)
+            tps_signer_medians = [
+                _median(tps_vals)
+                for _ttft_vals, tps_vals in validators.values()
+                if tps_vals
+            ]
+            tps_med = (
+                _median(tps_signer_medians)
+                if len(tps_signer_medians) >= MIN_PERFORMANCE_VALIDATORS
+                else 0.0
+            )
             if tps_med > 0:
                 miner_tps_medians.append(tps_med)
 
@@ -764,8 +784,8 @@ def compute_receipt_set_hash(
 class CompositeScorer:
     """Aggregates epoch outcomes into per-UID scores for Bittensor weight-setting.
 
-    Per-entry EMA tracking with additive multi-model aggregation.
-    Traffic volume multiplier from epoch service receipts.
+    Per-entry EMA tracking with additive multi-model aggregation. Organic work
+    credit is already included in each epoch score.
     """
 
     def __init__(
@@ -870,8 +890,8 @@ class CompositeScorer:
 
         WEIGHT(uid) = normalize( AGGREGATE )
 
-        Traffic volume is already captured in throughput² (total tokens
-        served per entry). No separate volume multiplier needed. Excluded
+        Authenticated organic work is already captured by the work factor.
+        No separate volume multiplier is applied. Excluded
         entries retain their EMA history but contribute no emission while an
         external policy gate such as probation is active.
         """
@@ -1004,7 +1024,13 @@ class CompositeScorer:
         entry: ModelEntryScore,
         epoch_score: Optional[float],
     ) -> None:
-        """Update a single entry's EMA score."""
+        """Update a single entry's EMA score from a zero cold start.
+
+        The first scored epoch follows the same recurrence as every later
+        epoch.  Copying the first observation directly into ``ema_score``
+        allowed a newly registered model index to crystallize one favorable
+        canary draw at full weight and made index churn bypass smoothing.
+        """
         entry.total_epochs += 1
 
         if epoch_score is None:
@@ -1012,13 +1038,10 @@ class CompositeScorer:
             return
 
         entry.scored_epochs += 1
-        if entry.scored_epochs == 1:
-            entry.ema_score = epoch_score
-        else:
-            entry.ema_score = (
-                self.ema_alpha * epoch_score
-                + (1 - self.ema_alpha) * entry.ema_score
-            )
+        entry.ema_score = (
+            self.ema_alpha * epoch_score
+            + (1 - self.ema_alpha) * entry.ema_score
+        )
 
 
 # ── Probation tracker ─────────────────────────────────────────────────
