@@ -82,6 +82,31 @@ class ProofV3FailurePolicyConfig:
 
 
 @dataclass(frozen=True)
+class ProofV3TimingConfig:
+    """Epoch-latched hard-proof deadline curve controlled by the owner."""
+
+    ordinary_decode_tokens: int = 4096
+    max_decode_tokens: int = 8192
+    ordinary_hard_proof_timeout_s: int = 360
+    max_hard_proof_timeout_s: int = 540
+    transport_margin_s: int = 60
+
+    def hard_proof_arrival_budget_ns(self, decode_tokens: int) -> int:
+        from verallm.proof_v3.session import (
+            hard_proof_arrival_budget_for_decode_v3,
+        )
+
+        return hard_proof_arrival_budget_for_decode_v3(
+            decode_tokens,
+            ordinary_decode_tokens=self.ordinary_decode_tokens,
+            max_decode_tokens=self.max_decode_tokens,
+            ordinary_budget_ns=self.ordinary_hard_proof_timeout_s
+            * 1_000_000_000,
+            max_budget_ns=self.max_hard_proof_timeout_s * 1_000_000_000,
+        )
+
+
+@dataclass(frozen=True)
 class RuntimeSubnetConfig:
     schema_version: int
     version: int
@@ -108,6 +133,7 @@ class RuntimeSubnetConfig:
     proof_protocol_rollout: ProofProtocolRolloutConfig
     proof_v3_hard_auditor: ProofV3HardAuditorConfig
     proof_v3_failure_policy: ProofV3FailurePolicyConfig
+    proof_v3_timing: ProofV3TimingConfig
     maintenance_grace: MaintenanceGraceConfig
     payload: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
     source: str = ""
@@ -335,6 +361,64 @@ def _proof_v3_failure_policy_to_dict(
     row: ProofV3FailurePolicyConfig,
 ) -> dict[str, Any]:
     return dict(asdict(row))
+
+
+def _proof_v3_timing_to_dict(row: ProofV3TimingConfig) -> dict[str, Any]:
+    return dict(asdict(row))
+
+
+def _parse_proof_v3_timing(
+    payload: Mapping[str, Any],
+) -> ProofV3TimingConfig:
+    raw = payload.get("proof_v3_timing")
+    if raw is None:
+        # Preserve the released 360--540 second curve until a later config
+        # version explicitly activates a wider deadline.
+        return ProofV3TimingConfig()
+    if not isinstance(raw, Mapping):
+        raise SubnetRuntimeConfigError("proof_v3_timing must be an object")
+    allowed = {field.name for field in fields(ProofV3TimingConfig)}
+    unknown = set(raw).difference(allowed)
+    if unknown:
+        raise SubnetRuntimeConfigError(
+            "proof_v3_timing contains unsupported fields: "
+            + ", ".join(sorted(unknown))
+        )
+    cfg = ProofV3TimingConfig(
+        ordinary_decode_tokens=_require_int(
+            raw, "ordinary_decode_tokens", minimum=1, maximum=8192
+        ),
+        max_decode_tokens=_require_int(
+            raw, "max_decode_tokens", minimum=1, maximum=8192
+        ),
+        ordinary_hard_proof_timeout_s=_require_int(
+            raw,
+            "ordinary_hard_proof_timeout_s",
+            minimum=1,
+            maximum=1800,
+        ),
+        max_hard_proof_timeout_s=_require_int(
+            raw,
+            "max_hard_proof_timeout_s",
+            minimum=1,
+            maximum=1800,
+        ),
+        transport_margin_s=_require_int(
+            raw, "transport_margin_s", minimum=1, maximum=600
+        ),
+    )
+    if cfg.ordinary_decode_tokens > cfg.max_decode_tokens:
+        raise SubnetRuntimeConfigError(
+            "proof_v3_timing ordinary decode boundary exceeds its maximum"
+        )
+    if cfg.ordinary_hard_proof_timeout_s > cfg.max_hard_proof_timeout_s:
+        raise SubnetRuntimeConfigError(
+            "proof_v3_timing ordinary timeout exceeds its maximum"
+        )
+    # Exercise the shared protocol validator so malformed curves fail closed
+    # at config load rather than during a live hard audit.
+    cfg.hard_proof_arrival_budget_ns(cfg.max_decode_tokens)
+    return cfg
 
 
 def _parse_proof_v3_failure_policy(
@@ -691,6 +775,9 @@ def build_default_subnet_config_payload(
         "proof_v3_failure_policy": _proof_v3_failure_policy_to_dict(
             proof_v3_failure_policy_config_from_neuron_config(neuron_config)
         ),
+        "proof_v3_timing": _proof_v3_timing_to_dict(
+            proof_v3_timing_config_from_neuron_config(neuron_config)
+        ),
         "maintenance_grace": _maintenance_grace_to_dict(
             maintenance_grace_config_from_neuron_config(neuron_config)
         ),
@@ -858,6 +945,7 @@ def validate_subnet_config_payload(
     proof_protocol_rollout = _parse_proof_protocol_rollout(payload)
     proof_v3_hard_auditor = _parse_proof_v3_hard_auditor(payload)
     proof_v3_failure_policy = _parse_proof_v3_failure_policy(payload)
+    proof_v3_timing = _parse_proof_v3_timing(payload)
     maintenance_grace = _parse_maintenance_grace(payload)
 
     normalized = build_default_subnet_config_payload(
@@ -931,6 +1019,9 @@ def validate_subnet_config_payload(
     normalized["proof_v3_failure_policy"] = (
         _proof_v3_failure_policy_to_dict(proof_v3_failure_policy)
     )
+    normalized["proof_v3_timing"] = _proof_v3_timing_to_dict(
+        proof_v3_timing
+    )
     normalized["maintenance_grace"] = _maintenance_grace_to_dict(maintenance_grace)
 
     return RuntimeSubnetConfig(
@@ -959,6 +1050,7 @@ def validate_subnet_config_payload(
         proof_protocol_rollout=proof_protocol_rollout,
         proof_v3_hard_auditor=proof_v3_hard_auditor,
         proof_v3_failure_policy=proof_v3_failure_policy,
+        proof_v3_timing=proof_v3_timing,
         maintenance_grace=maintenance_grace,
         payload=normalized,
         source=source,
@@ -1065,6 +1157,18 @@ def apply_runtime_config_to_neuron_config(
     config.proof_v3_probation_state_generation = (
         failure_policy.probation_state_generation
     )
+    timing = runtime.proof_v3_timing
+    config.proof_v3_timing_ordinary_decode_tokens = (
+        timing.ordinary_decode_tokens
+    )
+    config.proof_v3_timing_max_decode_tokens = timing.max_decode_tokens
+    config.proof_v3_timing_ordinary_hard_proof_timeout_s = (
+        timing.ordinary_hard_proof_timeout_s
+    )
+    config.proof_v3_timing_max_hard_proof_timeout_s = (
+        timing.max_hard_proof_timeout_s
+    )
+    config.proof_v3_timing_transport_margin_s = timing.transport_margin_s
     grace = runtime.maintenance_grace
     config.maintenance_grace_enabled = grace.enabled
     config.maintenance_grace_open_ended = grace.open_ended
@@ -1155,6 +1259,36 @@ def proof_v3_failure_policy_config_from_neuron_config(
         ),
         probation_state_generation=int(
             getattr(config, "proof_v3_probation_state_generation", 0)
+        ),
+    )
+
+
+def proof_v3_timing_config_from_neuron_config(
+    config: Any,
+) -> ProofV3TimingConfig:
+    return ProofV3TimingConfig(
+        ordinary_decode_tokens=int(
+            getattr(config, "proof_v3_timing_ordinary_decode_tokens", 4096)
+        ),
+        max_decode_tokens=int(
+            getattr(config, "proof_v3_timing_max_decode_tokens", 8192)
+        ),
+        ordinary_hard_proof_timeout_s=int(
+            getattr(
+                config,
+                "proof_v3_timing_ordinary_hard_proof_timeout_s",
+                360,
+            )
+        ),
+        max_hard_proof_timeout_s=int(
+            getattr(
+                config,
+                "proof_v3_timing_max_hard_proof_timeout_s",
+                540,
+            )
+        ),
+        transport_margin_s=int(
+            getattr(config, "proof_v3_timing_transport_margin_s", 60)
         ),
     )
 

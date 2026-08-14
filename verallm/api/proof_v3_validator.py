@@ -281,6 +281,9 @@ class ProofV3ValidatorExchange:
             "proof_v3_preexecution_context": (
                 self.session.precommit_context.canonical_bytes().hex()
             ),
+            "proof_v3_hard_proof_arrival_budget_ns": (
+                self.session.hard_proof_arrival_budget_ns
+            ),
         }
 
     @property
@@ -1081,6 +1084,15 @@ def finalize_proof_v3_exchange_sync(
                 "POST",
                 f"{base_url}{ECONOMIC_PROOF_V3_CHALLENGE_PATH}",
                 json={"nonce_reveal": reveal.hex()},
+                timeout=(
+                    getattr(
+                        getattr(exchange, "session", None),
+                        "hard_proof_arrival_budget_ns",
+                        540_000_000_000,
+                    )
+                    / 1_000_000_000
+                    + 1.0
+                ),
             ) as response:
                 if response.is_error:
                     response.read()
@@ -1259,6 +1271,15 @@ async def run_proof_v3_exchange_async(
                 "POST",
                 f"{base_url}{ECONOMIC_PROOF_V3_CHALLENGE_PATH}",
                 json={"nonce_reveal": reveal.hex()},
+                timeout=(
+                    getattr(
+                        getattr(exchange, "session", None),
+                        "hard_proof_arrival_budget_ns",
+                        540_000_000_000,
+                    )
+                    / 1_000_000_000
+                    + 1.0
+                ),
             ) as response:
                 if response.is_error:
                     await response.aread()

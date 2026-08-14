@@ -105,17 +105,22 @@ _MANAGED_NGINX_FALLBACK_READ_TIMEOUT_SECONDS = 960
 def _managed_nginx_read_timeout_seconds(config: NeuronConfig) -> int:
     """Return the restart-time proxy ceiling for the active subnet policy."""
 
-    from verallm.proof_v3.session import MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3
-
     full_context_seconds = math.ceil(
         float(config.canary_full_context_inference_timeout)
     )
-    hard_proof_seconds = math.ceil(
-        MAX_HARD_PROOF_ARRIVAL_BUDGET_NS_V3 / 1_000_000_000
+    hard_proof_seconds = int(
+        getattr(config, "proof_v3_timing_max_hard_proof_timeout_s", 540)
+    )
+    transport_margin_seconds = int(
+        getattr(
+            config,
+            "proof_v3_timing_transport_margin_s",
+            _MANAGED_NGINX_TIMEOUT_GRACE_SECONDS,
+        )
     )
     return (
         max(full_context_seconds, hard_proof_seconds)
-        + _MANAGED_NGINX_TIMEOUT_GRACE_SECONDS
+        + transport_margin_seconds
     )
 
 
@@ -843,6 +848,7 @@ class MinerNeuron:
         )
         self._proof_v3_configured = False
         self._served_proof_protocol_versions: tuple[int, ...] = ()
+        self._managed_nginx_timeout_seconds: int | None = None
         self._running = True
 
         self.evm_pk = ""
@@ -1751,6 +1757,7 @@ class MinerNeuron:
                 )
                 if runtime is not None:
                     apply_runtime_config_to_neuron_config(runtime, self.config)
+                    self._reconcile_runtime_nginx_timeout()
                     policy = runtime.proof_v3_hard_auditor
                     if policy.enabled and not hard_auditor["enabled"]:
                         bt.logging.warning(
@@ -1800,6 +1807,23 @@ class MinerNeuron:
         except Exception as e:
             bt.logging.warning(f"Failed to refresh validator allowlist: {e}")
             raise
+
+    def _reconcile_runtime_nginx_timeout(self) -> bool:
+        """Apply a changed subnet timing ceiling without restarting vLLM."""
+
+        target = _managed_nginx_read_timeout_seconds(self.config)
+        if self._managed_nginx_timeout_seconds == target:
+            return True
+        if not _reconcile_managed_nginx_read_timeout(
+            read_timeout_seconds=target,
+        ):
+            bt.logging.warning(
+                "Managed nginx timeout reconciliation did not complete; "
+                f"verify the upstream read timeout is at least {target}s"
+            )
+            return False
+        self._managed_nginx_timeout_seconds = target
+        return True
 
     _cached_metagraph_line: str = ""
 
@@ -2851,14 +2875,7 @@ def main():
             neuron._refresh_validator_allowlist()
         except Exception as e:
             bt.logging.warning(f"Initial validator allowlist write failed: {e} — server will block until next refresh succeeds")
-    managed_nginx_timeout_seconds = _managed_nginx_read_timeout_seconds(config)
-    if not _reconcile_managed_nginx_read_timeout(
-        read_timeout_seconds=managed_nginx_timeout_seconds,
-    ):
-        bt.logging.warning(
-            "Managed nginx timeout reconciliation did not complete; verify "
-            f"the upstream read timeout is at least {managed_nginx_timeout_seconds}s"
-        )
+    neuron._reconcile_runtime_nginx_timeout()
     served_proof_protocol_versions = (
         neuron._served_proof_protocol_versions
         or _configured_miner_proof_protocol_versions(

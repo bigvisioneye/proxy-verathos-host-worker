@@ -119,9 +119,9 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_buffering off;
         proxy_cache off;
-        # Default policy (900s) + 60s transport grace. Miner startup reconciles
-        # managed blocks when the hosted subnet timeout changes.
-        proxy_read_timeout 960s;
+        # Maximum proof policy (1800s) + 60s transport grace. Miner startup
+        # reconciles managed blocks when the hosted subnet timeout changes.
+        proxy_read_timeout 1860s;
     }
 }
 CONFEOF

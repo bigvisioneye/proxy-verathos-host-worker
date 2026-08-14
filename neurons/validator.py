@@ -8373,6 +8373,15 @@ class ValidatorNeuron:
             "top_p": float(test.top_p or 1.0),
             "min_p": 0.0,
         }
+        from neurons.subnet_runtime_config import (
+            proof_v3_timing_config_from_neuron_config,
+        )
+
+        request_kwargs["hard_proof_arrival_budget_ns"] = (
+            proof_v3_timing_config_from_neuron_config(
+                self.config
+            ).hard_proof_arrival_budget_ns(test.max_new_tokens)
+        )
         pair_id = str(getattr(test, "full_pair_id", "") or "")
         barrier = None
         exchange = None

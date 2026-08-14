@@ -2032,6 +2032,7 @@ class ValidatorClient:
         proof_challenge_id: bytes | None = None,
         nonce_reveal_hold_budget_ns: int | None = None,
         expected_hard_audit: bool | None = None,
+        hard_proof_arrival_budget_ns: int | None = None,
     ) -> tuple[object, dict[str, object]]:
         """Build the shared strict v3 exchange and miner request body."""
 
@@ -2110,6 +2111,11 @@ class ValidatorClient:
             challenge_id = os.urandom(32)
             while challenge_id == bytes(32):
                 challenge_id = os.urandom(32)
+        selected_hard_proof_arrival_budget_ns = (
+            hard_proof_arrival_budget_for_decode_v3(max_new_tokens)
+            if hard_proof_arrival_budget_ns is None
+            else hard_proof_arrival_budget_ns
+        )
         exchange = ProofV3ValidatorExchange.issue(
             qualified_profile=qualified_profile,
             proof_challenge_id=challenge_id,
@@ -2119,7 +2125,7 @@ class ValidatorClient:
             sampler_config_digest=sampler_digest,
             runtime_policy=runtime_policy,
             hard_proof_arrival_budget_ns=(
-                hard_proof_arrival_budget_for_decode_v3(max_new_tokens)
+                selected_hard_proof_arrival_budget_ns
             ),
             nonce_reveal_hold_budget_ns=nonce_reveal_hold_budget_ns,
             expected_hard_audit=expected_hard_audit,
@@ -2158,6 +2164,7 @@ class ValidatorClient:
         proof_challenge_id: bytes | None = None,
         nonce_reveal_hold_budget_ns: int | None = None,
         expected_hard_audit: bool | None = None,
+        hard_proof_arrival_budget_ns: int | None = None,
     ):
         """Run one v3 chat stream through its accepted precommit only."""
 
@@ -2183,6 +2190,7 @@ class ValidatorClient:
             proof_challenge_id=proof_challenge_id,
             nonce_reveal_hold_budget_ns=nonce_reveal_hold_budget_ns,
             expected_hard_audit=expected_hard_audit,
+            hard_proof_arrival_budget_ns=hard_proof_arrival_budget_ns,
         )
         return run_proof_v3_precommit_sync(
             client=self.client,
@@ -2238,6 +2246,7 @@ class ValidatorClient:
         min_p: float = 0.0,
         stream_callback=None,
         proof_challenge_id: bytes | None = None,
+        hard_proof_arrival_budget_ns: int | None = None,
     ):
         """Run one qualified greedy proof-v3 chat exchange.
 
@@ -2265,6 +2274,7 @@ class ValidatorClient:
             top_p=top_p,
             min_p=min_p,
             proof_challenge_id=proof_challenge_id,
+            hard_proof_arrival_budget_ns=hard_proof_arrival_budget_ns,
         )
         return run_proof_v3_exchange_sync(
             client=self.client,
@@ -5284,6 +5294,7 @@ class AsyncValidatorClient(ValidatorClient):
         stream_callback=None,
         proof_challenge_id: bytes | None = None,
         first_token_timeout_seconds: float | None = None,
+        hard_proof_arrival_budget_ns: int | None = None,
     ):
         """Run one qualified greedy proof-v3 chat exchange asynchronously."""
 
@@ -5305,6 +5316,7 @@ class AsyncValidatorClient(ValidatorClient):
             top_p=top_p,
             min_p=min_p,
             proof_challenge_id=proof_challenge_id,
+            hard_proof_arrival_budget_ns=hard_proof_arrival_budget_ns,
         )
         return await run_proof_v3_exchange_async(
             client=self.client,
