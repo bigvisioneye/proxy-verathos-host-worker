@@ -361,6 +361,50 @@ class ProofProtocolRequestBody(BaseModel):
         return resolve_proof_protocol_version(self.proof_protocol_version)
 
 
+# Hard server-side ceiling on client-requested generation length.  Applied at
+# request-parse time — BEFORE any proof precommit or PreExecutionRequestContext
+# is derived — so the proof transcript always commits to the value that is
+# actually executed.  Defense-in-depth: the runaway incident (req-df8b1431) was
+# NOT caused by a large max_tokens, but an unbounded client value multiplies
+# the blast radius of any finish-check bypass.
+#
+# The 4096 floor keeps an env typo from ever capping below validator canary
+# decode sizes (<=512) — a too-low cap would silently fail every proof-v3
+# canary fleet-wide, which is worse than no cap at all.
+def _resolve_max_new_tokens_cap() -> int:
+    try:
+        value = int(os.getenv("VERATHOS_MAX_NEW_TOKENS_CAP", "65536"))
+    except (TypeError, ValueError):
+        value = 65536
+    return max(4096, value)
+
+
+_MAX_NEW_TOKENS_CAP = _resolve_max_new_tokens_cap()
+
+
+def _apply_max_new_tokens_cap(value: int, values: dict) -> int:
+    """Cap organic requests; REJECT oversized proof-carrying requests.
+
+    A silent clamp on a proof-v3 request would rely on the compiled runtime
+    409-ing the sampler-config digest mismatch (committed params != executed
+    params).  Rejecting at parse time guarantees committed == executed
+    regardless of compiled-runtime behavior.  Validators send <=512 so this
+    never fires for them.
+    """
+    value = int(value)
+    if value <= _MAX_NEW_TOKENS_CAP:
+        return max(1, value)
+    if (
+        values.get("proof_protocol_version") == 3
+        or values.get("proof_v3_preexecution_context") is not None
+    ):
+        raise ValueError(
+            f"max_new_tokens {value} exceeds server cap "
+            f"{_MAX_NEW_TOKENS_CAP} for a proof-carrying request"
+        )
+    return _MAX_NEW_TOKENS_CAP
+
+
 class InferenceRequestBody(ProofProtocolRequestBody):
     prompt: str
     max_new_tokens: int = 4096
@@ -374,6 +418,10 @@ class InferenceRequestBody(ProofProtocolRequestBody):
     top_k: Optional[int] = None  # vLLM default -1 (disabled)
     top_p: Optional[float] = None  # vLLM default 1.0
     min_p: Optional[float] = None  # vLLM default 0.0
+
+    @validator("max_new_tokens")
+    def _cap_max_new_tokens(cls, value: int, values: dict) -> int:
+        return _apply_max_new_tokens_cap(value, values)
 
 
 class ChatMessage(BaseModel):
@@ -408,6 +456,10 @@ class ChatRequestBody(ProofProtocolRequestBody):
     tools: Optional[list[dict]] = None
     tool_choice: Optional[Any] = None
     parallel_tool_calls: Optional[bool] = None
+
+    @validator("max_new_tokens")
+    def _cap_max_new_tokens(cls, value: int, values: dict) -> int:
+        return _apply_max_new_tokens_cap(value, values)
 
 
 class ProofV2ChallengeRevealBody(BaseModel):
@@ -670,6 +722,12 @@ class MinerState:
         self.proof_v3_runtimes: dict[bytes, object] = {}
         self.proof_v3_coordinator = None
         self.allowed_proof_protocol_versions = (1, 3)
+        # Engine-health telemetry maintained by the batch step loop.  When the
+        # step loop fails many consecutive iterations the engine is considered
+        # degraded and /health reports 503 so the balancer routes around this
+        # box instead of feeding it canary traffic it will fail.
+        self.step_fail_streak: int = 0
+        self.engine_degraded_since: Optional[float] = None
 
 
 state = MinerState()
@@ -1256,6 +1314,23 @@ async def health():
     # No CUDA calls here — KV pool stats from admission control are
     # the real saturation metric; torch.cuda.memory_allocated() syncs
     # the GPU and can block the event loop for seconds under load.
+    #
+    # Engine-degraded gate: a poisoned engine (repeated step-loop failures,
+    # e.g. CUDA generator stuck in graph-capture state) previously hid behind
+    # a 200 liveness response for hours while failing every real request.
+    # Reporting 503 here makes the balancer evict this box immediately.
+    if state.engine_degraded_since is not None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "error": "inference engine failing repeated step attempts",
+                "step_fail_streak": state.step_fail_streak,
+                "degraded_for_s": round(
+                    time.monotonic() - state.engine_degraded_since, 1
+                ),
+            },
+        )
     result = {
         "status": "ok",
         "model": state.model_name,
@@ -1460,6 +1535,31 @@ async def reveal_proof_v2_challenge(
         "proof_challenge_id": body.proof_challenge_id,
         "idempotent": False,
     }
+
+
+def _vram_headroom_low() -> tuple[bool, int]:
+    """Return (low, free_mb): free GPU memory below the configured floor.
+
+    ``cudaMemGetInfo`` is a driver query — it does not synchronize the device,
+    so it is safe on the admission path (unlike ``torch.cuda.memory_allocated``
+    which can block).  The runaway incident began when per-step 2 MiB sampler
+    allocations started failing; refusing new admissions while headroom is
+    critically low keeps the sampler workspace viable for in-flight requests.
+    Set VERATHOS_MIN_VRAM_HEADROOM_MB=0 to disable.
+    """
+    try:
+        floor_mb = int(os.getenv("VERATHOS_MIN_VRAM_HEADROOM_MB", "512"))
+    except ValueError:
+        floor_mb = 512
+    if floor_mb <= 0:
+        return False, 0
+    try:
+        import torch
+
+        free_bytes, _total = torch.cuda.mem_get_info()
+    except Exception:
+        return False, 0
+    return free_bytes < floor_mb * 1024 * 1024, int(free_bytes // (1024 * 1024))
 
 
 def _resolve_sampling_params(
@@ -1751,6 +1851,21 @@ async def run_inference(body: InferenceRequestBody, request: Request = None):
             prompt_tokens = len(tokenizer.encode(body.prompt))
         token_budget = prompt_tokens + body.max_new_tokens
 
+        headroom_low, free_mb = _vram_headroom_low()
+        if headroom_low:
+            bt.logging.warning(
+                f"Admission rejected: GPU headroom {free_mb}MB below floor"
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Miner busy: GPU memory headroom exhausted",
+                    "free_vram_mb": free_mb,
+                    "retry_after_ms": 5000,
+                },
+                headers={"Retry-After": "5"},
+            )
+
         # Admission check — reject with 503 before streaming starts
         request_id = f"req-{uuid.uuid4().hex[:8]}"
         admitted = await state.admission.try_admit(request_id, token_budget)
@@ -1998,6 +2113,21 @@ async def run_chat(body: ChatRequestBody, request: Request = None):
             prompt_tokens = len(tokenizer.encode(synth_body.prompt))
         token_budget = prompt_tokens + body.max_new_tokens
 
+        headroom_low, free_mb = _vram_headroom_low()
+        if headroom_low:
+            bt.logging.warning(
+                f"Admission rejected: GPU headroom {free_mb}MB below floor"
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Miner busy: GPU memory headroom exhausted",
+                    "free_vram_mb": free_mb,
+                    "retry_after_ms": 5000,
+                },
+                headers={"Retry-After": "5"},
+            )
+
         # Admission check — reject with 503 before streaming starts
         request_id = f"req-{uuid.uuid4().hex[:8]}"
         admitted = await state.admission.try_admit(request_id, token_budget)
@@ -2217,7 +2347,14 @@ async def tee_chat(body: TEEChatRequestBody, request: Request):
 
     # Parse the decrypted chat request (OpenAI-style messages)
     messages = chat_request.get("messages", [])
-    max_new_tokens = chat_request.get("max_new_tokens", 4096)
+    # Cap at read time so token_budget and the synth body agree on the
+    # executed value (the endpoint bodies cap via their pydantic validator).
+    try:
+        max_new_tokens = min(
+            int(chat_request.get("max_new_tokens", 4096)), _MAX_NEW_TOKENS_CAP
+        )
+    except (TypeError, ValueError):
+        max_new_tokens = 4096
     do_sample = chat_request.get("do_sample", False)
     temperature = chat_request.get("temperature", 1.0)
     enable_thinking = chat_request.get("enable_thinking", True)
@@ -3798,6 +3935,111 @@ def _attach_proof_domain_router_topk(miner, activations, router_commitments) -> 
 # Batch mode: step loop + batched inference stream
 # ============================================================================
 
+# Orphaned-request containment (incident req-df8b1431 on huihui, 2026-08-12):
+# ``fail_all_requests`` aborts wrapper-tracked streams, but the vLLM core can
+# retain a request whose own step was in flight when the abort ran.  Such an
+# orphan keeps the scheduler non-idle, so the step loop grinds failing steps
+# indefinitely (observed: 262k failing steps over 18.6h, one committed token
+# per step bypassing max_tokens/EOS finish checks, ending in a poisoned CUDA
+# generator).  The registry remembers every engine request this API created;
+# once its consumer is gone the reaper re-issues ``abort_request`` until the
+# engine actually confirms eviction, making cleanup convergent instead of
+# one-shot.
+_ENGINE_REQ_REGISTRY: dict[str, dict] = {}
+_REAPER_GRACE_SECONDS = 2.0
+# 5 attempts (~10s) is ample for a real eviction retry; ghosts (ids the
+# engine no longer knows, where is_request_finished stays False) previously
+# burned 30 no-op aborts of log noise before giving up.
+_REAPER_MAX_ABORT_ATTEMPTS = 5
+_REAPER_MAX_TRACK_SECONDS = 3600.0
+_STEP_FAIL_DEGRADED_THRESHOLD = 25
+
+
+def _register_engine_request(request_id: str) -> None:
+    _ENGINE_REQ_REGISTRY[request_id] = {
+        "added": time.monotonic(),
+        "consumer_done": False,
+        "abort_attempts": 0,
+        "last_attempt": 0.0,
+    }
+
+
+def _mark_engine_request_consumer_done(request_id: str) -> None:
+    entry = _ENGINE_REQ_REGISTRY.get(request_id)
+    if entry is not None:
+        entry["consumer_done"] = True
+        # Pace the reaper from this moment: the consumer's own verified
+        # abort runs first, and the reaper only follows up if eviction
+        # remains unconfirmed a grace period later.
+        entry["last_attempt"] = time.monotonic()
+
+
+def _reap_orphaned_engine_requests(batch_engine) -> None:
+    """Re-abort engine-retained requests whose consumers are gone.
+
+    Runs on the event loop (no cross-thread state).  Exceptions are contained
+    per-entry so a single bad id can never kill the step loop.
+
+    Ordering matters for proof integrity: entries whose consumer is still
+    alive are NEVER touched (beyond pathological expiry) — the consumer owns
+    ``clear_finished`` because proof finalization runs against retained
+    engine-side state after ``output.finished``.  The reaper only acts once
+    ``consumer_done`` confirms the stream is gone.
+    """
+    now = time.monotonic()
+    try:
+        if not batch_engine.has_active_requests():
+            # Engine is idle — nothing can be retained, so every
+            # consumer-done entry is a ghost (is_request_finished returns
+            # False for ids the engine no longer knows, observed on canary:
+            # the initial abort had already evicted them).  Drop them
+            # silently instead of chasing 30 no-op aborts.
+            for request_id, entry in list(_ENGINE_REQ_REGISTRY.items()):
+                if entry["consumer_done"]:
+                    _ENGINE_REQ_REGISTRY.pop(request_id, None)
+            return
+    except Exception:
+        pass
+    for request_id, entry in list(_ENGINE_REQ_REGISTRY.items()):
+        try:
+            if not entry["consumer_done"]:
+                # A live consumer owns cleanup (including proof finalization
+                # against retained finished-state); only expire pathological
+                # entries that somehow outlived every legitimate stream.
+                if now - entry["added"] > _REAPER_MAX_TRACK_SECONDS:
+                    _ENGINE_REQ_REGISTRY.pop(request_id, None)
+                continue
+            # Give-up cap first, so a persistently-raising abort_request
+            # still converges instead of livelocking this entry forever.
+            if entry["abort_attempts"] >= _REAPER_MAX_ABORT_ATTEMPTS:
+                bt.logging.error(
+                    f"Reaper stopped tracking {request_id} after "
+                    f"{entry['abort_attempts']} abort attempts; if the engine "
+                    "still holds it the step-failure health gate will degrade "
+                    "this box out of rotation"
+                )
+                _ENGINE_REQ_REGISTRY.pop(request_id, None)
+                continue
+            if batch_engine.is_request_finished(request_id):
+                batch_engine.clear_finished(request_id)
+                _ENGINE_REQ_REGISTRY.pop(request_id, None)
+                continue
+            # Per-entry pacing vs the LAST attempt (not request start), so
+            # the 30-attempt budget genuinely spans ~60s even when the
+            # failure path invokes the reaper every ~10ms.
+            if now - entry["last_attempt"] < _REAPER_GRACE_SECONDS:
+                continue
+            entry["last_attempt"] = now
+            entry["abort_attempts"] += 1
+            batch_engine.abort_request(request_id)
+            if entry["abort_attempts"] == 1 or entry["abort_attempts"] % 10 == 0:
+                bt.logging.error(
+                    f"Reaper re-aborting engine-retained request {request_id}"
+                    f" (attempt {entry['abort_attempts']})"
+                )
+        except Exception:
+            logger.exception(f"Reaper error for request {request_id}")
+
 
 async def _engine_step_loop():
     """Background task: run engine.step_and_distribute() in a loop.
@@ -3815,6 +4057,7 @@ async def _engine_step_loop():
     _gpu_times: list[float] = []  # thread execution only
     _step_count = 0
     _max_active = 0
+    _last_reap = time.monotonic()
 
     def _timed_step():
         """Run step_and_distribute and return GPU-side wall time."""
@@ -3822,8 +4065,35 @@ async def _engine_step_loop():
         batch_engine.step_and_distribute()
         return time.perf_counter() - t
 
+    _last_step_failure = 0.0
+
     while True:
         if not batch_engine.has_active_requests():
+            # Reap leftover registry entries even while idle (an evicted
+            # orphan's bookkeeping must not wait for new traffic).
+            if (
+                _ENGINE_REQ_REGISTRY
+                and time.monotonic() - _last_reap > _REAPER_GRACE_SECONDS
+            ):
+                _last_reap = time.monotonic()
+                _reap_orphaned_engine_requests(batch_engine)
+            # Degraded-flag recovery: the flag normally clears on the next
+            # successful step, but a degraded box gets no traffic (health
+            # 503) so no steps ever run — without this the 503 would be
+            # permanent even though the engine recovered.  True poisoning
+            # re-degrades immediately on the next failing step.
+            if (
+                state.engine_degraded_since is not None
+                and not _ENGINE_REQ_REGISTRY
+                and time.monotonic() - _last_step_failure > 30.0
+            ):
+                bt.logging.info(
+                    "Engine idle and orphan registry empty for 30s after "
+                    f"{state.step_fail_streak} step failures; clearing "
+                    "degraded state, /health restored"
+                )
+                state.step_fail_streak = 0
+                state.engine_degraded_since = None
             if _step_count > 0:
                 avg_ms = sum(_step_times) / len(_step_times) * 1000
                 max_ms = max(_step_times) * 1000
@@ -3850,8 +4120,33 @@ async def _engine_step_loop():
             _step_times.append(time.perf_counter() - t_step)
             _gpu_times.append(gpu_time)
             _step_count += 1
-        except Exception:
+            if state.step_fail_streak:
+                if state.engine_degraded_since is not None:
+                    bt.logging.info(
+                        "Engine recovered after "
+                        f"{state.step_fail_streak} failed steps; /health "
+                        "restored"
+                    )
+                state.step_fail_streak = 0
+                state.engine_degraded_since = None
+            # Periodic reap: cheap no-op when the registry is empty.
+            if (
+                _ENGINE_REQ_REGISTRY
+                and time.monotonic() - _last_reap > _REAPER_GRACE_SECONDS
+            ):
+                _last_reap = time.monotonic()
+                _reap_orphaned_engine_requests(batch_engine)
+        except Exception as _step_exc:
             logger.exception("Error in engine step loop")
+            # Also record the cause in the pm2 out log: the error log is
+            # rotated minutely by the watchdog, which destroyed the
+            # tracebacks of the first two canary step-failure events.
+            bt.logging.error(
+                "Engine step failure: "
+                f"{type(_step_exc).__name__}: {str(_step_exc)[:300]}"
+            )
+            state.step_fail_streak += 1
+            _last_step_failure = time.monotonic()
             failed_ids = batch_engine.fail_all_requests(
                 BatchEngineRequestError(
                     "Inference engine step failed; request was aborted"
@@ -3861,6 +4156,31 @@ async def _engine_step_loop():
                 bt.logging.error(
                     f"Aborted {len(failed_ids)} request(s) after shared "
                     "engine step failure"
+                )
+                # Hand every failed id to the reaper so eviction is
+                # verified, not assumed.  Upsert covers ids created outside
+                # _stream_inference_batched (keepalive/warmup add_request
+                # sites) which are otherwise invisible to the registry.
+                for _rid in failed_ids:
+                    if _rid in _ENGINE_REQ_REGISTRY:
+                        _mark_engine_request_consumer_done(_rid)
+                    else:
+                        _ENGINE_REQ_REGISTRY[_rid] = {
+                            "added": time.monotonic(),
+                            "consumer_done": True,
+                            "abort_attempts": 0,
+                            "last_attempt": time.monotonic(),
+                        }
+            _reap_orphaned_engine_requests(batch_engine)
+            if (
+                state.step_fail_streak >= _STEP_FAIL_DEGRADED_THRESHOLD
+                and state.engine_degraded_since is None
+            ):
+                state.engine_degraded_since = time.monotonic()
+                bt.logging.error(
+                    f"Engine degraded: {state.step_fail_streak} consecutive "
+                    "step failures; /health now reports 503 until a step "
+                    "succeeds"
                 )
             await asyncio.sleep(0.01)
         # Yield to event loop so SSE generators can send queued outputs
@@ -4081,6 +4401,7 @@ async def _stream_inference_batched(
             ),
         )
         engine_request_active = True
+        _register_engine_request(request_id)
 
         # Stream tokens from per-request queue
         prev_text = ""
@@ -4115,8 +4436,20 @@ async def _stream_inference_batched(
                 )
             except asyncio.TimeoutError:
                 yield f"event: error\ndata: {json.dumps({'error': 'Inference timeout'})}\n\n"
-                batch_engine.abort_request(request_id)
-                engine_request_active = False
+                # Only trust the release once the engine confirms it; else
+                # leave engine_request_active True so the outer finally
+                # re-aborts and the step-loop reaper retries until evicted.
+                # Any raise (compiled-engine semantics for unknown ids are
+                # undocumented) is treated as eviction-unconfirmed.
+                try:
+                    batch_engine.abort_request(request_id)
+                    if batch_engine.is_request_finished(request_id):
+                        batch_engine.clear_finished(request_id)
+                        engine_request_active = False
+                except Exception:
+                    logger.exception(
+                        f"Timeout abort unconfirmed for {request_id}"
+                    )
                 if tracker is not None:
                     tracker.unregister_request(request_id)
                 if moe_mgr:
@@ -4124,9 +4457,22 @@ async def _stream_inference_batched(
                 return
 
             if isinstance(output, BatchEngineRequestError):
-                # The shared step loop already aborted every affected engine
-                # request before publishing this bounded error.
-                engine_request_active = False
+                # The shared step loop failed this request's tracked stream,
+                # but the vLLM core can retain the request if its own step
+                # was in flight when the abort ran (incident req-df8b1431:
+                # a retained request decode-looped to the context ceiling).
+                # Re-abort and only trust the release once the engine
+                # confirms it; any raise means eviction-unconfirmed and the
+                # reaper takes over via the outer finally.
+                try:
+                    batch_engine.abort_request(request_id)
+                    if batch_engine.is_request_finished(request_id):
+                        batch_engine.clear_finished(request_id)
+                        engine_request_active = False
+                except Exception:
+                    logger.exception(
+                        f"Step-failure abort unconfirmed for {request_id}"
+                    )
                 yield (
                     "event: error\n"
                     f"data: {json.dumps({'error': str(output)})}\n\n"
@@ -4657,6 +5003,21 @@ async def _stream_inference_batched(
             if moe_mgr:
                 moe_mgr.clear_request(request_id)
             _cleanup_inference_session(miner, session_id)
+            # Hand the id to the step-loop reaper: a single abort attempt is
+            # not proof of eviction (the engine can retain a request whose
+            # own step was in flight), so eviction is verified there.
+            _mark_engine_request_consumer_done(request_id)
+        else:
+            # Engine confirmed done (normal completion or verified abort).
+            # A disconnect between output.finished and the consumer's own
+            # clear_finished can still leave a finished engine entry — clear
+            # it here rather than leaking it.
+            try:
+                if batch_engine.is_request_finished(request_id):
+                    batch_engine.clear_finished(request_id)
+            except Exception:
+                pass
+            _ENGINE_REQ_REGISTRY.pop(request_id, None)
         # Always release token budget, even on error/timeout
         await admission.release(request_id)
 

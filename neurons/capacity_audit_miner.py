@@ -196,6 +196,18 @@ class CapacityAuditMinerWorker:
         self._publisher_lock = threading.Lock()
         self._publisher_result_lock = threading.Lock()
         self._publisher_stop = threading.Event()
+        # Capacity-audit substrate-fallback state. Initialized here (single
+        # thread, before the worker starts) to avoid a race in
+        # _note_sub_failure where _sub_fail_streak was set before
+        # _sub_fallback_net, so a concurrent failure read the missing
+        # attribute and crashed the audit worker thread permanently.
+        self._sub_fail_streak = 0
+        self._sub_use_fallback = False
+        _primary = self.config.subtensor_network or ""
+        _is_public = (_primary in ("finney", "") or
+                      any(h in _primary for h in ("opentensor.ai", "chain.opentensor")))
+        self._sub_fallback_net = "" if _is_public else os.getenv(
+            "VERATHOS_SUBTENSOR_FALLBACK", "finney")
         self._publisher_queues: dict[str, queue.Queue[_ValidatorDelivery]] = {}
         self._publisher_threads: dict[str, threading.Thread] = {}
 
@@ -382,7 +394,9 @@ class CapacityAuditMinerWorker:
         (e.g. a dead/expired Dwellir key). Keeps capacity audits alive on a bad
         key instead of hammering a 403 endpoint forever. Restart re-engages the
         primary."""
-        if not hasattr(self, "_sub_fail_streak"):
+        # State is initialized in __init__ (see there); guard defensively in
+        # case an older instance predates that init.
+        if not hasattr(self, "_sub_fallback_net"):
             self._sub_fail_streak = 0
             self._sub_use_fallback = False
             primary = self.config.subtensor_network or ""
