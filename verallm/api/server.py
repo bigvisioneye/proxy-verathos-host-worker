@@ -102,6 +102,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, StrictInt, root_validator, validator
 
+from neurons.version import (
+    miner_version_str,
+    version_str as spec_version_str,
+)
 from verallm.config import Config, set_config
 from verallm.challenge.beacon import (
     derive_hard_audit_sampling_challenge,
@@ -1192,6 +1196,11 @@ async def health():
     # the GPU and can block the event loop for seconds under load.
     result = {
         "status": "ok",
+        # Report the versions imported by this running process.  These are
+        # operational diagnostics only; validators never trust /health for
+        # proof or release admission.
+        "miner_version": miner_version_str,
+        "spec_version": spec_version_str,
         "model": state.model_name,
         "moe": state.moe_config is not None,
         "batch_mode": state.batch_mode,
