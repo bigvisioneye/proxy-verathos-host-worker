@@ -1250,21 +1250,45 @@ class CapacityAuditMinerWorker:
 
     def _enrich_hardware(self, miners: list[ActiveMiner]) -> None:
         for miner in miners:
+            hw: dict = {}
             for base_url in self._health_urls_for_miner(miner):
-                try:
-                    resp = httpx.get(f"{base_url}/health", timeout=3.0)
-                    if resp.status_code != 200:
+                # A busy API server can miss a single short probe; one empty or
+                # failed response must not poison the audit-selection metadata.
+                for _attempt in range(3):
+                    try:
+                        resp = httpx.get(f"{base_url}/health", timeout=5.0, verify=False)
+                        if resp.status_code != 200:
+                            continue
+                        candidate = (resp.json() or {}).get("hardware") or {}
+                        if candidate.get("gpu_name"):
+                            hw = candidate
+                            break
+                    except Exception:
                         continue
-                    hw = (resp.json() or {}).get("hardware") or {}
-                    miner.gpu_name = hw.get("gpu_name") or ""
-                    miner.gpu_count = int(hw.get("gpu_count") or 0)
-                    miner.vram_gb = int(hw.get("vram_gb") or 0)
-                    miner.compute_capability = hw.get("compute_capability") or ""
-                    uuids = hw.get("gpu_uuids") or []
-                    miner.gpu_uuids = uuids if isinstance(uuids, list) else []
+                if hw:
                     break
-                except Exception:
-                    continue
+            if not hw.get("gpu_name"):
+                # The launcher always advertises the hardware; audits must not
+                # no-show just because the local health probe was slow.
+                env_name = os.environ.get("VERATHOS_ADVERTISED_GPU_NAME", "")
+                if env_name:
+                    hw = {
+                        "gpu_name": env_name,
+                        "gpu_count": 1,
+                        "vram_gb": int(os.environ.get("VERATHOS_ADVERTISED_VRAM_GB", "0") or 0),
+                        "compute_capability": "",
+                        "gpu_uuids": [
+                            u for u in os.environ.get("VERATHOS_ADVERTISED_GPU_UUIDS", "").split(",") if u
+                        ],
+                    }
+            if not hw:
+                continue
+            miner.gpu_name = hw.get("gpu_name") or ""
+            miner.gpu_count = int(hw.get("gpu_count") or 0)
+            miner.vram_gb = int(hw.get("vram_gb") or 0)
+            miner.compute_capability = hw.get("compute_capability") or ""
+            uuids = hw.get("gpu_uuids") or []
+            miner.gpu_uuids = uuids if isinstance(uuids, list) else []
 
     def _workspace_script(self) -> Path:
         return Path(__file__).resolve().parents[1] / "scripts" / "hot_capacity_workspace" / "bench_combined.py"
