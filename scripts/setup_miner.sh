@@ -1293,6 +1293,19 @@ except Exception as e:
             -name "zkllm_native.cpython-*.so.torch*" \
         \) -delete 2>/dev/null || true
     fi
+    if [ "${GPU_SM:-0}" -ge 120 ]; then
+        # Blackwell miners: the cu130 torch's cuBLAS rejects the capacity-audit
+        # workload's INT8 GEMM (CUBLAS_STATUS_NOT_SUPPORTED; verified on eight
+        # sm_120 proxies, 2026-08-17), which no-shows every audit. torch
+        # 2.11.0+cu128 fully supports sm_120 and passes the workload; vLLM
+        # keeps its cu13-linked wheel (already installed above) because proxy
+        # miners never run vLLM inference. Pinning torch here also makes the
+        # proof-v3 wheel selection below resolve to the cu128 build.
+        echo "  Blackwell (sm_${GPU_SM}): pinning torch to 2.11.0+cu128 for the audit workload..."
+        $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
+            "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" \
+            --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -3
+    fi
     TORCH_CUDA_RUNTIME=$($PYTHON -c '
 import torch
 cuda = str(torch.version.cuda or "")
