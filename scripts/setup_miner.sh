@@ -1302,8 +1302,11 @@ except Exception as e:
         # miners never run vLLM inference. Pinning torch here also makes the
         # proof-v3 wheel selection below resolve to the cu128 build.
         echo "  Blackwell (sm_${GPU_SM}): pinning torch to 2.11.0+cu128 for the audit workload..."
-        $PYTHON -m pip install --no-cache-dir --force-reinstall --no-deps \
-            "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" \
+        # With dependencies: the cu128 wheel needs its nvidia-*-cu12 libs
+        # (libcupti et al) or torch fails to import against the cu13 set the
+        # cu130 install left behind.
+        $PYTHON -m pip install --no-cache-dir --force-reinstall \
+            "torch==2.11.0+cu128" \
             --index-url https://download.pytorch.org/whl/cu128 2>&1 | tail -3
     fi
     TORCH_CUDA_RUNTIME=$($PYTHON -c '
