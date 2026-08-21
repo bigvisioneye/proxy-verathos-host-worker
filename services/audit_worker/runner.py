@@ -202,7 +202,7 @@ class AuditJobRunner:
             raise KeyError(job_id)
         payload = {"seed_hex": str(proof_seed or ""), "audit_id": audit_id, "B_start": int(b_start), "t": time.time()}
         tmp = record.start_file.with_suffix(record.start_file.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n")
+        tmp.write_text(json.dumps(payload, sort_keys=True))
         os.replace(tmp, record.start_file)
         with record.lock:
             record.started = True
@@ -216,7 +216,7 @@ class AuditJobRunner:
         if not seed:
             raise ValueError("challenge_seed required")
         tmp = record.challenge_file.with_suffix(record.challenge_file.suffix + ".tmp")
-        tmp.write_text(seed + "\n")
+        tmp.write_text(seed)
         os.replace(tmp, record.challenge_file)
         logger.info("audit job challenge submitted: job_id=%s len=%d", job_id[:12], len(seed))
 

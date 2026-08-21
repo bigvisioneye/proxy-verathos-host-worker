@@ -205,7 +205,7 @@ def _register_with_balancer() -> None:
             "endpoint": _worker_endpoint,
             "worker_key": _worker_key,
             "gpu_class": _gpu_class,
-            "lease_ttl_s": 60,
+            "lease_ttl_s": 420,
         })
     except Exception:
         logger.warning("audit worker: initial balancer register failed; heartbeats will retry")

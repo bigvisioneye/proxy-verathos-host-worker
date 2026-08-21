@@ -384,7 +384,7 @@ class CapacityAuditMinerWorker:
                 disabled(
                     "Capacity audit miner worker disabled: hot-capacity workspace extension unavailable"
                 )
-            return
+                return
         self._running = True
         self._thread = threading.Thread(target=self._run, name="capacity-audit-miner", daemon=True)
         self._thread.start()
@@ -1018,6 +1018,15 @@ class CapacityAuditMinerWorker:
             deadline = time.time() + max(60.0, lead_wait_s + 90.0)
             audit_hash: Optional[bytes] = None
             while self._running and time.time() < deadline:
+                # Prefer the block stream (same primitive the local waiter leans
+                # on): it delivers B_start's hash the moment the block lands and
+                # keeps working through RPC 429 starvation.
+                audit_hash = self._wait_for_cached_block_hash(
+                    audit_slot.audit_block, timeout_s=2.0
+                )
+                if audit_hash is not None:
+                    break
+                # Stream quiet — fall back to one RPC probe per iteration.
                 try:
                     current_block = self._get_live_current_head_block(subtensor)
                 except Exception:
