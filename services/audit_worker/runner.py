@@ -31,6 +31,18 @@ _COMBINED_PROOF_FORMATS = frozenset({
     "hot_capacity_combined_proof_v2",
 })
 
+# Mirror the miner: always request the strict arithmetic (v2) payload from the
+# workload.  bench_combined defaults to v1 when the flag is absent, and
+# validators reject v1 outside the bounded compatibility window with
+# `legacy_capacity_proof_protocol_not_accepted`.  The guarded import keeps this
+# module light on hosts whose venv lacks the zkllm chain the constant pulls in.
+try:  # pragma: no cover - trivial constant import
+    from neurons.capacity_audit_combined import (
+        CURRENT_COMBINED_PROOF_PROTOCOL_VERSION as _PROOF_PROTOCOL_VERSION,
+    )
+except Exception:  # noqa: BLE001
+    _PROOF_PROTOCOL_VERSION = 2
+
 
 def _root_hex(raw: object) -> str:
     if isinstance(raw, str):
@@ -139,9 +151,12 @@ class AuditJobRunner:
         ]
         spec = payload.get("workload_spec") if isinstance(payload.get("workload_spec"), dict) else {}
         for key, value in spec.items():
-            if key in {"workload_version", "pass_count"}:
+            if key in {"workload_version", "pass_count", "proof_protocol_version"}:
                 continue
             cmd.extend([f"--{key.replace('_', '-')}", str(value)])
+        # This worker version always emits the strict arithmetic payload; see
+        # the module-level note on _PROOF_PROTOCOL_VERSION.
+        cmd.extend(["--proof-protocol-version", str(_PROOF_PROTOCOL_VERSION)])
         return cmd
 
     def prepare(self, payload: dict[str, Any]) -> str:
