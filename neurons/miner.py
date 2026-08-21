@@ -2761,7 +2761,20 @@ def main():
     # selected bundled wheel and installs it only when missing or stale.
     from neurons.auto_update import ensure_local_proof_v3_cuda_wheel
 
-    if not ensure_local_proof_v3_cuda_wheel():
+    # In remote-audit mode the timed proof-v3 work runs on a leased GPU worker,
+    # so this host never needs a local proof-v3 CUDA runtime — and may be a
+    # GPU-less VPS, where the wheel's CUDA smoke test cannot pass at all
+    # ("Found no NVIDIA driver on your system"). Skip the install in that mode.
+    _remote_audit_configured = bool(
+        str(getattr(args, "capacity_audit_balancer", "") or "").strip()
+        or str(os.environ.get("CAPACITY_AUDIT_BALANCER_URL", "") or "").strip()
+    )
+    if _remote_audit_configured:
+        bt.logging.info(
+            "Remote capacity audit configured — skipping local proof-v3 CUDA "
+            "runtime install (audits are leased to the worker pool)"
+        )
+    elif not ensure_local_proof_v3_cuda_wheel():
         bt.logging.error("Proof-v3 CUDA runtime installation failed")
         sys.exit(1)
 
