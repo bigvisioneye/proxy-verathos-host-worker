@@ -2268,6 +2268,11 @@ def parse_args():
                              help="Inference balancer base URL (Balancer 1) for /chat + /inference forwarding.")
     proxy_group.add_argument("--proxy-balancer-key", default=None,
                              help="Bearer token for Balancer 1 (or PROXY_BALANCER_API_KEY).")
+    proxy_group.add_argument("--capacity-audit-balancer", default=None,
+                             help="Audit-worker balancer base URL (Balancer 2) "
+                                  "(or CAPACITY_AUDIT_BALANCER_URL). Unset = local audit (default).")
+    proxy_group.add_argument("--capacity-audit-balancer-key", default=None,
+                             help="Bearer token for Balancer 2 (or CAPACITY_AUDIT_BALANCER_API_KEY).")
     proxy_group.add_argument("--proxy-llm-key", default=None,
                              help="Shared secret sent to inference GPUs (or PROXY_LLM_KEY).")
     proxy_group.add_argument("--advertised-gpu-name", default=None,
@@ -2888,6 +2893,20 @@ def main():
         config.proxy_balancer_key = args.proxy_balancer_key
     if getattr(args, "proxy_llm_key", None):
         config.proxy_llm_key = args.proxy_llm_key
+    audit_balancer = str(
+        getattr(args, "capacity_audit_balancer", "")
+        or os.environ.get("CAPACITY_AUDIT_BALANCER_URL", "")
+        or ""
+    ).strip()
+    if audit_balancer:
+        config.capacity_audit_balancer = audit_balancer
+    audit_balancer_key = str(
+        getattr(args, "capacity_audit_balancer_key", "")
+        or os.environ.get("CAPACITY_AUDIT_BALANCER_API_KEY", "")
+        or ""
+    ).strip()
+    if audit_balancer_key:
+        config.capacity_audit_balancer_key = audit_balancer_key
 
     # ── Early on-chain model check ───────────────────────────────
     # Verify the resolved model is registered on-chain BEFORE loading
@@ -3305,6 +3324,8 @@ def main():
                 local_health_url=local_health_url,
                 audit_state_file=capacity_audit_state_file,
                 poll_interval_s=_capacity_audit_worker_poll_interval(config),
+                audit_balancer_url=str(getattr(config, "capacity_audit_balancer", "") or ""),
+                audit_balancer_api_key=str(getattr(config, "capacity_audit_balancer_key", "") or ""),
             )
             neuron._capacity_audit_worker.start()
         except Exception as e:
